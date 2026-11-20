@@ -17,6 +17,9 @@ use std::io::{Write, Read};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ureq::Agent;
 use tungstenite::{connect, Message};
+use tungstenite::client_tls_with_config;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::OnceLock;
 use sha2::{Digest, Sha256};
 
 /// WS 连续失败后进入轮询的窗口；到点必须重新尝试 WS，避免一次网络抖动永久降级。
@@ -400,7 +403,7 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"]\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
+        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--proxy <url>|off]\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -414,10 +417,17 @@ fn main() {
         std::process::exit(2);
     }
     fs::create_dir_all(&cfg.dir).ok();
-    let agent: Agent = ureq::AgentBuilder::new()
+    init_proxy();
+    let mut agent_builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(40))
-        .user_agent("synapse-agent/0.5.1 (rust)")
-        .build();
+        .user_agent("synapse-agent/0.5.1 (rust)");
+    if let Some(p) = proxy_for(&host_of(&cfg.endpoint)) {
+        match ureq::Proxy::new(&p.url) {
+            Ok(up) => agent_builder = agent_builder.proxy(up),
+            Err(e) => eprintln!("[proxy] ureq 代理配置失败（HTTP 改直连）：{e}"),
+        }
+    }
+    let agent: Agent = agent_builder.build();
     let base = cfg.endpoint.trim_end_matches('/').to_string();
     // 顺序感知解析：--key value 成对；单独的 --flag（下一个是 --key 或到末尾）记为无值开关。
     // 这样 --flag 出现在任意位置都不会把下一个开关误当成它的值。
@@ -1245,6 +1255,177 @@ fn urlencode(s: &str) -> String {
     base + (now_ms() as u64 % span)
 }
 
+// ---------- 代理支持：--proxy 参数开启，或自动检测标准代理环境变量 ----------
+// 背景：部分运行环境没有直连出口，只有 HTTP egress 代理（例如受管 VM）。
+// 启用方式：① 任意子命令带 --proxy <url> 显式开启，--proxy off 强制直连；
+//          ② 未给参数时自动检测 HTTPS_PROXY/https_proxy/ALL_PROXY/all_proxy。
+// NO_PROXY 命中的主机始终直连。HTTP 走 ureq 的 proxy 配置；WS 手工建
+// CONNECT 隧道后在隧道上做 TLS 握手。启用与异常都在启动时响亮打印
+// （只打印 host:port，永不打印凭据）。
+// 已知取舍：ureq 的 proxy 对该 Agent 的全部请求生效（hub API 与产物上传同走此 Agent）。
+
+#[derive(Clone)]
+struct ProxyCfg {
+    url: String,          // 原始代理 URL（给 ureq 用，含凭据，不打印）
+    host: String,
+    port: u16,
+    auth: Option<String>, // Basic 凭据的 base64（给手工 CONNECT 用）
+    display: String,      // host:port（日志用，不含凭据）
+}
+
+static PROXY_CFG: OnceLock<Option<ProxyCfg>> = OnceLock::new();
+
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let n = ((chunk[0] as u32) << 16)
+            | ((*chunk.get(1).unwrap_or(&0) as u32) << 8)
+            | (*chunk.get(2).unwrap_or(&0) as u32);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// 解析代理 URL：http://[user[:pass]@]host[:port]（只支持 http 代理）。
+fn parse_proxy_url(raw: &str) -> Result<ProxyCfg, String> {
+    let rest = raw.trim().strip_prefix("http://")
+        .ok_or_else(|| "代理只支持 http:// 形式".to_string())?;
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, rest),
+    };
+    let hostport = hostport.trim_end_matches('/');
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| format!("代理端口无效：{p}"))?),
+        None => (hostport.to_string(), 8080u16),
+    };
+    if host.is_empty() { return Err("代理主机为空".to_string()); }
+    Ok(ProxyCfg {
+        url: raw.trim().to_string(),
+        display: format!("{host}:{port}"),
+        host,
+        port,
+        auth: userinfo.map(|u| b64_encode(u.as_bytes())),
+    })
+}
+
+/// 启动时解析一次：--proxy 参数优先，其次自动检测环境变量。
+fn init_proxy() {
+    let argv: Vec<String> = std::env::args().collect();
+    let mut raw: Option<String> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--proxy" && i + 1 < argv.len() {
+            raw = Some(argv[i + 1].clone());
+            i += 1;
+        }
+        i += 1;
+    }
+    let from_env = raw.is_none();
+    if from_env {
+        raw = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+            .iter().find_map(|k| std::env::var(k).ok())
+            .filter(|v| !v.trim().is_empty());
+    }
+    let cfg = match raw {
+        None => None,
+        Some(r) if matches!(r.trim().to_ascii_lowercase().as_str(), "off" | "none" | "direct") => {
+            eprintln!("[proxy] 已按 --proxy off 关闭代理（直连）");
+            None
+        }
+        Some(r) => match parse_proxy_url(&r) {
+            Ok(p) => {
+                eprintln!("[proxy] 已启用代理 {}（{}）", p.display,
+                          if from_env { "环境变量自动检测" } else { "--proxy 参数" });
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("[proxy] 代理配置无效（改直连）：{e}");
+                None
+            }
+        },
+    };
+    let _ = PROXY_CFG.set(cfg);
+}
+
+/// 目标主机应走的代理；未启用或命中 NO_PROXY 时返回 None（直连）。
+fn proxy_for(target_host: &str) -> Option<&'static ProxyCfg> {
+    let p = PROXY_CFG.get()?.as_ref()?;
+    let no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy")).unwrap_or_default();
+    for pat in no_proxy.split(',') {
+        let pat = pat.trim().trim_start_matches('.');
+        if !pat.is_empty() && (target_host == pat || target_host.ends_with(&format!(".{pat}"))) {
+            return None;
+        }
+    }
+    Some(p)
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://").nth(1).unwrap_or(url)
+        .split(['/', ':', '?']).next().unwrap_or("").to_string()
+}
+
+/// 经代理 CONNECT 打通到目标的 TCP 隧道。
+fn proxy_tunnel(proxy: &ProxyCfg, target_host: &str, target_port: u16) -> Result<TcpStream, String> {
+    let addr = format!("{}:{}", proxy.host, proxy.port)
+        .to_socket_addrs().map_err(|e| format!("代理解析失败 {}：{e}", proxy.display))?
+        .next().ok_or_else(|| format!("代理解析无结果 {}", proxy.display))?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(15))
+        .map_err(|e| format!("连接代理 {} 失败：{e}", proxy.display))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(20)));
+    let mut req = format!("CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n");
+    if let Some(a) = &proxy.auth {
+        req += &format!("Proxy-Authorization: Basic {a}\r\n");
+    }
+    req += "\r\n";
+    s.write_all(req.as_bytes()).map_err(|e| format!("代理 CONNECT 发送失败：{e}"))?;
+    // 逐字节读到响应头结束，避免多读吞掉隧道里的 TLS 字节。
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+        match s.read(&mut byte) {
+            Ok(0) => return Err("代理 CONNECT 连接被关闭".to_string()),
+            Ok(_) => head.push(byte[0]),
+            Err(e) => return Err(format!("代理 CONNECT 读取失败：{e}")),
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    if text.split_whitespace().nth(1) != Some("200") {
+        return Err(format!("代理 CONNECT 被拒：{}", text.lines().next().unwrap_or("无响应行")));
+    }
+    let _ = s.set_read_timeout(None);
+    Ok(s)
+}
+
+/// WS 连接：启用代理时走 CONNECT 隧道后 TLS 握手，否则保持原直连。
+fn ws_connect(url: &str)
+    -> Result<(tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+               tungstenite::handshake::client::Response), tungstenite::Error>
+{
+    match proxy_for(&host_of(url)) {
+        None => connect(url),
+        Some(p) => {
+            let port = if url.starts_with("wss://") { 443 } else { 80 };
+            let stream = proxy_tunnel(p, &host_of(url), port).map_err(|e| {
+                tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+            })?;
+            client_tls_with_config(url, stream, None, None).map_err(|e| match e {
+                tungstenite::handshake::HandshakeError::Failure(f) => f,
+                tungstenite::handshake::HandshakeError::Interrupted(_) => {
+                    tungstenite::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other, "ws 握手被中断"))
+                }
+            })
+        }
+    }
+}
+
 fn ws_ticket(cfg: &Cfg, agent: &Agent, base: &str) -> Result<String, String> {
     let r = agent
         .get(&format!("{}/p/{}/ws-ticket", base, cfg.project))
@@ -1454,7 +1635,7 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                     }
                 };
                 let url = format!("{}/p/{}/ws?ticket={}", ws_base2, cfg2.project, ticket);
-                match connect(&url) {
+                match ws_connect(&url) {
                     Ok((mut sock, _r)) => {
                         connected_at.set(Some(Instant::now()));
                         // 握手成功就清空“连续连接失败”计数；不能等到第一条消息，
