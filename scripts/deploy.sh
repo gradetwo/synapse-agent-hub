@@ -58,6 +58,7 @@ ENDPOINT="${SYNAPSE_ENDPOINT:-https://synapse.wangda.today}"
 BUCKET=""
 D1=""
 NO_ADMIN=0
+R2_RETRIES="${R2_RETRIES:-4}"
 
 info() { printf '→ %s\n' "$*"; }
 ok()   { printf '✓ %s\n' "$*"; }
@@ -88,6 +89,7 @@ release 选项：
   --skip-build         跳过编译，直接用 dist/ 现有产物
   --skip-worker        不 deploy Worker
   --skip-upload        不写 R2
+  --r2-retries N       R2 上传失败重试次数，默认 4（也可用环境变量 R2_RETRIES）
   --skip-verify        不跑线上校验
   --migration FILE     schema.sql 变更时，显式指定迁移 SQL
   --force-worker       即使没检测到 Worker/HTML 变更也 deploy
@@ -148,6 +150,8 @@ while [ "$#" -gt 0 ]; do
     --skip-worker) SKIP_WORKER=1; shift ;;
     --skip-upload) SKIP_UPLOAD=1; shift ;;
     --skip-verify) SKIP_VERIFY=1; shift ;;
+    --r2-retries) need_arg "$@"; R2_RETRIES="$2"; shift 2 ;;
+    --r2-retries=*) R2_RETRIES="${1#*=}"; shift ;;
     --skip-artifacts) SKIP_ARTIFACTS=1; shift ;;
     --force-worker) FORCE_WORKER=1; shift ;;
     --force-binaries) FORCE_BINARIES=1; shift ;;
@@ -179,6 +183,11 @@ case "$WIN_TOOLCHAIN" in
   msvc|gnu) ;;
   *) die "--win-toolchain 只能是 msvc 或 gnu" ;;
 esac
+
+case "$R2_RETRIES" in
+  ''|*[!0-9]*) die "--r2-retries 必须是正整数" ;;
+esac
+[ "$R2_RETRIES" -ge 1 ] || die "--r2-retries 必须至少为 1"
 
 # ── 目标名归一化 ─────────────────────────────────────────────
 normalize_targets() {
@@ -481,12 +490,42 @@ build_binaries() {
 # ── R2 上传 ──────────────────────────────────────────────────
 r2_put() {
   local key="$1" file="$2" type="${3:-}"
+  local attempt=1 size
   [ -f "$file" ] || die "要上传的文件不存在：$file"
-  if [ -n "$type" ]; then
-    run_wrangler r2 object put "$BUCKET/bin/$key" --remote --file="$file" --content-type="$type"
-  else
-    run_wrangler r2 object put "$BUCKET/bin/$key" --remote --file="$file"
+  size="$(du -h "$file" | awk '{print $1}')"
+
+  if [ "$DRY_RUN" = 1 ]; then
+    if [ -n "$type" ]; then
+      run_wrangler r2 object put "$BUCKET/bin/$key" --remote --file="$file" --content-type="$type"
+    else
+      run_wrangler r2 object put "$BUCKET/bin/$key" --remote --file="$file"
+    fi
+    return 0
   fi
+
+  while [ "$attempt" -le "$R2_RETRIES" ]; do
+    if [ "$attempt" -gt 1 ]; then
+      warn "重试 R2 上传（${attempt}/${R2_RETRIES}）：$key（${size}）"
+      sleep $((attempt * 3))
+    fi
+    if [ -n "$type" ]; then
+      if run_wrangler r2 object put "$BUCKET/bin/$key" --remote --file="$file" --content-type="$type"; then
+        return 0
+      fi
+    else
+      if run_wrangler r2 object put "$BUCKET/bin/$key" --remote --file="$file"; then
+        return 0
+      fi
+    fi
+    warn "R2 上传失败（${attempt}/${R2_RETRIES}）：$key（${size}）"
+    attempt=$((attempt + 1))
+  done
+
+  die "R2 上传最终失败：$key（${size}）。
+  先检查网络/代理；可执行：
+    env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+      npx -y wrangler@4 r2 object put \"$BUCKET/bin/$key\" --remote --file=\"$file\"
+  或加 --skip-upload 跳过上传，稍后手动补传。"
 }
 
 upload_binaries() {
@@ -648,6 +687,10 @@ release_flow() {
   determine_base
   collect_changes
 
+  if [ "$SKIP_UPLOAD" = 0 ] && [ -n "${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}${http_proxy:-}${ALL_PROXY:-}${all_proxy:-}" ]; then
+    warn "检测到代理环境变量；R2 上传出现 fetch failed 时，可先尝试去掉代理重跑"
+  fi
+
   if [ "$WORKER_CHANGED" = 0 ] && [ "$RUST_CHANGED" = 0 ] \
      && [ "$INSTALL_CHANGED" = 0 ] && [ "$SCHEMA_CHANGED" = 0 ] \
      && [ "$ALL" = 0 ] && [ "$FORCE_WORKER" = 0 ] \
@@ -750,7 +793,7 @@ bootstrap_flow() {
     info "跳过 binary 编译/上传（--skip-artifacts）"
   else
     info "开始编译/上传首批 binary"
-    local args=(--all --yes --skip-worker --targets "$TARGETS" --win-toolchain "$WIN_TOOLCHAIN" --endpoint "$ENDPOINT" --bucket "$BUCKET" --d1 "$D1")
+    local args=(--all --yes --skip-worker --targets "$TARGETS" --win-toolchain "$WIN_TOOLCHAIN" --endpoint "$ENDPOINT" --bucket "$BUCKET" --d1 "$D1" --r2-retries "$R2_RETRIES")
     [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
     [ "$SKIP_VERIFY" = 1 ] && args+=(--skip-verify)
     bash "$0" release "${args[@]}"
