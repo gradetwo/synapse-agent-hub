@@ -104,7 +104,7 @@ if (location.search.includes("reset=1")) {
   .card.maxed>h2{position:sticky;top:0;z-index:2;background:#0e1218;padding:8px 0;margin:0 0 6px;
     border-bottom:1px solid #1c2430}
   /* 最大化时给一个"永远在屏幕里"的退出按钮，手机上也点得到 */
-  #maxExit{display:none;position:fixed;right:12px;z-index:40;
+  #maxExit{display:none;position:fixed;right:12px;z-index:15;
     top:calc(env(safe-area-inset-top) + 12px);padding:8px 14px;border-radius:10px;
     border:1px solid #2f6da8;background:#132234;color:#eaf0f8;font:600 13px/1 -apple-system,sans-serif}
   body.has-max #maxExit{display:block}
@@ -239,8 +239,9 @@ if (location.search.includes("reset=1")) {
   <div class="seg">
     <span class="mono" id="liveDot" title="实时通道状态" style="cursor:pointer;border:1px solid #232a33;border-radius:6px;padding:6px 10px">○ 轮询</span>
     <select id="proj" title="项目"></select>
+    <button class="ghost" id="btnReload" title="立即刷新各面板">刷新</button>
     <button class="ghost" id="btnSettings">可见性</button>
-  <button class="ghost" id="btnPurge" title="页面像旧的？点这里强制重载">更新页面</button>
+    <button class="ghost" id="btnPurge" title="页面像旧的？点这里强制重载">更新页面</button>
     <select id="autoRef" title="自动刷新频率">
       <option value="0">不刷新</option>
       <option value="15">15 秒</option>
@@ -487,12 +488,13 @@ function showToast(msg, ms = 6000) {
 }
 
 window.addEventListener("error", (e) => {
-  const b = document.getElementById("build");
-  if (b) b.textContent = "ERR: " + (e.message || "unknown");
+  console.error("[hub] error", e.error || e.message);
+  showToast("操作出错：" + (e.message || "unknown"), 6000);
 });
 window.addEventListener("unhandledrejection", (e) => {
-  const b = document.getElementById("build");
-  if (b) b.textContent = "REJ: " + ((e.reason && e.reason.message) || e.reason || "unknown");
+  console.error("[hub] rejection", e.reason);
+  const msg = (e.reason && e.reason.message) || e.reason || "unknown";
+  if (msg instanceof Error || typeof msg === "string") showToast("操作失败：" + msg, 6000);
 });
 const STUB = {
   textContent: "", innerHTML: "", value: "", hidden: true, dataset: {}, style: {},
@@ -519,6 +521,7 @@ async function api(path, method = "GET", body) {
     method,
     headers: h,
     body: body ? JSON.stringify(body) : undefined,
+    credentials: "same-origin",   // 与 downloadBundle/boot 一致：带上 Access/hub_sess cookie
   });
   if (r.status === 401 || r.status === 403) {
     // 不要递归弹窗：清掉凭证、锁屏、抛错让上层停止渲染
@@ -748,6 +751,7 @@ async function collectAll() {
 async function broadcast() {
   const title = $("bTitle").value.trim();
   if (!title) { $("bHint").textContent = "标题必填"; return; }
+  if (!confirm(`向项目 ${current} 的全体 agent 广播「${title}」？`)) return;
   const body = {
     broadcast_id: "bc-" + new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14),
     severity: $("bSeverity").value,
@@ -759,21 +763,30 @@ async function broadcast() {
       ack_required: $("bAck").value === "1",
     },
   };
-  const r = await api(`/admin/p/${current}/broadcast`, "POST", body);
-  $("bHint").textContent = `已发布 seq=${r.seq}`;
-  $("bTitle").value = ""; $("bBody").value = "";
+  try {
+    const r = await api(`/admin/p/${current}/broadcast`, "POST", body);
+    $("bHint").textContent = `已发布 seq=${r.seq}`;
+    $("bTitle").value = ""; $("bBody").value = "";
+  } catch (e) {
+    if (!(e instanceof AuthError)) $("bHint").textContent = "发布失败：" + (e.message || e);
+  }
 }
 
 async function settings() {
   const mode = prompt(`可见性当前：${policy.mode}\n输入 all 或 list`, policy.mode);
   if (!mode) return;
+  if (mode !== "all" && mode !== "list") { alert("可见性只能是 all 或 list"); return; }
   let projects = [];
   if (mode === "list") {
     const csv = prompt("要可见的项目（逗号分隔）", policy.projects.join(",") || current);
     projects = (csv || "").split(",").map(s => s.trim()).filter(Boolean);
   }
-  await api("/admin/visibility", "POST", { mode, projects });
-  await loadProjects();
+  try {
+    await api("/admin/visibility", "POST", { mode, projects });
+    await loadProjects();
+  } catch (e) {
+    if (!(e instanceof AuthError)) alert("保存可见性失败：" + (e.message || e));
+  }
 }
 
 async function loadSec() {
@@ -850,8 +863,7 @@ async function quickRun() {
   const r = await api(`/admin/p/${current}/send`, "POST",
     { to: targets, title: cmd.title, body: cmd.body, kind: cmd.kind || "task", ack_required: cmd.ack });
   $("sndHint").textContent = `已发 ${r.sent.length} 个：${r.sent.map((x) => x.to + "#" + x.seq).join(" ")}（已刷新列表）`;
-  await refresh();
-  if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);   // 详情里的"最近消息"同步刷新
+  if (detailAgent && $("detail") && !$("detail").hidden) await openAgent(detailAgent); // 详情里的"最近消息"同步刷新
   await refresh();
 }
 
@@ -1526,7 +1538,13 @@ function setProjectPanels(enabled) {
 
 async function refresh() {
   if (!current) return;
-  await Promise.all([loadAgents(), loadSec(), loadStats(), loadEnr()]);
+  // 各面板独立容错：任一非核心接口失败不应让整页 lock()。
+  // 用 allSettled 并打印失败项，界面其余部分照常渲染。
+  const parts = [loadAgents(), loadSec(), loadStats(), loadEnr()];
+  const results = await Promise.allSettled(parts);
+  results.forEach((r, i) => {
+    if (r.status === "rejected") console.warn("[hub] refresh part failed", i, r.reason);
+  });
   if (current === "*") {
     setProjectPanels(false);
     return;
@@ -1627,7 +1645,7 @@ document.addEventListener("click", async (e) => {
     const co = btn.getAttribute("data-collect");
     if (co) return collect(co);
     const ub = btn.getAttribute("data-unblock");
-    if (ub) { await api("/admin/security/unblock", "POST", { ip: ub }); return loadSec(); }
+    if (ub) { if (!confirm(`解除 ${ub} 的封禁？`)) return; await api("/admin/security/unblock", "POST", { ip: ub }); return loadSec(); }
     return;
   }
   const dq = el.getAttribute && el.getAttribute("data-dq");
