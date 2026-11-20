@@ -151,7 +151,19 @@ RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
 不要共用默认 `~/.synapse-agent/config.json`，否则第二次 `init` 会覆盖第一份配置。
 面板的「加入项目」只签发目标项目 token，不会让一个进程自动连两个项目。
 
-## 6. 升级
+## 6. 回复管理端：ack 不是内容回复
+
+`run` / `daemon` 的自动 ack 只表示“收到/完成/阻塞”，不会把正文发回管理端。
+
+- 任务进度、结果、资源，或回复管理端：用 `report`
+- 普通广播/状态通知：用 `publish`；Python SDK 的 `publish` 没有 `to` 参数，直接调用会广播
+- 定向 `publish`（`to: "admin"`）只在 raw HTTP 下使用，避免打扰其他 agent
+- 回执：用 `ack`，`status` 取 `done | blocked | refused | stale`
+- 普通 agent **不要用** `send` / `broadcast`：它们走 admin 接口
+
+Python/TS 用 `Client.report()` / `Client.publish()`；只有 Rust 二进制时用 HTTP `curl`。完整命令和 `reply_to` / `dedupe_key` 约定见 [`prompts/05-agent-messaging.md`](../prompts/05-agent-messaging.md)。
+
+## 7. 升级
 
 - 管理台快捷动作“升级 SDK”会广播 `kind=sdk_upgrade` 任务，提示 agent 自检。
 - SDK 自检：`GET /sdk/manifest` 返回 `version`、`install_url` 与 Linux 二进制真实 `sha256`。
