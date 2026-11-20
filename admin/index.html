@@ -305,10 +305,10 @@ if (location.search.includes("reset=1")) {
     <h2>名册 <span class="muted" id="agentStat"></span></h2>
     <table>
       <thead><tr>
-        <th>Agent</th><th>状态</th><th>在做什么</th><th class="num">CPU</th>
+        <th>Agent</th><th>项目</th><th>状态</th><th>在做什么</th><th class="num">CPU</th>
         <th class="num">内存</th><th class="num">磁盘</th><th>基线</th><th>心跳</th><th></th>
       </tr></thead>
-      <tbody id="agents"><tr><td colspan="8" class="empty">未连接</td></tr></tbody>
+      <tbody id="agents"><tr><td colspan="10" class="empty">未连接</td></tr></tbody>
     </table>
   </div>
 
@@ -569,13 +569,15 @@ async function loadProjects() {
     ? `全部项目 ${d.projects.length} 个`
     : `指定项目 ${policy.projects.length} 个`;
   const sel = $("proj");
-  sel.innerHTML = d.projects.map(p =>
+  sel.innerHTML = `<option value="*">全部项目</option>` + d.projects.map(p =>
     `<option value="${p.project}">${p.display_name}</option>`).join("");
   // 记住上次选的项目；否则刷新后总是回到最早创建的项目，容易把新项目里的 agent 看漏。
   let saved = "";
   try { saved = localStorage.getItem("hub.project") || ""; } catch {}
-  if (!current || !d.projects.some((p) => p.project === current)) {
-    current = d.projects.some((p) => p.project === saved) ? saved : (d.projects[0]?.project || "");
+  if (!current || (current !== "*" && !d.projects.some((p) => p.project === current))) {
+    current = saved === "*"
+      ? "*"
+      : (d.projects.some((p) => p.project === saved) ? saved : (d.projects[0]?.project || "*"));
   }
   sel.value = current;
   try { localStorage.setItem("hub.project", current); } catch {}
@@ -593,11 +595,26 @@ function fillDetailProjects() {
   sel.disabled = !list.length;
 }
 
+// 从“全部项目”或注册审批跳到具体项目：统一更新下拉、实时连接和项目级缓存。
+function activateProject(project) {
+  if (!project || project === current) return;
+  current = project;
+  const sel = $("proj");
+  if (sel) sel.value = project;
+  try { localStorage.setItem("hub.project", project); } catch {}
+  lastPending = null;
+  SUB_ROWS = [];
+  SUB_STATE = new Map();
+  fillDetailProjects();
+  connectLive();
+}
+
 async function loadAgents() {
-  const d = await api(`/admin/p/${current}/agents`);
-  const rows = d.agents || [];
+  const isAll = current === "*";
+  const d = isAll ? await api("/admin/agents") : await api(`/admin/p/${current}/agents`);
+  const rows = (d.agents || []).map((a) => ({ ...a, project: a.project || current }));
   const alive = rows.filter(a => a.alive === "alive").length;
-  $("agentStat").textContent = `${alive}/${rows.length} 在线`;
+  $("agentStat").textContent = `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}`;
   $("agents").innerHTML = rows.length ? rows.map(a => {
     const w = a.work || {}, l = a.load || {}, dk = (l.disk || [{}])[0];
     const cls = a.alive === "alive" ? "alive" : a.alive === "late" ? "late" : "offline";
@@ -605,8 +622,10 @@ async function loadAgents() {
     // 失联的 agent 只保留最后上报的 work，不能当作"现在正在忙"
     const doing = a.alive === "alive" ? (w.phase || w.state || "—") : "—";
     const mem = (l.mem_used_mb != null) ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
-    return `<tr${idle} class="clickable" data-agent="${a.agent_id}" data-alive="${a.alive}" data-work="${a.alive === "alive" ? (w.state || "idle") : ""}">
+    const projectName = (allProjects.find((p) => p.project === a.project)?.display_name) || a.project;
+    return `<tr${idle} class="clickable" data-agent="${a.agent_id}" data-project="${a.project}" data-alive="${a.alive}" data-work="${a.alive === "alive" ? (w.state || "idle") : ""}">
       <td><span class="dot ${cls}"></span>${a.agent_id}</td>
+      <td class="muted">${projectName}</td>
       <td>${a.alive === "alive" ? "忙" : a.alive === "late" ? "迟到" : "失联"}</td>
       <td>${doing}</td>
       <td class="num">${pct(l.cpu_pct, 85)}</td>
@@ -615,11 +634,11 @@ async function loadAgents() {
       <td class="mono">${(a.env || {}).git_head || "—"}</td>
       <td class="muted">${ago(a.age_s)}前</td>
       <td style="white-space:nowrap">
-        <button class="ghost mini" data-detail="${a.agent_id}">详情</button>
-        <button class="ghost mini" data-revoke="${a.agent_id}" title="吊销该 agent 凭据">×</button>
+        <button class="ghost mini" data-detail="${a.agent_id}" data-project="${a.project}">详情</button>
+        <button class="ghost mini" data-revoke="${a.agent_id}" data-project="${a.project}" title="吊销该 agent 凭据">×</button>
       </td>
     </tr>`;
-  }).join("") : `<tr><td colspan="9" class="empty">还没有 agent 接入</td></tr>`;
+  }).join("") : `<tr><td colspan="10" class="empty">还没有 agent 接入</td></tr>`;
   window._agents = rows;
   bindBulk();
   reapplyFilters();
@@ -790,16 +809,7 @@ async function loadEnr() {
     const project = b.dataset.project;
     await api(`/admin/enrollments/${b.dataset.approve}/approve`, "POST", {});
     // 批准的是别的项目时，当前名册还停在旧项目，会误以为 agent 没上线。
-    if (project && project !== current) {
-      current = project;
-      $("proj").value = project;
-      try { localStorage.setItem("hub.project", project); } catch {}
-      lastPending = null;
-      SUB_ROWS = [];
-      SUB_STATE = new Map();
-      fillDetailProjects();
-      connectLive();
-    }
+    if (project) activateProject(project);
     await refresh();
   });
   $("enr").querySelectorAll("[data-reject]").forEach((b) => b.onclick = async () => {
@@ -873,9 +883,11 @@ async function sendTargeted() {
   await refresh();
 }
 
-async function revoke(id) {
+async function revoke(id, project) {
+  const p = project || current;
+  if (!p || p === "*") { alert("请先选择具体项目，再吊销 agent。"); return; }
   if (!confirm(`吊销 ${id}？该 agent 的 token 立刻失效，需重新申请接入。`)) return;
-  const r = await api(`/admin/p/${current}/revoke`, "POST", { agents: [id], confirm: true });
+  const r = await api(`/admin/p/${p}/revoke`, "POST", { agents: [id], confirm: true });
   await refresh();
   alert(`已吊销：${(r.revoked || []).join(", ")}`);
 }
@@ -915,7 +927,11 @@ function setDetailReady(on) {
     if (el) el.disabled = !on;
   }
 }
-function openAgent(id) {
+function openAgent(id, project) {
+  if (project && project !== current) {
+    activateProject(project);
+    refresh();
+  }
   const ov = $("detail");
   // 同一 agent 的详情刷新（下载交付后、发消息后、吊销后都会重进 openAgent）不清 #dToken：
   // 刚签发的 token 只显示这一次，被刷新擦掉就再也看不到；吊销后的「已吊销。」提示同理。
@@ -1054,7 +1070,7 @@ $("dDemote").onclick = () => issueFor("agent");
 $("dReissue").onclick = () => issueFor(detailRole, true);
 
 $("btnIssueToken").onclick = async () => {
-  if (!current) return renderTokenError("issueTokenBox", "请先选择项目");
+  if (!current || current === "*") return renderTokenError("issueTokenBox", "请先选择具体项目");
   const agentId = $("issueAgentId").value.trim();
   const role = $("issueRole").value;
   const ttl = Number($("issueTtl").value || 30);
@@ -1386,6 +1402,7 @@ function bindBulk() {
   // 名册：一键清掉失联的残留号
   const ros = cardByTitle("名册");
   if (ros) addCardBtn(ros, "清失联", async () => {
+    if (current === "*") { alert("全部项目视图下请先选择具体项目，再清理失联 agent。"); return; }
     const off = (window._agents || []).filter((a) => a.alive !== "alive").map((a) => a.agent_id);
     if (!off.length) { alert("没有失联的 agent"); return; }
     if (!confirm(`吊销 ${off.length} 个失联 agent？\n${off.slice(0, 8).join(", ")}${off.length > 8 ? " …" : ""}`)) return;
@@ -1473,10 +1490,49 @@ async function loadStats() {
   $("ovAt").textContent = new Date(d.at).toLocaleTimeString();
 }
 
+function setProjectPanels(enabled) {
+  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast"]) {
+    const el = $(id);
+    if (el) el.disabled = !enabled;
+  }
+  if (enabled) {
+    $("sndHint").textContent = "";
+    $("bHint").textContent = "";
+    return;
+  }
+  // 全部项目只做聚合总览；涉及写操作/交付/消息的卡片必须回到具体项目。
+  $("subStat").textContent = "全部项目视图不汇总";
+  $("subs").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看交付箱</td></tr>`;
+  $("msgStat").textContent = "";
+  $("msgs").innerHTML = `<tr><td colspan="6" class="empty">选择具体项目查看消息流</td></tr>`;
+  $("sndWho").innerHTML = "";
+  $("sndHint").textContent = "全部项目视图为只读；请选择具体项目后再发送";
+  $("bHint").textContent = "全部项目视图为只读；请选择具体项目后再广播";
+  const alertEl = $("deliveryAlert");
+  if (alertEl) alertEl.hidden = true;
+  document.title = BASE_TITLE;
+  BADGES.deli = 0;
+  BADGES.msg = 0;
+  updateBadges();
+  SUB_ROWS = [];
+  SUB_STATE = new Map();
+  lastPending = null;
+  const ov = $("detail");
+  if (ov) { ov.hidden = true; ov.style.display = ""; document.body.classList.remove("has-sheet"); }
+  detailAgent = null;
+  detailReady = false;
+  setDetailReady(false);
+}
+
 async function refresh() {
   if (!current) return;
-  // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
   await Promise.all([loadAgents(), loadSec(), loadStats(), loadEnr()]);
+  if (current === "*") {
+    setProjectPanels(false);
+    return;
+  }
+  setProjectPanels(true);
+  // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
   await loadSubs();
   await loadMsgs();
 }
@@ -1504,6 +1560,7 @@ function closeLive() { if (liveWs) { try { liveWs.close(); } catch {} liveWs = n
 function connectLive() {
   closeLive();
   if (!current) return;
+  if (current === "*") { paintLive(false, "全部项目视图：定时/手动刷新"); return; }
   if (liveMode === "poll") { paintLive(false, "轮询模式：按刷新频率拉取"); return; }
   try {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1511,7 +1568,7 @@ function connectLive() {
     ws.onopen = () => paintLive(true, "实时模式：服务端推送");
     ws.onmessage = (ev) => { try { if (JSON.parse(ev.data).type === "msg") scheduleRefresh(); } catch {} };
     ws.onclose = (e) => { paintLive(false, "实时断开，5 秒后重连", "轮询·断开" + (e.code ? ` ${e.code}` : "")); liveWs = null;
-      setTimeout(() => { if (liveMode === "ws" && current && document.visibilityState !== "hidden") connectLive(); }, 5000); };
+      setTimeout(() => { if (liveMode === "ws" && current && current !== "*" && document.visibilityState !== "hidden") connectLive(); }, 5000); };
     ws.onerror = () => paintLive(false, "实时连不上", "轮询·失败");
     liveWs = ws;
   } catch { paintLive(false, "浏览器不支持 WebSocket"); }
@@ -1562,9 +1619,9 @@ document.addEventListener("click", async (e) => {
       return;
     }
     const rv = btn.getAttribute("data-revoke");
-    if (rv) return revoke(rv);
+    if (rv) return revoke(rv, btn.getAttribute("data-project"));
     const dt = btn.getAttribute("data-detail");
-    if (dt) return openAgent(dt);
+    if (dt) return openAgent(dt, btn.getAttribute("data-project"));
     const dl = btn.getAttribute("data-dl");
     if (dl) return downloadBundle(dl);
     const co = btn.getAttribute("data-collect");
@@ -1583,7 +1640,7 @@ document.addEventListener("click", async (e) => {
     return;
   }
   const agId = el.closest && el.closest("[data-agent]")?.getAttribute("data-agent");
-  if (agId) return openAgent(agId);
+  if (agId) return openAgent(agId, el.closest("[data-agent]")?.getAttribute("data-project"));
   const dlId = el.getAttribute && el.getAttribute("data-dl");
   if (dlId) return downloadBundle(dlId);
   const collectId = el.getAttribute && el.getAttribute("data-collect");

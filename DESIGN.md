@@ -178,7 +178,8 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | GET | `/admin/projects` | 按可见性策略过滤，返回 `{policy, projects, hidden}` |
 | POST | `/admin/projects` | 新建项目 |
 | GET/POST | `/admin/visibility` | 看全部 / 只看列表 |
-| GET | `/admin/p/{p}/agents` | 名册（含 alive/late/offline + age_s） |
+| GET | `/admin/agents` | 全部可见项目的聚合名册（每行带 `project`，控制台“全部项目”视图用） |
+| GET | `/admin/p/{p}/agents` | 单项目名册（含 alive/late/offline + age_s） |
 | GET | `/admin/p/{p}/snapshot` | seq + agents + tasks |
 | POST | `/admin/p/{p}/broadcast` | 广播（幂等 `broadcast_id`） |
 | GET/POST | `/admin/p/{p}/submissions` | 交付箱列表 / 新建（测试用） |

@@ -578,6 +578,30 @@ async function admin(req: Request, env: Env, url: URL) {
     });
   }
 
+  // 管理端全局名册：按可见项目聚合并保留 project，前端用于“全部项目”视图。
+  if (path === "/admin/agents" && req.method === "GET") {
+    const policy = await loadPolicy(env);
+    const rows = (await env.DB.prepare(
+      "SELECT project FROM projects WHERE status='active' ORDER BY created_at"
+    ).all<any>()).results;
+    const visible = rows
+      .map((r) => r.project as string)
+      .filter((p) => policy.mode === "all" || (policy.projects || []).includes(p));
+    const agents: any[] = [];
+    for (const project of visible) {
+      try {
+        const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+        const r = await stub.fetch(new Request("https://do/agent/list"));
+        const d = await r.json<any>().catch(() => ({ agents: [] }));
+        for (const a of (Array.isArray(d.agents) ? d.agents : [])) agents.push({ ...a, project });
+      } catch { /* 单个项目的 DO 抖动不影响其它项目的总览 */ }
+    }
+    agents.sort((a, b) =>
+      String(a.project ?? "").localeCompare(String(b.project ?? "")) ||
+      String(a.agent_id ?? "").localeCompare(String(b.agent_id ?? "")));
+    return json({ agents, at: Date.now() });
+  }
+
   if (path === "/admin/enrollments" && req.method === "GET") {
     const rows = await env.DB.prepare(
       `SELECT id, project, agent_id, scopes, machine, created_at, status, code
