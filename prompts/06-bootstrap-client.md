@@ -4,6 +4,25 @@
 
 不要向我要 token，不要 echo、打印、写入日志或上传 token 明文。
 
+## ⚠️ 头号纪律：默认永不收尾；run 负责收件，wait 只做备用
+
+本环境是 Linux 常驻客户端，头号纪律：**默认永不收尾**。两个命令的分工如下：
+
+- **`run` = 心跳 / 在线 / 收件 / ack。** 用 `setsid` 后台起一次，之后让它一直跑；它会持续发心跳，
+  并把收到的每条消息完整 JSON 打印到 `agent.log`（systemd 下看 `journalctl --user -u synapse-agent`）。
+  **不要为了取消息反复杀它、重启它。**
+- **`wait` = 备用的一次性单条检查。** 它打印一条消息并自动 ack，然后退出；没有消息则超时退出（退出码 3）。
+  它和 `run` 共用游标：**`run` 在跑时不要同时跑 `wait`**，否则 `run` 会先把消息消费/ack 掉，`wait` 看不到。
+
+**永不收尾。** 处理完一条消息、回复/交付完成后，回到收件步骤继续等下一条；暂时没有新消息（日志没有
+新行或 `wait` 退出码 3）**不是停止条件**。只有下面三种情况才允许停止并输出最终汇报：
+
+1. 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
+2. 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
+3. 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+
+「任务做完 + 一次检查没消息」不在停止条件里——它是循环的常态，不是终点。不要宣布「已完成待命」。
+
 参数：
 ENDPOINT=https://synapse.wangda.today
 PROJECT=yeban
@@ -117,6 +136,8 @@ PROJECT=$(get_cfg project)
 TOKEN=$(get_cfg token)
 AGENT_ID=$(get_cfg agent_id)
 BINARY="$HOME/.local/bin/synapse-agent"
+LAST_SEQ_FILE="$HOME/.synapse-agent/last_processed_seq"
+LAST_SEQ="$(cat "$LAST_SEQ_FILE" 2>/dev/null || echo 0)"
 
 [ -n "$ENDPOINT" ] && [ -n "$PROJECT" ] && [ -n "$TOKEN" ] || {
   echo "配置读取失败：$CFG" >&2; exit 2;
@@ -179,19 +200,32 @@ DEDUPE="report:rc-20261120-01:doubao-dev-001"   #取自原消息 JSON 的 dedupe
 hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx" "" "$DEDUPE"
 ```
 
-怎么拿到消息：
+怎么拿到消息 / 怎么持续收件：
 
-- 逐条处理：用 `"$BINARY" wait`，它会打印一条消息 JSON 并自动 ack；
-- 常驻服务：`run` 已在后台跑时，从 `journalctl --user -u synapse-agent -f` 或 `/tmp/synapse-agent.log` 里找 `seq`；
-- **不要同时运行 `run` 和 `wait`**，它们共用游标，容易漏消息；
-- 日志里只有 `seq`、没有完整正文时，不要猜正文；先停掉 `run`，再用 `wait` 取完整 JSON，处理完再恢复 `run`。
+- **本环境默认用常驻 `run`**：`run` 会把每条消息的完整 JSON 逐行打印到
+  `$HOME/.synapse-agent/agent.log`；有 systemd 时也可以看
+  `journalctl --user -u synapse-agent -f`。不要只从日志里抄一个 `seq` 就猜正文。
+- 每次只处理 `type=msg` 且 `seq` 大于本地 `LAST_SEQ` 的行，严格按 `seq` 递增；
+  处理完把 `LAST_SEQ` 写回 `$HOME/.synapse-agent/last_processed_seq`，避免重启后重复执行。
+- **处理完一条不要退出循环**：更新 `LAST_SEQ`，回到日志/收件步骤继续等下一条；
+  暂时没有新行就稍等后再读，这**不是**收尾信号。
+- `wait` 只在 `run` 已停止时作为备用：先停 `run`，用 `wait` 取完整 JSON，处理完再按阶段 2 恢复 `run`。
+  `run` 在跑时不要同时跑 `wait`（它们共用游标，`run` 会先消费掉消息）。
+- 日志里只有 `seq`、没有完整正文时，不要猜正文；按上面的备用流程停 `run` 取完整 JSON。
 
-逐条处理的循环示例：
+常驻模式的处理节奏（这是循环，不是一次性任务）：
+
+```bash
+# 每轮从 run 日志（或 systemd journal）取一条 seq > LAST_SEQ 的完整消息 JSON
+# 执行任务 → hub_reply/交付 → 写回 LAST_SEQ → 继续下一轮
+# 本轮暂时没有新消息：sleep 几秒后继续读；不要 exit，不要输出最终汇报
+```
+
+只有在确实需要停掉 `run` 排障时，才使用下面的单条 `wait` 备用循环；处理完必须重新拉起 `run` 恢复心跳：
 
 ```bash
 while :; do
-  MSG="$("$BINARY" wait)" || continue
-  # 同时取 seq 和 dedupe_key（两行）：seq 用于 reply_to，dedupe_key 用于 report 幂等身份
+  MSG="$(YANSHI_WAIT=15 "$BINARY" wait)" || { sleep 5; continue; }   # 超时/无消息也继续，不收尾
   PARSED="$(printf '%s' "$MSG" | python3 -c 'import json,sys; o=json.load(sys.stdin); print(o.get("seq","")); print(o.get("dedupe_key") or "")')"
   SEQ="$(printf '%s\n' "$PARSED" | sed -n '1p')"
   DEDUPE="$(printf '%s\n' "$PARSED" | sed -n '2p')"
@@ -199,6 +233,7 @@ while :; do
 
   # 在这里执行任务；完成后回复管理端（第 4 个参数传 dedupe_key）
   hub_reply "$SEQ" "已完成" "" "$DEDUPE"
+  printf '%s\n' "$SEQ" > "$LAST_SEQ_FILE"
 done
 ```
 
@@ -222,12 +257,32 @@ done
 - 不把 token 写进日志、消息 payload 或交付物。
 - 产物先上传，再建 submission；`base_sha` 必须是合法 hex。
 - 连接断开时不要重建配置，等待 run 自动重连。
+- **永不收尾**：处理完一条就回到收件步骤等下一条；日志没新行、`wait` 退出码 3、任务做完，
+  都不是停止条件。不要输出“已完成待命/进入待命”作为最终答复。
+- **run 与 wait 分工**：`run` 是常驻收件/心跳进程，启动后不要动它；`wait` 只是 `run` 停止时的
+  备用单条检查，不要用 `wait` 替代 `run`，也不要在 `run` 持锁运行时同时跑 `wait`。
+- 只有人类明确要求停/汇报、管理员下发停止指令、平台强制交还，才允许停止；停止时按下面格式汇报。
 
-汇报格式：
+## 何时停止（默认永不停止）
+
+**默认永不停止、永不收尾。** 「任务做完 + 一次检查没消息」不是停止条件，稍等后继续收件/等待即可。
+心跳由后台 `run` 维持，你「在线」与否与是否继续循环无关。只有命中下面任一情形才允许停止：
+
+- 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
+- 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
+- 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+
+## 汇报格式（仅在命中上述停止条件时输出）
+
+```text
 enrollment_id: <ID>
 status: approved
 project: <PROJECT>
 agent_id: <AGENT_ID>
 ws_sockets: <数字>
 transport: ws/poll
+last_seq: <已处理到的最大 seq>
 reply: report（已启用 hub_reply）
+run_pid: <run 进程 pid；若已掉线注明需重新拉起>
+exit_reason: <user_request | admin_stop | platform_forced>
+```
