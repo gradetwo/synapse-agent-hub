@@ -55,7 +55,7 @@ if curl -fsSL --retry 2 -o "$TMP/agent.sha256" "$SHA_URL" 2>/dev/null; then
   EXPECT=$(awk '{print $1}' "$TMP/agent.sha256" | head -1)
   ACTUAL=$(sha256sum "$TMP/agent" | awk '{print $1}')
   if [ "$EXPECT" != "$ACTUAL" ]; then
-    die "校验不一致：期望 $EXPECT，实际 $ACTUAL"
+    die "校验不一致：期望 ${EXPECT}，实际 $ACTUAL"
   fi
   say "  ok $ACTUAL"
 else
@@ -65,8 +65,8 @@ else
     die "拿不到任何 sha256（$SHA_URL 与服务端 x-sha256 都为空），拒绝安装未校验的二进制"
   fi
   ACTUAL=$(sha256sum "$TMP/agent" | awk '{print $1}')
-  [ "$EXPECT" = "$ACTUAL" ] || die "校验不一致：期望 $EXPECT，实际 $ACTUAL"
-  say "  ok $ACTUAL（来自响应头）"
+  [ "$EXPECT" = "$ACTUAL" ] || die "校验不一致：期望 ${EXPECT}，实际 $ACTUAL"
+  say "  ok ${ACTUAL}（来自响应头）"
 fi
 
 say "→ 安装到 $DEST/synapse-agent"

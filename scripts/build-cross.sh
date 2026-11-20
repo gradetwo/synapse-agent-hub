@@ -349,7 +349,7 @@ ensure_formula() {
   local formula="$1" cmd="$2"
   if command -v "$cmd" >/dev/null 2>&1; then return 0; fi
   if [ "$INSTALL_DEPS" = 0 ]; then
-    die "缺少 $formula（命令 $cmd）。手动安装：brew install $formula"
+    die "缺少 ${formula}（命令 ${cmd}）。手动安装：brew install $formula"
   fi
   ensure_brew
   info "安装 Homebrew 包：$formula"
@@ -392,7 +392,7 @@ ensure_cargo_tool() {
   local tool="$1" crate="$2"
   if command -v "$tool" >/dev/null 2>&1; then return 0; fi
   if [ "$INSTALL_DEPS" = 0 ]; then
-    die "缺少 $tool。手动安装：cargo install $crate"
+    die "缺少 ${tool}。手动安装：cargo install $crate"
   fi
   info "安装 cargo 工具：$crate"
   cargo install "$crate" || die "cargo install $crate 失败"
@@ -411,7 +411,7 @@ ensure_rust_target() {
     *" $triple "*) return 0 ;;
   esac
   if [ "$INSTALL_DEPS" = 0 ]; then
-    die "缺少 Rust target：$triple。手动安装：rustup target add $triple"
+    die "缺少 Rust target：${triple}。手动安装：rustup target add $triple"
   fi
   info "安装 Rust target：$triple"
   rustup target add "$triple" || die "rustup target add $triple 失败"
@@ -498,7 +498,7 @@ build_windows_gnu() {
   local triple="$1"
   local linker="x86_64-w64-mingw32-gcc"
   local ar="x86_64-w64-mingw32-ar"
-  info "执行：cargo build --release --target $triple（MinGW）"
+  info "执行：cargo build --release --target ${triple}（MinGW）"
   if [ "$DRY_RUN" = 1 ]; then return 0; fi
   CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$linker" \
   CC_x86_64_pc_windows_gnu="$linker" \

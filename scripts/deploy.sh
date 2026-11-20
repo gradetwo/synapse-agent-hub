@@ -197,7 +197,7 @@ normalize_targets() {
     esac
     case "$t" in
       linux-x64|linux-arm64|win-x64|macos-arm64|macos-x64) ;;
-      *) die "未知目标：$t（可选 linux-x64 linux-arm64 win-x64 macos-arm64 macos-x64）" ;;
+      *) die "未知目标：${t}（可选 linux-x64 linux-arm64 win-x64 macos-arm64 macos-x64）" ;;
     esac
     case " $out " in
       *" $t "*) ;;
@@ -318,7 +318,7 @@ read_versions() {
 check_versions() {
   read_versions
   if [ "$CARGO_VERSION" != "$SDK_VERSION" ]; then
-    warn "版本不一致：Cargo=$CARGO_VERSION Worker SDK_VERSION=$SDK_VERSION（发版前建议统一）"
+    warn "版本不一致：Cargo=$CARGO_VERSION Worker SDK_VERSION=${SDK_VERSION}（发版前建议统一）"
   fi
   info "build=$BUILD_TAG sdk=$SDK_VERSION cargo=$CARGO_VERSION"
 }
@@ -331,8 +331,10 @@ determine_base() {
     BASE="$(tr -d '[:space:]' < "$STATE_FILE")"
   elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
     BASE="HEAD~1"
+    info "没有 .deploy-state，首次按 HEAD~1 对比；如需覆盖更多提交，请用 --since 或 --all"
   else
     BASE="HEAD"
+    info "没有 .deploy-state 且没有 HEAD~1，按当前 HEAD 对比未提交改动"
   fi
   git rev-parse --verify "${BASE}^{commit}" >/dev/null 2>&1 \
     || die "无效的对比基线：$BASE"
@@ -366,7 +368,7 @@ collect_changes() {
     return 0
   fi
 
-  info "变更文件（相对 $BASE）："
+  info "变更文件（相对 ${BASE}）："
   printf '%s\n' "$CHANGED" | sed 's/^/  ~ /'
 
   local f
@@ -458,7 +460,7 @@ build_binaries() {
     return 0
   fi
 
-  info "编译目标：$TARGETS（win=$WIN_TOOLCHAIN）"
+  info "编译目标：${TARGETS}（win=${WIN_TOOLCHAIN}）"
   local host target targs=()
   host="$(uname -s)"
   if [ "$host" = "Darwin" ]; then
@@ -468,7 +470,7 @@ build_binaries() {
     for target in $TARGETS; do
       case "$target" in
         linux-x64|linux-arm64|win-x64) build_native_linux "$target" ;;
-        *) die "Linux 主机不能编译 $target；请用 macOS 主机或 --skip-build" ;;
+        *) die "Linux 主机不能编译 ${target}；请用 macOS 主机或 --skip-build" ;;
       esac
     done
   else
@@ -505,7 +507,7 @@ upload_binaries() {
       info "计划上传 binary：$name"
       continue
     fi
-    [ -f "$file" ] || die "缺少产物：$file（先编译，或用 --skip-build 提供）"
+    [ -f "$file" ] || die "缺少产物：${file}（先编译，或用 --skip-build 提供）"
     [ -f "$file.sha256" ] || write_sha "$file" "$(sha256_file "$file")"
     want="$(awk '{print $1}' "$file.sha256" | head -1)"
     got="$(sha256_file "$file")"
@@ -600,7 +602,7 @@ verify_release() {
   ver="$(curl -fsS --max-time 15 "$ENDPOINT/ver")"
   remote_build="$(printf '%s' "$ver" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("build",""))' 2>/dev/null || true)"
   [ -n "$remote_build" ] || die "无法解析 /ver：$ver"
-  [ "$remote_build" = "$BUILD_TAG" ] || warn "/ver build=$remote_build，本地 BUILD_TAG=$BUILD_TAG"
+  [ "$remote_build" = "$BUILD_TAG" ] || warn "/ver build=${remote_build}，本地 BUILD_TAG=$BUILD_TAG"
 
   curl -fsSL --max-time 15 "$ENDPOINT/dl/BUILD.txt" >/tmp/synapse-remote-build.$$ || die "无法读取 /dl/BUILD.txt"
   remote_commit="$(sed -n 's/^commit=//p' /tmp/synapse-remote-build.$$ | head -1)"
