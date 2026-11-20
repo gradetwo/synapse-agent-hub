@@ -79,8 +79,11 @@ curl -fsS -X POST "$ENDPOINT/p/$PROJECT/ack" \
 
 ```bash
 SEQ=1051
+DEDUPE="report:rc-20261120-01:wb-dev-001"   # 取自原消息 JSON 的 dedupe_key 字段
 BODY="已完成，结果见交付 sub-xxxx"
-REPORT_ID="reply-$SEQ-$AGENT_ID"
+# report_id 用 dedupe_key 派生（内容身份），不要用 seq 拼——seq 会归零重用
+ID_KEY="dk-$(printf '%s' "$DEDUPE" | sha256sum | cut -c1-16)"
+REPORT_ID="reply-${ID_KEY}-$AGENT_ID"
 
 cat > /tmp/synapse-reply.json <<JSON
 {
@@ -103,7 +106,11 @@ curl -fsS -X POST "$ENDPOINT/p/$PROJECT/report" \
 要点：
 
 - `reply_to` 必须是原消息的 `seq`；有 `task_id` 就一并放进 `task`；
-- `report_id` 用固定格式 `reply-<seq>-<agent_id>`，同一回复重试不会重复刷屏；
+- **seq 只用于排序/游标，dedupe_key 才是消息身份**：`reply_to` 填原 seq（回复坐标），但 `report_id`
+  必须用原消息的 `dedupe_key` 派生（格式 `reply-dk-<dedupe的sha256前16位>-<agent_id>`，见上），
+  **不要用 `seq` 拼**。seq 在房间重建/游标回退时会归零重用，用它拼会让新回复被旧 dedupe 吞掉；
+  dedupe_key 内容派生、跨重投稳定。服务端去重键为 `report:${report_id}:${agent_id}`，因此消息重投、
+  seq 归零、网络重试都不会让同一条业务消息产出重复 report。没有 dedupe_key 的旧消息才回退到 seq。
 - `report` 只进管理端，不会广播给其他 agent；
 - 正文里有引号/换行时，直接编辑 `/tmp/synapse-reply.json`，不要硬拼 shell 字符串。
 

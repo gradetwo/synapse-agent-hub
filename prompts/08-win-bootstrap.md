@@ -94,12 +94,26 @@ Rust CLI 没有 `report` 子命令，用自带 `curl.exe` 调 `/report`；`run` 
 $cfg = Get-Content "$HOME\.synapse-agent\config.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 ```
 
-内容回复管理端（`reply_to` 填原消息 `seq`；`report_id` 用固定格式防重试刷屏）：
+内容回复管理端（`reply_to` 填原消息 `seq`；`report_id` 用消息自带的 `dedupe_key` 派生防重试刷屏）：
+
+> **幂等键纪律**：`report_id` 是服务端 report 去重的幂等键，必须用**消息自带的 `dedupe_key`（内容身份）**
+> 派生，**不要用 `seq` 拼**。seq 会在房间重建/游标回退时归零重用，用它拼 report_id 会让新回复
+> 被旧 dedupe 吞掉；dedupe_key 内容派生、跨重投稳定。服务端去重键 `report:${report_id}:${agent_id}`，
+> 因此同一条业务消息无论重试多少次、seq 怎么变，都只产出一条 report。
 
 ```powershell
 $seq  = 1051
+$dedupe = "report:rc-20261120-01:doubao-dev-001"   # 取自原消息 JSON 的 dedupe_key 字段
+# 优先用 dedupe_key 做身份；没有时才回退到 seq（兼容旧消息）
+if ($dedupe) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $hex = ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($dedupe)) | ForEach-Object { $_.ToString("x2") }) -join ""
+  $idKey = "dk-" + $hex.Substring(0,16)
+} else {
+  $idKey = "seq-$seq"
+}
 $body = @{
-  report_id = "reply-$seq-$($cfg.agent_id)"
+  report_id = "reply-$idKey-$($cfg.agent_id)"
   task = @{ reply_to = $seq; state = "done"; body = "已完成" }
   resources = @{}
 } | ConvertTo-Json -Depth 6
@@ -108,7 +122,7 @@ curl.exe -fsS -X POST "$($cfg.endpoint)/p/$($cfg.project)/report" `
   -H "Content-Type: application/json" --data-binary $body
 ```
 
-处理纪律：严格按 `seq` 顺序；成功后再回正文，失败回 `blocked`/`refused`；不要用 `send`/`broadcast`（那是 admin 接口，普通 token 会 403）；不回复自己的消息；任务有 120 秒租约，长任务靠 `run` 保持心跳。
+处理纪律：严格按 `seq` 顺序（seq 只用于排序/游标，**dedupe_key 才是消息身份**，seq 会归零重用，绝不可当幂等键；report_id 必须用 dedupe_key 派生、见上）；成功后再回正文，失败回 `blocked`/`refused`；不要用 `send`/`broadcast`（那是 admin 接口，普通 token 会 403）；不回复自己的消息；任务有 120 秒租约，长任务靠 `run` 保持心跳。
 
 ---
 

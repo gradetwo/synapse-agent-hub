@@ -181,12 +181,24 @@ BIN="$STATE/.local/bin/synapse-agent"
 [ -n "$ENDPOINT" ] && [ -n "$PROJECT" ] && [ -n "$TOKEN" ] || { echo "配置读取失败" >&2; exit 2; }
 ```
 
-定义回复函数（第一个参数原消息 `seq`，第二个正文，第三个可选 `task_id`）：
+定义回复函数。参数依次为：原消息 `seq`、正文、可选 `task_id`、可选 `dedupe_key`。
+
+> **幂等键纪律（务必遵守）**：`report_id` 是服务端 report 去重的幂等键，必须用**消息自带的
+> `dedupe_key`（内容身份）**派生，而**不要用 `seq` 拼**。seq 会在房间重建/游标回退时归零重用，
+> 用它拼 report_id 会导致新回复被旧 dedupe 吞掉；dedupe_key 是内容派生的稳定身份，重投、
+> 归零都不变。服务端去重键为 `report:${report_id}:${agent_id}`——只要 dedupe_key 稳定，
+> 同一条业务消息无论重试多少次、seq 怎么变，都只会产出一条 report。
 
 ```bash
 hub_reply() {
-  seq="$1"; body="$2"; task_id="${3:-}"
-  report_id="reply-$seq-$AGENT_ID"
+  seq="$1"; body="$2"; task_id="${3:-}"; dedupe_key="${4:-}"
+  # 优先用 dedupe_key 做身份；没有时才回退到 seq（兼容极少数不带 dedupe_key 的旧消息）
+  if [ -n "$dedupe_key" ]; then
+    id_key="dk-$(printf '%s' "$dedupe_key" | sha256sum | cut -c1-16)"
+  else
+    id_key="seq-$seq"
+  fi
+  report_id="reply-${id_key}-$AGENT_ID"
   tmp="$(mktemp)"
   python3 - "$report_id" "$seq" "$body" "$task_id" > "$tmp" <<'PY'
 import json, sys
@@ -224,12 +236,14 @@ PY
      直接回到第 1 步再挂一个 wait 继续等。
 
 3. 解析消息。`wait.out` **可能混入非 JSON 的提示行**（如「还有 N 条积压，下轮继续」），
-   所以**不要**把整个文件直接喂给 `json.load`；要逐行挑出以 `{` 开头的合法 JSON：
+   所以**不要**把整个文件直接喂给 `json.load`；要逐行挑出以 `{` 开头的合法 JSON。
+   **同时提取 `seq`（用于 reply_to/排序）和 `dedupe_key`（用于 report 幂等身份）**：
 
    ```bash
-   MSG="$(python3 - "$STATE/wait.out" <<'PY'
+   # 输出两行：第一行 seq，第二行 dedupe_key（可能为空）
+   PARSED="$(python3 - "$STATE/wait.out" <<'PY'
 import json, sys
-seq = ""
+seq = dedupe = ""
 for line in open(sys.argv[1], encoding="utf-8"):
     line = line.strip()
     if not line.startswith("{"):
@@ -240,19 +254,23 @@ for line in open(sys.argv[1], encoding="utf-8"):
         continue
     if "seq" in obj:
         seq = str(obj["seq"])
+        dedupe = str(obj.get("dedupe_key") or "")
         break
 print(seq)
+print(dedupe)
 PY
 )"
-   [ -z "$MSG" ] && { echo "未解析到 seq（多半是 wait 超时），继续挂 wait"; }
+   SEQ="$(printf '%s\n' "$PARSED" | sed -n '1p')"
+   DEDUPE="$(printf '%s\n' "$PARSED" | sed -n '2p')"
+   [ -z "$SEQ" ] && { echo "未解析到 seq（多半是 wait 超时），继续挂 wait"; }
    # 需要完整消息体时，同样逐行取那条 JSON 再用 obj["payload"]["body"] 等字段。
    ```
 
-4. 拿到 `seq` 后执行任务，然后回复（第一个参数是原消息 `seq`）：
+4. 拿到 `seq` 和 `dedupe_key` 后执行任务，然后回复（第 1 个参数 `seq`、第 4 个 `dedupe_key`）：
 
    ```bash
    # 执行任务 ...
-   hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx"
+   hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx" "" "$DEDUPE"
    # 有产物就 deliver（见下）
    ```
 
@@ -280,6 +298,11 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch \
 ## 阶段 7：处理纪律
 
 - 严格按 `seq` 顺序，不跳过积压；`wait` 内部已对 `ack_required=true` 自动 ack。
+- **seq 只用于排序/游标，dedupe_key 才是消息身份**：`seq` 在房间重建或游标回退时会归零重用，
+  绝不可当作业务幂等键。`reply_to` 填原 seq（这是"回复哪条"的坐标），但 report 的去重身份
+  必须走 `dedupe_key`——`hub_reply` 已自动用 `dedupe_key` 派生 `report_id`，你要做的是把从消息
+  里解析出的 `dedupe_key` 作为第 4 个参数传给它。好处：消息重投、seq 归零、网络重试都不会
+  让同一条业务消息产出重复 report（服务端去重键 `report:${report_id}:${agent_id}`）。
 - 回复必须带 `reply_to`（原 seq）或 `task_id`，用 `hub_reply` 固化该字段。
 - `ack` 的 `detail` 不是正文，结果只写 report/交付，不要只写在 ack 里。
 - 自己发的广播会被回声过滤，别写「收到就回复自己」的循环。

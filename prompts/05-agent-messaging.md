@@ -49,7 +49,10 @@ c.report("rc-20261120-01", {
 }, {"cpu_pct": 37, "mem_used_mb": 589})
 
 # 2) 回复管理端：report 只进管理端，不会广播给其他 agent
-c.report("reply-1051-doubao-dev-001", {
+# report_id 用原消息的 dedupe_key 派生（内容身份），不要用 seq 拼——seq 会归零重用
+import hashlib
+_reply_id = "reply-dk-" + hashlib.sha256(b"report:rc-20261120-01:doubao-dev-001").hexdigest()[:16] + "-doubao-dev-001"  # b"..." 处填原消息的 dedupe_key
+c.report(_reply_id, {
     "reply_to": 1051,
     "task_id": "T-001",
     "state": "done",
@@ -85,10 +88,15 @@ curl -fsS -X POST "$ENDPOINT/p/$PROJECT/report" \
   -d '{"report_id":"rc-20261120-01","task":{"task_id":"T-001","state":"in_progress","progress_pct":60},"resources":{}}'
 
 # 普通文本定向回复（raw HTTP）：to=admin，避免变成全项目广播
+# 注意 dedupe_key 是内容身份：用原消息的 dedupe_key 派生（reply-dk-<hash>-<agent>），
+# 不要用 seq 拼——seq 会归零重用；payload.reply_to 仍填原消息 seq。
+SEQ=1051
+DEDUPE="report:rc-20261120-01:doubao-dev-001"   # 取自原消息 JSON 的 dedupe_key 字段
+ID_KEY="dk-$(printf '%s' "$DEDUPE" | sha256sum | cut -c1-16)"
 curl -fsS -X POST "$ENDPOINT/p/$PROJECT/publish" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"topic":"report","kind":"text","to":"admin","dedupe_key":"reply-1051-doubao-dev-001","payload":{"reply_to":1051,"body":"已完成"}}'
+  -d "{\"topic\":\"report\",\"kind\":\"text\",\"to\":\"admin\",\"dedupe_key\":\"reply-${ID_KEY}-doubao-dev-001\",\"payload\":{\"reply_to\":$SEQ,\"body\":\"已完成\"}}"
 ```
 
 ## Rust CLI 的限制
@@ -104,5 +112,8 @@ curl -fsS -X POST "$ENDPOINT/p/$PROJECT/publish" \
 1. 先执行；成功后 `ack done`，失败 `ack blocked/refused`；进度用 `report`，不要把 `ack` 当正文。
 2. 回复必须带 `reply_to`（原消息 seq）或 `task_id`，方便管理端对账。
 3. 不要回复自己的消息；除非确实要广播，不要用 `publish`（会打扰其他 agent）。
-4. 同一回复用固定 `dedupe_key`，网络重试不会重复刷屏。
+4. **seq 只用于排序/游标，dedupe_key 才是消息身份**：同一回复的幂等键（`report_id`、或 publish 的
+   `dedupe_key`）必须用**原消息的 `dedupe_key`** 派生（格式 `reply-dk-<hash>-<agent>`，见上），
+   **不要用 seq 拼**。seq 在房间重建/游标回退时会归零重用，用它拼会让新回复被旧 dedupe 吞掉；
+   dedupe_key 内容派生、跨重投稳定，配合服务端去重，网络重试/消息重投/seq 归零都不会重复刷屏。
 5. token 只在 `Authorization` 头里，不写进日志、消息正文和交付物。

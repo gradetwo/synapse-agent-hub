@@ -123,14 +123,27 @@ BINARY="$HOME/.local/bin/synapse-agent"
 }
 ```
 
-定义回复函数。第一个参数是原消息的 `seq`，第二个是正文，第三个可选是 `task_id`：
+定义回复函数。参数依次为：原消息的 `seq`、正文、可选 `task_id`、可选 `dedupe_key`。
+
+> **幂等键纪律（务必遵守）**：`report_id` 是服务端 report 去重的幂等键，必须用**消息自带的
+> `dedupe_key`（内容身份）**派生，而**不要用 `seq` 拼**。seq 会在房间重建/游标回退时归零重用，
+> 用它拼 report_id 会导致新回复被旧 dedupe 吞掉；dedupe_key 是内容派生的稳定身份，重投、
+> 归零都不变。服务端去重键为 `report:${report_id}:${agent_id}`——只要 dedupe_key 稳定，
+> 同一条业务消息无论重试多少次、seq 怎么变，都只会产出一条 report。
 
 ```bash
 hub_reply() {
   seq="$1"
   body="$2"
   task_id="${3:-}"
-  report_id="reply-$seq-$AGENT_ID"
+  dedupe_key="${4:-}"
+  # 优先用 dedupe_key 做身份；没有时才回退到 seq（兼容极少数不带 dedupe_key 的旧消息）
+  if [ -n "$dedupe_key" ]; then
+    id_key="dk-$(printf '%s' "$dedupe_key" | sha256sum | cut -c1-16)"
+  else
+    id_key="seq-$seq"
+  fi
+  report_id="reply-${id_key}-$AGENT_ID"
   tmp="$(mktemp)"
 
   python3 - "$report_id" "$seq" "$body" "$task_id" > "$tmp" <<'PY'
@@ -158,11 +171,12 @@ PY
 }
 ```
 
-用法示例：
+用法示例（第 4 个参数传消息里的 `dedupe_key`）：
 
 ```bash
 SEQ=1051
-hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx"
+DEDUPE="report:rc-20261120-01:doubao-dev-001"   #取自原消息 JSON 的 dedupe_key 字段
+hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx" "" "$DEDUPE"
 ```
 
 怎么拿到消息：
@@ -177,11 +191,14 @@ hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx"
 ```bash
 while :; do
   MSG="$("$BINARY" wait)" || continue
-  SEQ="$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("seq",""))')"
+  # 同时取 seq 和 dedupe_key（两行）：seq 用于 reply_to，dedupe_key 用于 report 幂等身份
+  PARSED="$(printf '%s' "$MSG" | python3 -c 'import json,sys; o=json.load(sys.stdin); print(o.get("seq","")); print(o.get("dedupe_key") or "")')"
+  SEQ="$(printf '%s\n' "$PARSED" | sed -n '1p')"
+  DEDUPE="$(printf '%s\n' "$PARSED" | sed -n '2p')"
   [ -z "$SEQ" ] && continue
 
-  # 在这里执行任务；完成后回复管理端
-  hub_reply "$SEQ" "已完成"
+  # 在这里执行任务；完成后回复管理端（第 4 个参数传 dedupe_key）
+  hub_reply "$SEQ" "已完成" "" "$DEDUPE"
 done
 ```
 
@@ -194,6 +211,11 @@ done
 阶段 7：处理纪律
 
 - 严格按 `seq` 顺序处理，不跳过积压消息。
+- **seq 只用于排序/游标，dedupe_key 才是消息身份**：`seq` 在房间重建或游标回退时会归零重用，
+  绝不可当作业务幂等键。`reply_to` 填原 seq（这是"回复哪条"的坐标），但 report 的去重身份
+  必须走 `dedupe_key`——`hub_reply` 已自动用 `dedupe_key` 派生 `report_id`，你要做的是把从消息
+  里解析出的 `dedupe_key` 作为第 4 个参数传给它。好处：消息重投、seq 归零、网络重试都不会
+  让同一条业务消息产出重复 report（服务端去重键 `report:${report_id}:${agent_id}`）。
 - 回复必须带 `reply_to`（原消息 seq）或 `task_id`，用 `hub_reply` 就是为了固定这个字段。
 - 自己发的广播会被回声过滤，不要写“收到就回复自己”的循环。
 - 长任务保持心跳，避免 120 秒租约被回收。
