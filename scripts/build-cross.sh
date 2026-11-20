@@ -4,6 +4,9 @@
 # 支持目标：
 #   linux-x64     -> x86_64-unknown-linux-musl
 #   linux-arm64   -> aarch64-unknown-linux-musl
+#   linux-x64-gnu   -> x86_64-unknown-linux-gnu（动态 glibc；musl 静态版的
+#                      自带 DNS 解析在受限沙箱环境可能不可用，这类环境用 gnu 版）
+#   linux-arm64-gnu -> aarch64-unknown-linux-gnu（同上）
 #   win-x64       -> x86_64-pc-windows-msvc 或 x86_64-pc-windows-gnu
 #   macos-arm64   -> aarch64-apple-darwin
 #   macos-x64     -> x86_64-apple-darwin
@@ -70,6 +73,8 @@ Synapse Rust SDK 交叉编译脚本（macOS）
 目标：
   linux-x64        Linux x86_64，静态 musl
   linux-arm64      Linux ARM64，静态 musl
+  linux-x64-gnu    Linux x86_64，动态 glibc（受限网络环境用）
+  linux-arm64-gnu  Linux ARM64，动态 glibc（受限网络环境用）
   win-x64          Windows x86_64，默认 MSVC，可用 --win-toolchain gnu
   macos-arm64      macOS Apple Silicon
   macos-x64        macOS Intel
@@ -103,6 +108,8 @@ list_targets() {
 支持的目标：
   linux-x64       -> x86_64-unknown-linux-musl
   linux-arm64     -> aarch64-unknown-linux-musl
+  linux-x64-gnu   -> x86_64-unknown-linux-gnu
+  linux-arm64-gnu -> aarch64-unknown-linux-gnu
   win-x64         -> x86_64-pc-windows-msvc 或 x86_64-pc-windows-gnu
   macos-arm64     -> aarch64-apple-darwin
   macos-x64       -> x86_64-apple-darwin
@@ -110,6 +117,8 @@ list_targets() {
 别名：
   linux-x86_64 / linux-amd64 -> linux-x64
   linux-aarch64              -> linux-arm64
+  linux-x64-glibc            -> linux-x64-gnu
+  linux-arm64-glibc          -> linux-arm64-gnu
   windows-x64 / win64        -> win-x64
   darwin-arm64               -> macos-arm64
   darwin-x64                 -> macos-x64
@@ -122,6 +131,8 @@ normalize_target() {
   case "$t" in
     linux-x64|linux-x86_64|linux-amd64) printf '%s' 'linux-x64' ;;
     linux-arm64|linux-aarch64|linux-arm) printf '%s' 'linux-arm64' ;;
+    linux-x64-gnu|linux-x86_64-gnu|linux-amd64-gnu|linux-x64-glibc) printf '%s' 'linux-x64-gnu' ;;
+    linux-arm64-gnu|linux-aarch64-gnu|linux-arm64-glibc) printf '%s' 'linux-arm64-gnu' ;;
     win-x64|windows-x64|windows-x86_64|win64|windows-amd64) printf '%s' 'win-x64' ;;
     macos-arm64|darwin-arm64|mac-arm64) printf '%s' 'macos-arm64' ;;
     macos-x64|darwin-x64|mac-x64|macos-x86_64) printf '%s' 'macos-x64' ;;
@@ -420,7 +431,7 @@ ensure_rust_target() {
 prepare_for_target() {
   local t="$1"
   case "$t" in
-    linux-x64|linux-arm64)
+    linux-x64|linux-arm64|linux-x64-gnu|linux-arm64-gnu)
       if [ "$LINUX_TOOLCHAIN" = "zigbuild" ]; then
         ensure_zig
         ensure_cargo_tool cargo-zigbuild cargo-zigbuild
@@ -467,6 +478,8 @@ else
     case "$t" in
       linux-x64)      ensure_rust_target x86_64-unknown-linux-musl ;;
       linux-arm64)    ensure_rust_target aarch64-unknown-linux-musl ;;
+      linux-x64-gnu)  ensure_rust_target x86_64-unknown-linux-gnu ;;
+      linux-arm64-gnu) ensure_rust_target aarch64-unknown-linux-gnu ;;
       win-x64)
         case "$WIN_TOOLCHAIN" in
           msvc) ensure_rust_target x86_64-pc-windows-msvc ;;
@@ -518,6 +531,8 @@ artifact_name() {
   case "$1" in
     linux-x64)    printf '%s' "synapse-agent-x86_64-linux-musl" ;;
     linux-arm64)  printf '%s' "synapse-agent-aarch64-linux-musl" ;;
+    linux-x64-gnu)   printf '%s' "synapse-agent-x86_64-linux-gnu" ;;
+    linux-arm64-gnu) printf '%s' "synapse-agent-aarch64-linux-gnu" ;;
     win-x64)      printf '%s' "synapse-agent-x86_64-windows-${WIN_TOOLCHAIN}.exe" ;;
     macos-arm64)  printf '%s' "synapse-agent-aarch64-apple-darwin" ;;
     macos-x64)    printf '%s' "synapse-agent-x86_64-apple-darwin" ;;
@@ -528,6 +543,8 @@ target_triple() {
   case "$1" in
     linux-x64)    printf '%s' "x86_64-unknown-linux-musl" ;;
     linux-arm64)  printf '%s' "aarch64-unknown-linux-musl" ;;
+    linux-x64-gnu)   printf '%s' "x86_64-unknown-linux-gnu" ;;
+    linux-arm64-gnu) printf '%s' "aarch64-unknown-linux-gnu" ;;
     win-x64)
       case "$WIN_TOOLCHAIN" in
         msvc) printf '%s' "x86_64-pc-windows-msvc" ;;
@@ -561,7 +578,7 @@ for t in $TARGETS; do
 
   info "构建 $t ($triple)"
   case "$t" in
-    linux-x64|linux-arm64) build_linux "$triple" ;;
+    linux-x64|linux-arm64|linux-x64-gnu|linux-arm64-gnu) build_linux "$triple" ;;
     win-x64)
       if [ "$WIN_TOOLCHAIN" = "msvc" ]; then build_windows_msvc; else build_windows_gnu "$triple"; fi ;;
     macos-arm64|macos-x64) build_macos "$triple" ;;

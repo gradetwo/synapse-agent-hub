@@ -5,14 +5,14 @@
 #   bootstrap  空 Cloudflare 账号初始化：建 D1/R2、建表、设 secret、首次 deploy
 #   release    线上增量更新：只重建/上传变化的 binary，按需 deploy Worker
 #
-# 默认发布三套二进制：
-#   linux-x64 / linux-arm64 / win-x64
+# 默认发布四套二进制：
+#   linux-x64 / linux-arm64 / linux-x64-gnu / win-x64
 #
 # 用法：
 #   ./scripts/deploy.sh bootstrap --fresh --yes
 #   ./scripts/deploy.sh release --yes
 #   ./scripts/deploy.sh release --since HEAD~1 --dry-run
-#   ./scripts/deploy.sh release --targets linux-x64,linux-arm64,win-x64 --yes
+#   ./scripts/deploy.sh release --targets linux-x64,linux-arm64,linux-x64-gnu,win-x64 --yes
 #
 # 说明：
 # - release 不会创建 D1/R2，不会重跑 schema.sql，不会轮换 SESSION_SECRET。
@@ -40,7 +40,7 @@ FRESH=0
 SINCE=""
 ALL=0
 ALL_TARGETS=0
-TARGETS="linux-x64 linux-arm64 win-x64"
+TARGETS="linux-x64 linux-arm64 linux-x64-gnu win-x64"
 WIN_TOOLCHAIN="msvc"
 SKIP_BUILD=0
 SKIP_WORKER=0
@@ -83,8 +83,8 @@ release 选项：
   --since REF          指定对比基线，例如 HEAD~1、origin/main 或某个 commit
   --all                强制认为 Worker/Rust/安装脚本都变了
   --targets LIST       编译/上传目标，逗号或空格分隔
-                       默认 linux-x64 linux-arm64 win-x64
-                       all = linux-x64 linux-arm64 win-x64 macos-arm64 macos-x64
+                       默认 linux-x64 linux-arm64 linux-x64-gnu win-x64
+                       all = linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64 macos-arm64 macos-x64
   --win-toolchain msvc|gnu   Windows 工具链，默认 msvc
   --skip-build         跳过编译，直接用 dist/ 现有产物
   --skip-worker        不 deploy Worker
@@ -194,19 +194,21 @@ normalize_targets() {
   local raw out="" t
   raw="${1//,/ }"
   if [ "$raw" = "all" ] || [ "$ALL_TARGETS" = 1 ]; then
-    raw="linux-x64 linux-arm64 win-x64 macos-arm64 macos-x64"
+    raw="linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64 macos-arm64 macos-x64"
   fi
   for t in $raw; do
     case "$t" in
       linux-x86_64|linux-amd64) t="linux-x64" ;;
       linux-aarch64|linux-arm) t="linux-arm64" ;;
+      linux-x64-glibc) t="linux-x64-gnu" ;;
+      linux-arm64-glibc) t="linux-arm64-gnu" ;;
       windows-x64|windows-x86_64|win64|windows-amd64) t="win-x64" ;;
       darwin-arm64|mac-arm64) t="macos-arm64" ;;
       darwin-x64|mac-x64|macos-x86_64) t="macos-x64" ;;
     esac
     case "$t" in
-      linux-x64|linux-arm64|win-x64|macos-arm64|macos-x64) ;;
-      *) die "未知目标：${t}（可选 linux-x64 linux-arm64 win-x64 macos-arm64 macos-x64）" ;;
+      linux-x64|linux-arm64|linux-x64-gnu|linux-arm64-gnu|win-x64|macos-arm64|macos-x64) ;;
+      *) die "未知目标：${t}（可选 linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64 macos-arm64 macos-x64）" ;;
     esac
     case " $out " in
       *" $t "*) ;;
@@ -397,6 +399,8 @@ artifact_for() {
   case "$1" in
     linux-x64)   printf '%s' "synapse-agent-x86_64-linux-musl" ;;
     linux-arm64) printf '%s' "synapse-agent-aarch64-linux-musl" ;;
+    linux-x64-gnu)   printf '%s' "synapse-agent-x86_64-linux-gnu" ;;
+    linux-arm64-gnu) printf '%s' "synapse-agent-aarch64-linux-gnu" ;;
     win-x64)     printf '%s' "synapse-agent-x86_64-windows-${WIN_TOOLCHAIN}.exe" ;;
     macos-arm64) printf '%s' "synapse-agent-aarch64-apple-darwin" ;;
     macos-x64)   printf '%s' "synapse-agent-x86_64-apple-darwin" ;;
@@ -407,6 +411,8 @@ triple_for() {
   case "$1" in
     linux-x64)   printf '%s' "x86_64-unknown-linux-musl" ;;
     linux-arm64) printf '%s' "aarch64-unknown-linux-musl" ;;
+    linux-x64-gnu)   printf '%s' "x86_64-unknown-linux-gnu" ;;
+    linux-arm64-gnu) printf '%s' "aarch64-unknown-linux-gnu" ;;
     win-x64)
       case "$WIN_TOOLCHAIN" in
         msvc) printf '%s' "x86_64-pc-windows-msvc" ;;
@@ -435,10 +441,14 @@ build_native_linux() {
     run_in_rust rustup target add "$triple"
     run_in_rust env RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
       cargo build --release --target "$triple"
-  elif [ "$target" = "linux-arm64" ]; then
+  elif [ "$target" = "linux-arm64" ] || [ "$target" = "linux-arm64-gnu" ]; then
     [ "$DRY_RUN" = 1 ] || command -v cross >/dev/null 2>&1 || die "Linux arm64 需要 cargo install cross"
     run_in_rust rustup target add "$triple"
     run_in_rust cross build --release --target "$triple"
+  elif [ "$target" = "linux-x64-gnu" ]; then
+    # gnu 版是动态 glibc，不能带 musl 分支的 crt-static RUSTFLAGS
+    run_in_rust rustup target add "$triple"
+    run_in_rust cargo build --release --target "$triple"
   elif [ "$target" = "win-x64" ] && [ "$WIN_TOOLCHAIN" = "msvc" ]; then
     [ "$DRY_RUN" = 1 ] || command -v cargo-xwin >/dev/null 2>&1 || die "Windows MSVC 需要 cargo install cargo-xwin"
     run_in_rust rustup target add "$triple"
@@ -478,7 +488,7 @@ build_binaries() {
   elif [ "$host" = "Linux" ]; then
     for target in $TARGETS; do
       case "$target" in
-        linux-x64|linux-arm64|win-x64) build_native_linux "$target" ;;
+        linux-x64|linux-arm64|linux-x64-gnu|linux-arm64-gnu|win-x64) build_native_linux "$target" ;;
         *) die "Linux 主机不能编译 ${target}；请用 macOS 主机或 --skip-build" ;;
       esac
     done
