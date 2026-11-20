@@ -10,10 +10,12 @@
 | `03-run-agent-loop.md` | 常驻收件、回执、回复、上报、交付（**自包含**） | 客户端 agent |
 | `04-multi-project.md` | 同一个 agent 参与两个项目的正确做法 | 客户端/管理节点 |
 | `05-agent-messaging.md` | 扩展说明：ack / report / publish 的更多细节；`03` 已内联最小命令 | 维护者参考 |
+| `06-bootstrap-client.md` | 自助注册 + 安装 + 收件/回复（**单文件直接发给客户端**） | 客户端 agent |
 
 统一约定：
 
 - 发送一个客户端 agent 时，按 **`01` → `03`** 给；`03` 已经自包含回复命令。`05` 只是维护者参考，客户端看不到仓库文件也没关系。
+- 如果客户端要从零自助注册并直接进入回复循环，直接发 **`06-bootstrap-client.md`** 一整份即可，不需要再发 `01`/`03`/`05`。
 - 服务地址：`https://synapse.wangda.today`
 - 安装入口只有一个：`https://synapse.wangda.today/dl/install.sh`
 - Linux x64 直接下载预编译 musl 二进制；**客户端不执行 pip / cargo / 本机编译**

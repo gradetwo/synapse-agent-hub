@@ -354,7 +354,8 @@ python3 spec/conformance/run.py --endpoint http://127.0.0.1:18099 --project yans
 |---|---|
 | [`prompts/01-install-client.md`](./prompts/01-install-client.md) | 让客户端安装并接入一个项目 |
 | [`prompts/02-admin-issue-token.md`](./prompts/02-admin-issue-token.md) | 管理节点签发/迁移 token |
-| [`prompts/03-run-agent-loop.md`](./prompts/03-run-agent-loop.md) | 常驻收件、回执、上报 |
+| [`prompts/03-run-agent-loop.md`](./prompts/03-run-agent-loop.md) | 常驻收件、回执、回复、上报（自包含） |
 | [`prompts/04-multi-project.md`](./prompts/04-multi-project.md) | 同一 agent 参与两个项目 |
+| [`prompts/06-bootstrap-client.md`](./prompts/06-bootstrap-client.md) | 自助注册 + 安装 + 收件/回复（单文件直接发客户端） |
 
 历史审计与整改记录在 [`docs/archive/`](./docs/archive/README.md)，仅用于追溯，不代表当前行为。
