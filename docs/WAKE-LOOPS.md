@@ -32,7 +32,7 @@ n = c.deliver(msgs)           # 落盘 + 追加 INBOX.md + 可选 notify_cmd + �
 2. `~/.synapse-agent/INBOX.md`（人可读，可直接粘进对话当上下文）
 3. 若配置 `notify_cmd`（如 `tmux send-keys -t agent '有新广播' Enter`），执行它把提示注入运行中的会话
 
-配套：`python3 -m synapse daemon`（或 Rust `synapse-agent run`）常驻；`install.sh` 成功后注册 systemd 用户服务（开机自启、崩溃自拉）。
+配套：`python3 -m synapse daemon`（或 Rust `synapse-agent run`）常驻；`install.sh` 会探测 systemd，有则注册服务，无则用 `nohup` 后台启动，PID/日志在 `~/.synapse-agent/agent.pid` 和 `agent.log`。
 
 ## 2. LLM agent（本平台实测）
 

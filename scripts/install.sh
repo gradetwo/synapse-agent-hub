@@ -52,11 +52,58 @@ echo "→ 通道：预编译二进制（静态 musl，免 glibc）"
   echo "  ✓ sha256 校验通过 ($GOT)"
   install -m 755 "$TMP" "${HOME}/.local/bin/synapse-agent"
   "${HOME}/.local/bin/synapse-agent" init --endpoint "$ENDPOINT" --project "$PROJECT" --token "$TOKEN" ${AGENT:+--agent "$AGENT"}
-  UNIT_CMD="${HOME}/.local/bin/synapse-agent run"
 
 CFG="${HOME}/.synapse-agent/config.json"
-if [ -f "$CFG" ] && command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-  UNIT_DIR="${HOME}/.config/systemd/user"; mkdir -p "$UNIT_DIR"
+PID_FILE="${HOME}/.synapse-agent/agent.pid"
+LOG_FILE="${HOME}/.synapse-agent/agent.log"
+BIN="${HOME}/.local/bin/synapse-agent"
+
+[ -f "$CFG" ] || { echo "✗ 配置未生成：$CFG"; exit 1; }
+
+stop_nohup() {
+  if [ -f "$PID_FILE" ]; then
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+      echo "→ 停止旧的后台进程 pid=$OLD_PID"
+      kill "$OLD_PID" 2>/dev/null || true
+      sleep 1
+      if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill -9 "$OLD_PID" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$PID_FILE"
+  fi
+}
+
+start_nohup() {
+  if ! command -v nohup >/dev/null 2>&1; then
+    echo "→ 未找到 nohup；请手动常驻："
+    echo "    ${BIN} run"
+    return 0
+  fi
+  : > "$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  nohup "${BIN}" run >"$LOG_FILE" 2>&1 &
+  NEW_PID=$!
+  printf '%s\n' "$NEW_PID" > "$PID_FILE"
+  chmod 600 "$PID_FILE" 2>/dev/null || true
+  sleep 1
+  if kill -0 "$NEW_PID" 2>/dev/null; then
+    echo "✓ 已用 nohup 后台启动（pid=$NEW_PID）"
+    echo "  日志：$LOG_FILE"
+  else
+    echo "！后台进程启动后退出，最近日志："
+    tail -n 20 "$LOG_FILE" 2>/dev/null || true
+    exit 1
+  fi
+}
+
+# 先探测 systemd 用户会话；有就注册服务，没有就自动用 nohup 常驻。
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  echo "→ 检测到 systemd 用户会话，注册 synapse-agent.service"
+  stop_nohup
+  UNIT_DIR="${HOME}/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
   cat > "$UNIT_DIR/synapse-agent.service" <<UNIT
 [Unit]
 Description=synapse agent heartbeat daemon
@@ -64,20 +111,25 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${UNIT_CMD}
+ExecStart=${BIN} run
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=default.target
 UNIT
-  systemctl --user daemon-reload >/dev/null 2>&1
-  systemctl --user enable --now synapse-agent >/dev/null 2>&1 && \
-    echo "✓ 已注册 systemd 用户服务（开机自启，崩溃自拉）" || \
-    echo "！systemd 注册失败，可手动： systemctl --user enable --now synapse-agent"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if systemctl --user enable --now synapse-agent >/dev/null 2>&1 \
+     && systemctl --user restart synapse-agent >/dev/null 2>&1; then
+    echo "✓ 已注册并启动 systemd 用户服务（开机自启，崩溃自拉）"
+  else
+    echo "！systemd 注册失败，回退 nohup"
+    rm -f "$UNIT_DIR/synapse-agent.service" 2>/dev/null || true
+    start_nohup
+  fi
 else
-  echo "→ 未检测到 systemd 用户会话；请自行常驻："
-  echo "    nohup ${UNIT_CMD} >/dev/null 2>&1 &"
+  echo "→ 未检测到可用 systemd 用户会话，使用 nohup 后台启动"
+  start_nohup
 fi
 
-echo "✓ 完成。配置在 ~/.synapse-agent/config.json（600），token 只在本地。"
+echo "✓ 完成。配置在 ${CFG}（600），token 只在本地。"

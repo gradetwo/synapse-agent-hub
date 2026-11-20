@@ -146,7 +146,7 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 2. 其它平台直接报错退出，不会 pip / cargo / 本机编译。
 3. 按架构从 `/dl/synapse-agent-x86_64-linux-musl` 或 `/dl/synapse-agent-aarch64-linux-musl` 下载，动态取 `.sha256` 边车或 `x-sha256` 响应头校验。
 4. 安装到 `~/.local/bin/synapse-agent`，执行 `init` 写 `~/.synapse-agent/config.json`（600）。
-5. 有 systemd 用户会话时注册 `synapse-agent.service`；没有则打印手动常驻命令。
+5. 探测 systemd 用户会话：有则注册 `synapse-agent.service`；没有则自动用 `nohup` 后台启动，PID 写到 `~/.synapse-agent/agent.pid`，日志写到 `~/.synapse-agent/agent.log`。
 
 macOS 由维护者按 [`BUILD.md`](./BUILD.md) 编译后，手动执行：
 

@@ -36,11 +36,20 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 curl -fsS https://synapse.wangda.today/ver
 ```
 
-如果机器没有 systemd 用户会话，安装脚本会提示手动常驻；按提示执行：
+安装脚本会先探测 systemd 用户会话：有 systemd 就注册服务，没有就自动用 `nohup` 后台启动。有 systemd 时检查：
 
 ```bash
-nohup "$HOME/.local/bin/synapse-agent" run >/tmp/synapse-agent.log 2>&1 &
+systemctl --user status synapse-agent --no-pager
 ```
+
+无 systemd 时检查：
+
+```bash
+cat "$HOME/.synapse-agent/agent.pid"
+tail -n 20 "$HOME/.synapse-agent/agent.log"
+```
+
+如果进程没有起来，先看日志；不要重复执行安装脚本。
 
 ## 完成标准
 
