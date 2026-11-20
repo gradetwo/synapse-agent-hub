@@ -14,10 +14,13 @@ mod profile;
 mod winmsg;
 mod localbus;
 use std::io::{Write, Read};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ureq::Agent;
 use tungstenite::{connect, Message};
 use sha2::{Digest, Sha256};
+
+/// WS 连续失败后进入轮询的窗口；到点必须重新尝试 WS，避免一次网络抖动永久降级。
+const WS_RETRY_AFTER_POLL: u64 = 120;
 
 struct Cfg {
     cmd: String,
@@ -229,6 +232,18 @@ fn journal_save(dir: &PathBuf, items: &[Value]) {
 
 fn seq_of(m: &Value) -> Option<u64> { m["seq"].as_u64() }
 
+/// 消息身份：优先 dedupe_key（内容身份，seq 归零/重投都不变）；旧消息没有才退回 seq。
+fn dedupe_key_of(m: &Value) -> Option<&str> {
+    m["dedupe_key"].as_str().filter(|s| !s.is_empty())
+}
+
+fn same_message(a: &Value, b: &Value) -> bool {
+    match (dedupe_key_of(a), dedupe_key_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => seq_of(a).is_some() && seq_of(a) == seq_of(b),
+    }
+}
+
 /// 房间重建：游标归零、换 epoch、清空未处理 WAL。
 fn reset_room_state(cfg: &Cfg, epoch: &str, journal: Option<&Arc<Mutex<Vec<Value>>>>) {
     cursor_set(&cfg.dir, 0);
@@ -262,9 +277,10 @@ fn enqueue_message(cfg: &Cfg, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) -> bo
     let Some(seq) = seq_of(m) else { return false };
     if seq <= cursor_get(&cfg.dir) { return false; }
     let mut items = journal.lock().unwrap();
-    if items.iter().any(|x| seq_of(x) == Some(seq)) {
+    if items.iter().any(|x| same_message(x, m)) {
         drop(items);
-        // 崩溃点落在“已写 WAL、未推游标”之间：WAL 里已有，补推游标即可，不能重复投递
+        // 崩溃点落在“已写 WAL、未推游标”之间：WAL 里已有，补推游标即可，不能重复投递。
+        // 同一 dedupe_key 换了 seq 重投时也走这里，避免同一条业务消息被执行两次。
         if seq > cursor_get(&cfg.dir) { cursor_set(&cfg.dir, seq); }
         return false;
     }
@@ -276,10 +292,10 @@ fn enqueue_message(cfg: &Cfg, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) -> bo
     true
 }
 
-/// 处理完成：从 WAL 移除。
-fn dequeue_message(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>, seq: u64) {
+/// 处理完成：从 WAL 移除（优先按 dedupe_key 身份匹配，旧消息按 seq）。
+fn dequeue_message(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) {
     let mut items = journal.lock().unwrap();
-    items.retain(|x| seq_of(x) != Some(seq));
+    items.retain(|x| !same_message(x, m));
     journal_save(dir, &items);
 }
 
@@ -359,6 +375,28 @@ fn write_run_state(dir: &PathBuf, body: &Value) {
     atomic_write(&dir.join("run.state.json"), body.to_string().as_bytes());
 }
 
+/// 连接/断开时立即落状态，避免 status 要等下一次心跳（最长 60s）才看到真实 connected。
+fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
+                  last_msg_ms: u64, unacked: usize, gate: &Mutex<()>) {
+    // 与心跳线程共用一把写锁：谁最后写，谁的 connected 就是写锁内读到的原子值，
+    // 避免“刚连上就被上一轮心跳写成 false”的竞态。
+    let _g = gate.lock().unwrap();
+    // 连/断事件只改连接相关字段，保留上一拍心跳结果；否则 status 会在断开瞬间
+    // 把 last_hb_ok/last_hb_ms 写成 null，看起来像从未心跳成功。
+    let old: Value = fs::read_to_string(dir.join("run.state.json")).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let old_last_msg = old["last_msg_ms"].as_u64().unwrap_or(0);
+    let last_msg_ms = old_last_msg.max(last_msg_ms);
+    write_run_state(dir, &json!({
+        "connected": connected, "transport": "ws",
+        "last_hb_ok": old["last_hb_ok"].clone(),
+        "last_hb_ms": old["last_hb_ms"].clone(),
+        "last_msg_ms": last_msg_ms, "queue": queue, "unacked": unacked,
+        "pid": std::process::id(),
+    }));
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
@@ -407,11 +445,11 @@ fn main() {
 
     // 单实例：同一 state dir 只允许一个 run/ws 常驻，避免两个进程抢游标、
     // 重复消费、服务端堆出多条死连接（flock 随进程退出自动释放）。
-    let _run_lock = if matches!(cfg.cmd.as_str(), "run" | "ws") {
+    let _run_lock = if matches!(cfg.cmd.as_str(), "run" | "ws" | "wait") {
         match acquire_run_lock(&cfg.dir) {
             Some(f) => Some(f),
             None => {
-                eprintln!("✗ 已有另一个 synapse-agent run 持有 {}/run.lock；本进程退出",
+                eprintln!("✗ 已有另一个 synapse-agent 常驻/等待进程持有 {}/run.lock；本进程退出",
                           cfg.dir.display());
                 std::process::exit(3);
             }
@@ -477,19 +515,26 @@ fn main() {
             }));
             return;
         }
-        // 长连接优先：连不上（环境不支持/代理拦/握手失败）再退回轮询
+        // 长连接优先：连不上（环境不支持/代理拦/握手失败）再退回轮询；
+        // 轮询只是临时降级，过一段时间必须再试 WS，不能一次失败就永久留在 poll。
         "run" | "ws" => {
             let force_poll = std::env::var("YANSHI_NO_WS").map(|v| v == "1").unwrap_or(false);
             if force_poll {
                 if cfg.cmd == "ws" { eprintln!("YANSHI_NO_WS=1 与 ws 冲突"); std::process::exit(2); }
                 eprintln!("YANSHI_NO_WS=1：强制轮询");
-            } else if run_ws(&cfg, &agent, &base) {
+                run_poll(&cfg, &agent, &base, None);
                 return;
-            } else if cfg.cmd == "ws" {
-                eprintln!("长连接建立失败；把子命令换成 run 可自动回退轮询");
+            }
+            if cfg.cmd == "ws" {
+                if run_ws(&cfg, &agent, &base) { return; }
+                eprintln!("长连接建立失败；把子命令换成 run 可自动回退轮询并定时重试 WS");
                 std::process::exit(2);
-            } else {
-                eprintln!("长连接不可用，回退轮询");
+            }
+            loop {
+                if run_ws(&cfg, &agent, &base) { return; }
+                eprintln!("[run] 长连接不可用，回退轮询 {}s 后重试 WS", WS_RETRY_AFTER_POLL);
+                run_poll(&cfg, &agent, &base, Some(Duration::from_secs(WS_RETRY_AFTER_POLL)));
+                eprintln!("[run] 轮询窗口结束，重试 WS");
             }
         }
         "wait" => {
@@ -940,60 +985,8 @@ fn main() {
         _ => {}
     }
 
-    // ── 轮询回退：心跳线程独立，主线程只负责拉取+执行，长任务不再压住心跳 ──
-    let poll_s = crate::profile::detect()["poll_s"].as_u64().unwrap_or(4).max(1);
-    let journal: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(journal_load(&cfg.dir)));
-    let replay: Vec<Value> = journal.lock().unwrap().clone();
-    for m in replay {
-        let text = serde_json::to_string(&m).unwrap_or_default();
-        if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
-        if let Some(seq) = seq_of(&m) { dequeue_message(&cfg.dir, &journal, seq); }
-    }
-
-    let last_msg = Arc::new(AtomicU64::new(0));
-    {
-        let (cfg2, agent2, base2, journal2, last2) =
-            (cfg.clone_lite(), agent.clone(), base.to_string(), journal.clone(), last_msg.clone());
-        thread::spawn(move || {
-            let mut hb: u64 = 0;
-            loop {
-                hb += 1;
-                let queue_len = journal2.lock().unwrap().len();
-                let body = heartbeat_payload(&cfg2, hb, queue_len, &journal2);
-                let ok = agent2
-                    .post(&format!("{}/p/{}/heartbeat", base2, cfg2.project))
-                    .set("authorization", &format!("Bearer {}", cfg2.token))
-                    .set("x-sdk-version", env!("CARGO_PKG_VERSION"))
-                    .set("connection", "close")
-                    .send_json(body).is_ok();
-                if !ok { eprintln!("[poll] heartbeat 失败 hb={hb}"); }
-                write_run_state(&cfg2.dir, &json!({
-                    "connected": ok, "transport": "poll", "last_hb_ok": ok,
-                    "last_hb_ms": now_ms() as u64,
-                    "last_msg_ms": last2.load(Ordering::Relaxed),
-                    "queue": queue_len, "unacked": queue_len, "pid": std::process::id(),
-                }));
-                thread::sleep(Duration::from_secs(cfg2.heartbeat_s.max(1)));
-            }
-        });
-    }
-
-    loop {
-        if let Some(msgs) = fetch_inbox(&cfg, &agent, &base, cursor_get(&cfg.dir), 5, Some(&journal), true) {
-            for m in msgs {
-                if is_noise(&cfg, &m) || !for_me(&cfg, &m) { continue; }
-                if !enqueue_message(&cfg, &journal, &m) { continue; }
-                let seq = seq_of(&m).unwrap_or(0);
-                let _ = ack_message(&cfg, &agent, &base, seq, "done",
-                                    &json!({"note": "poll 收到（receipt）"}), ack_required(&m));
-                let text = serde_json::to_string(&m).unwrap_or_default();
-                if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
-                dequeue_message(&cfg.dir, &journal, seq);
-                last_msg.store(now_ms() as u64, Ordering::Relaxed);
-            }
-        }
-        thread::sleep(Duration::from_secs(poll_s));
-    }
+    // ── 兜底：未知子命令仍按旧行为进入轮询常驻 ─────────────────
+    run_poll(&cfg, &agent, &base, None);
 }
 
 /// 取一条新消息（游标推进）；没有就返回 None
@@ -1210,6 +1203,13 @@ fn fetch_inbox(cfg: &Cfg, agent: &Agent, base: &str, mut since: u64, max_pages: 
     out.retain(|m| !is_noise(cfg, m) && for_me(cfg, m));
     out.sort_by_key(|m| seq_of(m).unwrap_or(0));
     out.dedup_by_key(|m| seq_of(m));
+    // 同一批里可能包含同一 dedupe_key 的不同 seq（重投/房间重建）。先按 seq 排序，
+    // 再按内容身份保留最早的一条，避免 wait 逐条取时把同一业务消息打印两次。
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|m| match dedupe_key_of(m) {
+        Some(k) => seen_keys.insert(k.to_string()),
+        None => true,
+    });
     // 全是 ack 回声/发给别人的消息时，也要把游标越过它们，否则每轮都从头重拉
     if out.is_empty() && advance_nonactionable && last_seen > cursor_get(&cfg.dir) {
         cursor_set(&cfg.dir, last_seen);
@@ -1277,7 +1277,7 @@ fn exec_task(cmd: &str, task: &str) {
 /// 把一条消息投递出去：先 WAL（inflight）落盘，再回执“已收到”，最后入队给主线程。
 fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
               journal: &Arc<Mutex<Vec<Value>>>, m: &Value,
-              tx: &mpsc::SyncSender<String>, queue: &AtomicUsize, last_msg: &AtomicU64) {
+              tx: &mpsc::Sender<(String, bool)>, queue: &AtomicUsize, last_msg: &AtomicU64) {
     if is_noise(cfg, m) || !for_me(cfg, m) { return; }
     if !enqueue_message(cfg, journal, m) { return; }
     let seq = seq_of(m).unwrap_or(0);
@@ -1286,11 +1286,99 @@ fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
     let text = serde_json::to_string(m).unwrap_or_default();
     // 先加计数再入队：主线程可能在 send 返回前就取走并减计数，顺序反了会把 queue 卡在虚高值
     queue.fetch_add(1, Ordering::Relaxed);
-    if tx.send(text).is_err() {
+    if tx.send((text, false)).is_err() {
         let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
                                  |x| Some(x.saturating_sub(1)));
     }
     last_msg.store(now_ms() as u64, Ordering::Relaxed);
+}
+
+/// 轮询模式（也是 WS 失败后的降级通道）。max_duration=None 表示常驻轮询；
+/// Some(d) 表示只跑 d 这么久，然后返回让调用方重试 WS。
+fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>) {
+    let poll_s = crate::profile::detect()["poll_s"].as_u64().unwrap_or(4).max(1);
+    let journal: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(journal_load(&cfg.dir)));
+    let last_msg = Arc::new(AtomicU64::new(0));
+    let poll_stop = Arc::new(AtomicBool::new(false));
+
+    // 心跳独立于收件/执行：长任务不能把 heartbeat 压住。
+    let hb_handle = {
+        let (cfg2, agent2, base2, journal2, last2, stop2) =
+            (cfg.clone_lite(), agent.clone(), base.to_string(), journal.clone(),
+             last_msg.clone(), poll_stop.clone());
+        thread::spawn(move || {
+            let mut hb: u64 = 0;
+            loop {
+                if stop2.load(Ordering::Relaxed) { break; }
+                hb += 1;
+                let queue_len = journal2.lock().unwrap().len();
+                let body = heartbeat_payload(&cfg2, hb, queue_len, &journal2);
+                let ok = agent2
+                    .post(&format!("{}/p/{}/heartbeat", base2, cfg2.project))
+                    .set("authorization", &format!("Bearer {}", cfg2.token))
+                    .set("x-sdk-version", env!("CARGO_PKG_VERSION"))
+                    .set("connection", "close")
+                    .send_json(body).is_ok();
+                if !ok { eprintln!("[poll] heartbeat 失败 hb={hb}"); }
+                write_run_state(&cfg2.dir, &json!({
+                    "connected": ok, "transport": "poll", "last_hb_ok": ok,
+                    "last_hb_ms": now_ms() as u64,
+                    "last_msg_ms": last2.load(Ordering::Relaxed),
+                    "queue": queue_len, "unacked": queue_len, "pid": std::process::id(),
+                }));
+                // 分片睡眠，让 run_poll 到点返回时最多等 1s，不必等满一个心跳周期。
+                let wait_until = Instant::now() + Duration::from_secs(cfg2.heartbeat_s.max(1));
+                while !stop2.load(Ordering::Relaxed) && Instant::now() < wait_until {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        })
+    };
+
+    // 先启动心跳，再重放 WAL：重放里的 exec 任务再慢，也不会让心跳停摆。
+    let replay: Vec<Value> = journal.lock().unwrap().clone();
+    for m in replay {
+        if let Some(seq) = seq_of(&m) {
+            let _ = ack_message(cfg, agent, base, seq, "done",
+                                &json!({"note": "poll 启动重放（receipt）"}), ack_required(&m));
+        }
+        let text = serde_json::to_string(&m).unwrap_or_default();
+        if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
+        dequeue_message(&cfg.dir, &journal, &m);
+        last_msg.store(now_ms() as u64, Ordering::Relaxed);
+    }
+
+    let started = Instant::now();
+    loop {
+        if let Some(limit) = max_duration {
+            if started.elapsed() >= limit { break; }
+        }
+        if let Some(msgs) = fetch_inbox(&cfg, &agent, &base, cursor_get(&cfg.dir), 5, Some(&journal), true) {
+            for m in msgs {
+                if is_noise(&cfg, &m) || !for_me(&cfg, &m) { continue; }
+                if !enqueue_message(&cfg, &journal, &m) { continue; }
+                let seq = seq_of(&m).unwrap_or(0);
+                let _ = ack_message(&cfg, &agent, &base, seq, "done",
+                                    &json!({"note": "poll 收到（receipt）"}), ack_required(&m));
+                let text = serde_json::to_string(&m).unwrap_or_default();
+                if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
+                dequeue_message(&cfg.dir, &journal, &m);
+                last_msg.store(now_ms() as u64, Ordering::Relaxed);
+            }
+        }
+        thread::sleep(Duration::from_secs(poll_s));
+    }
+
+    poll_stop.store(true, Ordering::Relaxed);
+    let _ = hb_handle.join();
+    // 交给 WS 重试前先把状态改成“轮询已停”，避免旧状态继续显示 connected=true。
+    let mut st: Value = fs::read_to_string(cfg.dir.join("run.state.json")).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    st["connected"] = json!(false);
+    st["transport"] = json!("poll");
+    st["pid"] = json!(std::process::id());
+    write_run_state(&cfg.dir, &st);
 }
 
 /// WebSocket 长连接：收件线程（重连/探活/补拉）+ 心跳线程 + 主线程执行。
@@ -1298,25 +1386,27 @@ fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
 fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
     let ws_base = base.replace("https://", "wss://").replace("http://", "ws://");
     let journal: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(journal_load(&cfg.dir)));
-    // 启动时重放崩溃前未处理完的 inflight（receipt 已回过，这里只补本地处理）
+    // 启动时的 inflight 不在这里同步执行：先把它们排到主线程队列，再建立连接/心跳。
+    // 否则一条卡住的重放任务会让 WS 永远连不上，status 也看不到 reconnect。
     let pending: Vec<Value> = { let g = journal.lock().unwrap(); g.clone() };
-    for m in pending {
-        let text = serde_json::to_string(&m).unwrap_or_default();
-        if let Some(seq) = seq_of(&m) {
-            // 上次可能刚写 WAL 就崩了、receipt 还没发出去：重放时补一次（已回过会 409，视为成功）
-            let _ = ack_message(cfg, agent, base, seq, "done",
-                                &json!({"note": "run 启动重放（receipt）"}), ack_required(&m));
-        }
-        if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
-        if let Some(seq) = seq_of(&m) { dequeue_message(&cfg.dir, &journal, seq); }
-    }
-    let (tx, rx) = mpsc::sync_channel::<String>(200);
+    // 无界队列：收件线程绝不因主线程在跑长任务而阻塞。磁盘 WAL 仍是上限，
+    // queue 只保存消息 JSON，积压几百条也不会把 WS 读取/心跳卡死。
+    let (tx, rx) = mpsc::channel::<(String, bool)>();
     let state = Arc::new(Mutex::new(("idle".to_string(), String::new(), 0usize)));
     let connected = Arc::new(AtomicBool::new(false));
     let queue = Arc::new(AtomicUsize::new(0));
     let last_msg = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let superseded = Arc::new(AtomicBool::new(false));
+    let state_gate = Arc::new(Mutex::new(()));
+
+    // 重放先入队（此时收件线程还没启动，保证 replay 排在新消息前面）。
+    for m in pending {
+        let text = serde_json::to_string(&m).unwrap_or_default();
+        if tx.send((text, true)).is_ok() {
+            queue.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     // 收件线程：连接、收、断线重连；任务执行期间照常入队
     {
@@ -1329,9 +1419,11 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         let ws_base2 = ws_base.clone();
         let stop2 = stop.clone();
         let superseded2 = superseded.clone();
+        let gate2 = state_gate.clone();
         thread::spawn(move || {
             let mut backoff = 1u64;
             let mut fails = 0u32;
+            let connected_at: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
             loop {
                 if stop2.load(Ordering::Relaxed) { break; }
                 let ticket = match ws_ticket(&cfg2, &agent2, &base2) {
@@ -1348,9 +1440,15 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                 let url = format!("{}/p/{}/ws?ticket={}", ws_base2, cfg2.project, ticket);
                 match connect(&url) {
                     Ok((mut sock, _r)) => {
-                        backoff = 1;
+                        connected_at.set(Some(Instant::now()));
+                        // 握手成功就清空“连续连接失败”计数；不能等到第一条消息，
+                        // 否则一条安静但健康的连接会被上一次失败计数拖进轮询。
+                        fails = 0;
                         connected2.store(true, Ordering::Relaxed);
                         println!("ws connected {}", url.split("/ws?").next().unwrap_or(""));
+                        let unacked = journal2.lock().unwrap().len();
+                        write_ws_state(&cfg2.dir, true, queue2.load(Ordering::Relaxed),
+                                       last2.load(Ordering::Relaxed), unacked, &gate2);
                         // 读超时：黑洞连接不能永远卡在 read()
                         {
                             use tungstenite::stream::MaybeTlsStream;
@@ -1387,7 +1485,13 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                                         }
                                     }
                                 }
-                                Ok(Message::Ping(p)) => { fails = 0; let _ = sock.send(Message::Pong(p)); }
+                                Ok(Message::Ping(p)) => {
+                                    // Ping 也是活连接证据：同时清掉读超时计数，否则
+                                    // “超时一次 → Ping → 再超时一次”会被误判为连续两次超时。
+                                    timeouts = 0;
+                                    fails = 0;
+                                    let _ = sock.send(Message::Pong(p));
+                                }
                                 Ok(Message::Pong(_)) => { timeouts = 0; fails = 0; }
                                 Ok(Message::Close(frame)) => {
                                     // 4001 = 服务端“同 agent 已有更新连接”，本进程应退出而不是抢回来
@@ -1412,6 +1516,14 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                             }
                         }
                         connected2.store(false, Ordering::Relaxed);
+                        let unacked = journal2.lock().unwrap().len();
+                        write_ws_state(&cfg2.dir, false, queue2.load(Ordering::Relaxed),
+                                       last2.load(Ordering::Relaxed), unacked, &gate2);
+                        // 只有稳定连接超过 10s 才把退避重置为 1；否则“刚连上就被踢”
+                        // 会以 1s 间隔无限重连，形成重连风暴。
+                        if connected_at.get().map(|t| t.elapsed() >= Duration::from_secs(10)).unwrap_or(true) {
+                            backoff = 1;
+                        }
                         if superseded2.load(Ordering::Relaxed) { break; }
                         fails += 1;
                         eprintln!("[ws] 连接断开({fails}/6)，{}s 后重连", jitter(backoff));
@@ -1441,6 +1553,7 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         let last3 = last_msg.clone();
         let journal3 = journal.clone();
         let stop3 = stop.clone();
+        let gate3 = state_gate.clone();
         thread::spawn(move || {
             let mut hb = 0u64;
             loop {
@@ -1448,21 +1561,24 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                 hb += 1;
                 let (ws, ph, _q) = { let g = st.lock().unwrap(); (g.0.clone(), g.1.clone(), g.2) };
                 let queue_now = q3.load(Ordering::Relaxed);
+                let unacked = journal3.lock().unwrap().len();
                 let body = json!({"hb": hb, "agent_id": aid, "work": {"state": ws, "phase": ph},
                                   "load": {"disk": disk()}, "sdk_version": env!("CARGO_PKG_VERSION"),
-                                  "queue": queue_now, "unacked": journal3.lock().unwrap().len()});
+                                  "queue": queue_now, "unacked": unacked});
                 let ok = agent2.post(&format!("{}/p/{}/heartbeat", base2, proj))
                     .set("authorization", &format!("Bearer {}", tok))
                     .set("connection", "close")
                     .send_json(body).is_ok();
+                let _g = gate3.lock().unwrap();
+                let connected_now = conn3.load(Ordering::Relaxed);
                 write_run_state(&dir2, &json!({
-                    "connected": conn3.load(Ordering::Relaxed),
+                    "connected": connected_now,
                     "transport": "ws",
                     "last_hb_ok": ok,
                     "last_hb_ms": now_ms() as u64,
                     "last_msg_ms": last3.load(Ordering::Relaxed),
                     "queue": queue_now,
-                    "unacked": journal3.lock().unwrap().len(),
+                    "unacked": unacked,
                     "pid": std::process::id(),
                 }));
                 thread::sleep(Duration::from_secs(period));
@@ -1470,20 +1586,29 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         });
     }
 
-    // 主线程：取任务 → 执行（inflight 已在启动时重放）
-    loop {
-        let Ok(task) = rx.recv() else { break };
-        let title = serde_json::from_str::<Value>(&task).ok()
+    // 主线程：取任务 → 执行（inflight 已在启动时先入队，保留 seq 顺序）
+    while let Ok((task, replay)) = rx.recv() {
+        let parsed = serde_json::from_str::<Value>(&task).ok();
+        let title = parsed.as_ref()
             .and_then(|v| v["payload"]["title"].as_str().map(|x| x.to_string()))
             .unwrap_or_default();
         { let mut g = state.lock().unwrap(); g.0 = "busy".into(); g.1 = title.clone(); }
+        if replay {
+            // 上次可能刚写 WAL 就崩了、receipt 还没发出去：重放时补一次（已回过会 409，视为成功）
+            if let Some(v) = &parsed {
+                if let Some(seq) = seq_of(v) {
+                    let _ = ack_message(cfg, agent, base, seq, "done",
+                                        &json!({"note": "run 启动重放（receipt）"}), ack_required(v));
+                }
+            }
+        }
         if let Some(cmd) = &cfg.exec_cmd {
             exec_task(cmd, &task);
         } else {
             println!("{task}");
         }
-        if let Ok(v) = serde_json::from_str::<Value>(&task) {
-            if let Some(seq) = seq_of(&v) { dequeue_message(&cfg.dir, &journal, seq); }
+        if let Some(v) = &parsed {
+            dequeue_message(&cfg.dir, &journal, v);
         }
         let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
                                  |x| Some(x.saturating_sub(1)));
@@ -1544,7 +1669,7 @@ mod tests {
         assert!(!enqueue_message(&cfg, &journal, &msg), "same seq must not duplicate");
         assert_eq!(journal_load(&dir).len(), 1);
 
-        dequeue_message(&dir, &journal, 5);
+        dequeue_message(&dir, &journal, &msg);
         assert_eq!(journal_load(&dir).len(), 0);
         assert_eq!(cursor_get(&dir), 5, "ack/processing must not rewind cursor");
 
@@ -1555,6 +1680,16 @@ mod tests {
         cursor_set(&dir, 5);
         assert!(!enqueue_message(&cfg, &journal, &msg6));
         assert_eq!(cursor_get(&dir), 6, "duplicate in WAL must still advance cursor");
+        assert_eq!(journal_load(&dir).len(), 1);
+
+        // dedupe_key 是内容身份：换了 seq 重投也不能再执行一次
+        let m7 = json!({"seq": 7, "topic": "task", "dedupe_key": "task:d1", "payload": {"title": "z"}});
+        let m9 = json!({"seq": 9, "topic": "task", "dedupe_key": "task:d1", "payload": {"title": "z"}});
+        assert!(enqueue_message(&cfg, &journal, &m7));
+        assert!(!enqueue_message(&cfg, &journal, &m9), "same dedupe_key must be idempotent");
+        assert_eq!(cursor_get(&dir), 9);
+        assert_eq!(journal_load(&dir).len(), 2);
+        dequeue_message(&dir, &journal, &m9);   // 用新 seq 也要删掉旧 WAL 项
         assert_eq!(journal_load(&dir).len(), 1);
     }
 
