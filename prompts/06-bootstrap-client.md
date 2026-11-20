@@ -31,8 +31,10 @@ curl -fsSL "$ENDPOINT/dl/install.sh" | sh -s -- \
 
 install.sh 会写配置并尝试启动 systemd 用户服务。
 未批准时 run 会 401 并自动重试，这是正常现象，不要反复重装。
-如果没有 systemd，手动启动：
-nohup "$HOME/.local/bin/synapse-agent" run >/tmp/synapse-agent.log 2>&1 &
+如果没有 systemd，手动启动（必须 setsid 脱离当前会话；只用 nohup 会在安装 shell 退出时被一起回收）：
+```bash
+setsid "$HOME/.local/bin/synapse-agent" run >>"$HOME/.synapse-agent/agent.log" 2>&1 </dev/null &
+```
 
 阶段 3：提交自助注册
 
@@ -90,7 +92,8 @@ sleep 2
 curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" \
   -H "Authorization: Bearer $TOKEN"
 
-wsstat 返回 sockets > 0 或在日志里看到 ws connected，就说明已经连上。
+wsstat 返回 sockets > 0、`live[]` 里出现自己的 agent_id，或日志里看到 ws connected，就说明已经连上。
+`status` 还会给 `connected`、`last_hb_ok`、`last_msg_ms`、`queue`、`unacked`、`pid`、`alive/stale`，掉线、积压、进程已死一眼可见。
 不要打印 config.json。
 
 阶段 6：进入收件 / 回执 / 回复 / 上报循环

@@ -56,7 +56,11 @@ export class ProjectRoom implements DurableObject {
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
       case "ws":           return this.ws(req);
-      case "wsstat":       return json({ sockets: this.state.getWebSockets().length });
+      case "wsstat": {
+        // 只报"活着的会话"，并按 agent 汇总；sockets 字段保留给旧客户端/提示词
+        const live = this.liveSockets();
+        return json({ sockets: live.length, agents: new Set(live.map((x) => x.agent)).size, live });
+      }
       case "snapshot":     return this.snapshot();
       case "cron/tick":    return this.tick();
       default:             return json({ error: "unknown_action", action }, 404);
@@ -134,6 +138,16 @@ export class ProjectRoom implements DurableObject {
   }
 
   // ── WebSocket：连接挂在 DO 上，空闲可休眠 ───────────────────
+  private liveSockets(): any[] {
+    const live: any[] = [];
+    for (const ws of this.state.getWebSockets()) {
+      let att: any = null;
+      try { att = ws.deserializeAttachment?.(); } catch { att = null; }
+      live.push({ agent: att?.me ?? "unknown", role: att?.role ?? "agent", connected_at: att?.at ?? null });
+    }
+    return live;
+  }
+
   private ws(req: Request): Response {
     if ((req.headers.get("upgrade") ?? "").toLowerCase() !== "websocket")
       return json({ error: "upgrade_required" }, 426);
@@ -142,8 +156,15 @@ export class ProjectRoom implements DurableObject {
     // 客户端身份随连接保存，断线重连时管理端能看到"谁连着"
     const me = req.headers.get("x-agent-id") ?? "unknown";
     const role = req.headers.get("x-role") ?? "agent";
+    // 同一 agent 只保留最新一条会话：旧连接先踢掉，避免两个 run 实例同时消费、重复回执
+    for (const old of this.state.getWebSockets()) {
+      try {
+        const att: any = old.deserializeAttachment?.();
+        if (att?.me === me) old.close(4001, "superseded by new connection");
+      } catch { /* 旧运行时没有 attachment */ }
+    }
     this.state.acceptWebSocket(server, [me]);
-    try { server.serializeAttachment({ me, role }); } catch { /* 兼容旧运行时 */ }
+    try { server.serializeAttachment({ me, role, at: Date.now() }); } catch { /* 兼容旧运行时 */ }
     server.send(JSON.stringify({ type: "hello", at: Date.now() }));
     return new Response(null, { status: 101, webSocket: client });
   }

@@ -75,21 +75,38 @@ stop_nohup() {
   fi
 }
 
+rotate_log() {
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    mv "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+  fi
+}
+
 start_nohup() {
   if ! command -v nohup >/dev/null 2>&1; then
     echo "→ 未找到 nohup；请手动常驻："
     echo "    ${BIN} run"
     return 0
   fi
-  : > "$LOG_FILE"
+  : >> "$LOG_FILE"
   chmod 600 "$LOG_FILE" 2>/dev/null || true
-  nohup "${BIN}" run >"$LOG_FILE" 2>&1 &
-  NEW_PID=$!
+  rotate_log
+  # 关键：必须脱离当前会话/进程组（setsid），否则安装脚本所在 shell 一退出，
+  # 子进程会被一起回收——这就是“明明启动成功、过一会儿却掉线”的根因。
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c 'echo $$ > "$1"; exec "$2" run' sh "$PID_FILE" "$BIN" \
+      >>"$LOG_FILE" 2>&1 </dev/null &
+    SPAWNED=$!
+    sleep 1
+    NEW_PID="$(cat "$PID_FILE" 2>/dev/null || printf '%s' "$SPAWNED")"
+  else
+    nohup "${BIN}" run >>"$LOG_FILE" 2>&1 </dev/null &
+    NEW_PID=$!
+  fi
   printf '%s\n' "$NEW_PID" > "$PID_FILE"
   chmod 600 "$PID_FILE" 2>/dev/null || true
   sleep 1
   if kill -0 "$NEW_PID" 2>/dev/null; then
-    echo "✓ 已用 nohup 后台启动（pid=$NEW_PID）"
+    echo "✓ 已后台启动（pid=$NEW_PID，已脱离当前会话）"
     echo "  日志：$LOG_FILE"
   else
     echo "！后台进程启动后退出，最近日志："
