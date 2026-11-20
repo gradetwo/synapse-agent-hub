@@ -1,0 +1,134 @@
+-- 共享层表结构（项目注册 / 令牌 / 历史 / 交付索引）
+-- 真源在 Durable Object；这里的表用于管理端查询与长期留档。
+
+CREATE TABLE IF NOT EXISTS projects (
+  project         TEXT PRIMARY KEY,
+  display_name    TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'active',   -- active|paused|archived
+  max_agents      INTEGER NOT NULL DEFAULT 20,
+  max_storage_mb  INTEGER NOT NULL DEFAULT 2048,
+  max_msgs_per_min INTEGER NOT NULL DEFAULT 60,
+  retention_days  INTEGER NOT NULL DEFAULT 30,
+  created_at      INTEGER NOT NULL
+);
+
+-- 令牌：只存 sha256，明文仅在签发时返回一次
+CREATE TABLE IF NOT EXISTS agents (
+  project     TEXT NOT NULL,
+  agent_id    TEXT NOT NULL,
+  role        TEXT NOT NULL DEFAULT 'agent',        -- agent|admin
+  scopes      TEXT NOT NULL,                        -- 逗号分隔
+  token_sha   TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  revoked_at  INTEGER,
+  expires_at  INTEGER,
+  PRIMARY KEY (project, agent_id, token_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_token ON agents(token_sha);
+
+-- 管理端可见性策略：scope='*' 表示全局策略；也可按 admin 单独配置
+--   mode='all'  ⇒ 看全部项目（默认）
+--   mode='list' ⇒ 只看 projects_json 里列出的项目
+CREATE TABLE IF NOT EXISTS admin_policy (
+  scope         TEXT PRIMARY KEY,                   -- '*' 或某 admin 标识
+  mode          TEXT NOT NULL DEFAULT 'all',
+  projects_json TEXT NOT NULL DEFAULT '[]',
+  updated_at    INTEGER NOT NULL
+);
+
+-- 心跳历史：每 5 分钟一行，保留 14 天
+CREATE TABLE IF NOT EXISTS hb_hist (
+  project       TEXT NOT NULL,
+  agent_id      TEXT NOT NULL,
+  bucket        INTEGER NOT NULL,                   -- floor(ts/300s)
+  cpu_pct       INTEGER,
+  mem_used_mb   INTEGER,
+  mem_total_mb  INTEGER,
+  disk_used_pct INTEGER,
+  work_state    TEXT,
+  PRIMARY KEY (project, agent_id, bucket)
+);
+
+-- 交付索引（文件本体在 R2；状态三态：delivered|collected|archived）
+CREATE TABLE IF NOT EXISTS submissions (
+  project       TEXT NOT NULL,
+  submission_id TEXT NOT NULL,
+  agent_id      TEXT NOT NULL,
+  base_sha      TEXT,
+  kind          TEXT NOT NULL,
+  title         TEXT,
+  refs_json     TEXT NOT NULL,
+  checks_json   TEXT,
+  result        TEXT,
+  state         TEXT NOT NULL DEFAULT 'delivered',
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  PRIMARY KEY (project, submission_id)
+);
+
+-- 登录失败防护：按 IP 计数 + 阶梯封禁（-1 表示永久）
+CREATE TABLE IF NOT EXISTS login_guard (
+  ip            TEXT PRIMARY KEY,
+  fails         INTEGER NOT NULL DEFAULT 0,
+  first_fail_at INTEGER NOT NULL DEFAULT 0,
+  blocked_until INTEGER NOT NULL DEFAULT 0
+);
+
+-- 自助注册：agent 本地生成 token，只把 sha256 报上来；管理端审批后才进 agents 表
+CREATE TABLE IF NOT EXISTS enrollments (
+  id          TEXT PRIMARY KEY,
+  project     TEXT NOT NULL,
+  agent_id    TEXT NOT NULL,
+  token_sha   TEXT NOT NULL,
+  code        TEXT NOT NULL,
+  scopes      TEXT NOT NULL,
+  machine     TEXT,
+  ip          TEXT,
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected|expired
+  decided_at  INTEGER,
+  decided_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_enr_status ON enrollments(project, status);
+
+CREATE TABLE IF NOT EXISTS ws_tickets (
+  ticket   TEXT PRIMARY KEY,
+  project  TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  role     TEXT NOT NULL,
+  exp_ms   INTEGER NOT NULL,
+  used     INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ws_tickets_exp ON ws_tickets(exp_ms);
+
+-- 运行期键值（会话 epoch 等）。吊销端点依赖此表，缺表会 500
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- 消息归档：热窗口之外仍可回读、ack；按 room 分段防止换命名空间后 seq 覆盖
+CREATE TABLE IF NOT EXISTS archive (
+  project      TEXT NOT NULL,
+  room         TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  sender       TEXT NOT NULL DEFAULT '',
+  topic        TEXT NOT NULL DEFAULT '',
+  kind         TEXT NOT NULL DEFAULT '',
+  to_agent     TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  ts           TEXT NOT NULL,
+  PRIMARY KEY (project, room, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_rate ON archive(project, sender, ts);
+
+-- 产物台账：按项目累计字节数，max_storage_mb 依赖此表
+CREATE TABLE IF NOT EXISTS artifacts (
+  project    TEXT NOT NULL,
+  sha        TEXT NOT NULL,
+  bytes      INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (project, sha)
+);

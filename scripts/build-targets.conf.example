@@ -1,0 +1,32 @@
+# Synapse Rust SDK 多平台交叉编译配置
+# 用法：
+#   cp scripts/build-targets.conf.example scripts/build-targets.conf
+#   ./scripts/build-cross.sh --config scripts/build-targets.conf
+#
+# 命令行传入目标时，会覆盖 targets 这一项。
+
+# 目标列表：逗号或空格分隔
+# linux-x64 / linux-arm64 / win-x64 / macos-arm64 / macos-x64
+targets = linux-x64, linux-arm64, win-x64
+
+# Linux 交叉工具链：
+#   zigbuild -> 需要 brew install zig + cargo install cargo-zigbuild（推荐）
+#   cross    -> 需要 Docker Desktop + cargo install cross
+linux_toolchain = zigbuild
+
+# Windows 工具链：
+#   msvc -> 需要 brew install llvm + cargo install cargo-xwin（推荐）
+#   gnu  -> 需要 brew install mingw-w64
+win_toolchain = msvc
+
+# 产物目录，相对路径按仓库根目录解析
+out_dir = dist
+
+# 缺少 brew 包/cargo 子命令时自动安装
+install_deps = true
+
+# 可选：cargo 并行任务数
+# jobs = 4
+
+# 可选：构建后 strip（需要 llvm-strip）
+strip = false

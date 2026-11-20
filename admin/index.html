@@ -1,0 +1,1614 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+// 旧版页面/旧 service worker 会把改版后的控制台挡住，这里给一次性自救入口：
+// 打开 /console?reset=1 即注销 SW、清空缓存、回到干净页面。
+if (location.search.includes("reset=1")) {
+  (async () => {
+    try {
+      for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+      const ks = await caches.keys();
+      await Promise.all(ks.map((k) => caches.delete(k)));
+    } catch (e) {}
+    location.replace("/console");
+  })();
+}
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0e1116">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/dl/icon-192.png">
+<title>Synapse · 控制台</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a21; --line:#232a33; --fg:#e6ebf2; --dim:#8b95a5;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#4c8dff; --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
+  .bar{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);
+       background:var(--panel);position:sticky;top:0;z-index:9}
+  .bar h1{font-size:14px;font-weight:600;margin:0}
+  .muted{color:var(--dim);font-size:12px}
+  .seg{margin-left:auto;display:flex;gap:8px;align-items:center}
+  select,button,input,textarea{font:inherit;color:var(--fg);background:#1b222b;
+       border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+  button{cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#0b0f14;font-weight:600}
+  button.ghost{background:transparent}
+  .wrap{padding:16px 18px;display:grid;gap:16px;max-width:1280px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+  .card>h2{margin:0;padding:10px 14px;font-size:12px;letter-spacing:.4px;text-transform:uppercase;
+           color:var(--dim);border-bottom:1px solid var(--line);font-weight:500;display:flex;gap:10px}
+  .card>h2 span{margin-left:auto;text-transform:none;letter-spacing:0}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:9px 14px;text-align:left;border-bottom:1px solid #1c232c;white-space:nowrap}
+  th{font-size:11px;color:var(--dim);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
+  tr:hover td{background:#11161d}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
+  .alive{background:var(--ok)} .late{background:var(--warn)} .offline{background:var(--bad)} .unk{background:#555}
+  .idle td{opacity:.5}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .warnv{color:var(--warn)} .badv{color:var(--bad)}
+  .badge{font-size:11px;padding:1px 8px;border-radius:20px;border:1px solid var(--line);color:var(--dim)}
+  .badge.delivered{color:var(--accent);border-color:#24406e}
+  .badge.collected{color:var(--ok);border-color:#1d3a25}
+  .badge.archived{opacity:.55}
+  /* 待取交付的全局提醒：不是普通提示条，必须一直可见直到取走 */
+  .alertbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;
+    border:1px solid #674b18;border-radius:var(--radius);background:#241b0e;color:#ffd58a;
+    box-shadow:0 0 0 1px rgba(210,153,34,.08) inset}
+  .alertbar[hidden]{display:none!important}
+  .alertbar .grow{flex:1;min-width:220px}
+  .alertbar b{color:#ffe5ae}
+  .alertbar .hint{color:#c9a45c;font-size:12px}
+  .alertbar .acts{display:flex;gap:8px;flex-wrap:wrap}
+  .alertbar button{border-color:#674b18;background:#33250f;color:#ffe5ae}
+  .alertbar button.primary{background:#d29922;border-color:#d29922;color:#171006}
+  .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;
+    max-width:min(560px,92vw);padding:10px 14px;border-radius:9px;
+    background:#1b222b;border:1px solid #674b18;color:#ffe5ae;font-size:13px;
+    box-shadow:0 10px 30px rgba(0,0,0,.45)}
+  .toast[hidden]{display:none!important}
+  .form{display:grid;gap:10px;padding:14px}
+  .form label{display:grid;gap:5px;font-size:12px;color:var(--dim)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .empty{padding:18px 14px;color:var(--dim);font-size:12px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .mini{font-size:11px;padding:2px 8px;border-radius:6px;background:transparent;border:1px solid var(--line);color:var(--dim);cursor:pointer}
+  .mini:hover{color:var(--fg);border-color:var(--dim)}
+  .mono{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+  .foot{padding:10px 18px;color:var(--dim);font-size:11px;border-top:1px solid var(--line)}
+  textarea{min-height:58px;resize:vertical}
+  /* 未认证时整页锁住：不显示任何业务界面 */
+  .gate{position:fixed;inset:0;background:rgba(9,12,16,.96);display:none;
+        align-items:center;justify-content:center;z-index:50}
+  body.locked .gate{display:flex}
+  body.locked .wrap,body.locked .bar .seg{display:none}
+  .gate .box{width:min(420px,90vw);background:var(--panel);border:1px solid var(--line);
+        border-radius:12px;padding:22px;display:grid;gap:12px}
+  .gate h2{margin:0;font-size:15px;font-weight:600}
+  .gate p{margin:0;color:var(--dim);font-size:12px;line-height:1.6}
+  .gate input{width:100%;padding:9px 11px;font-family:ui-monospace,Menlo,monospace}
+  .gate .row2{display:flex;gap:8px}
+  .gate .row2 button{flex:1}
+
+  /* 概览：手机上一眼看到数字 */
+  .roster tbody tr.clickable{cursor:pointer}
+  .roster tbody tr.clickable:hover{background:#12171e}
+  .card.collapsed .cardBody{display:none}
+  .card.maxed{position:fixed;inset:8px;z-index:15;max-height:none;overflow:auto;box-shadow:0 18px 60px rgba(0,0,0,.6)}
+  .card.maxed>h2{position:sticky;top:0;z-index:2;background:#0e1218;padding:8px 0;margin:0 0 6px;
+    border-bottom:1px solid #1c2430}
+  /* 最大化时给一个"永远在屏幕里"的退出按钮，手机上也点得到 */
+  #maxExit{display:none;position:fixed;right:12px;z-index:40;
+    top:calc(env(safe-area-inset-top) + 12px);padding:8px 14px;border-radius:10px;
+    border:1px solid #2f6da8;background:#132234;color:#eaf0f8;font:600 13px/1 -apple-system,sans-serif}
+  body.has-max #maxExit{display:block}
+  body.has-max,body.has-sheet{overflow:hidden}
+  .cardTools{margin-left:auto;display:flex;gap:6px}
+  thead th{position:sticky;top:0;background:#0b0f14;z-index:1;box-shadow:0 1px 0 #1c2430}
+  .tabs{position:sticky;top:0;z-index:5;display:flex;gap:6px;padding:8px 0;background:linear-gradient(#0b0f14 70%,transparent);overflow-x:auto}
+  .tabs button{flex:0 0 auto;padding:7px 14px;border-radius:8px;border:1px solid #202836;background:#0e1319;color:#9aa4b2;font-size:13px}
+  .tabs button.on{color:#eaf0f8;border-color:#2f6da8;background:#132234}
+  .tabs .cnt{color:#7d8798;font-size:11px;margin-left:4px}
+  .quick{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin:8px 0}
+  .permBar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 8px}
+  .permRole{font-size:12.5px;color:#9aa4b2;border:1px solid #232a33;border-radius:6px;padding:4px 8px}
+  .permRole.admin{color:#eaf0f8;border-color:#2f6da8;background:#132234}
+  .permTtl{display:flex;align-items:center;gap:6px;font-size:12px;color:#7d8798}
+  .permTtl select{min-height:34px;padding:4px 8px}
+  .permGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .permGrid .primary{grid-column:1 / -1;min-height:40px}
+  .permGrid button{min-height:38px}
+  @media(max-width:640px){.quick{grid-template-columns:1fr}}
+  .filterbar{display:flex;align-items:center;gap:8px;margin:8px 0 4px}
+  .filterbar input{flex:1;min-width:0}
+  .mini{padding:1px 7px;font-size:12px;line-height:18px;border-radius:6px}
+  .card h2{display:flex;align-items:center;gap:8px}
+  .overlay[hidden]{display:none!important}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20;padding:16px}
+  .sheet{background:#0e1218;border:1px solid #222a35;border-radius:12px;width:min(920px,96vw);max-height:88vh;
+    display:flex;flex-direction:column;overflow:hidden;padding:0}
+  .sheetHead{padding:12px 16px;border-bottom:1px solid #1c2430;background:#12171f;flex:0 0 auto}
+  .sheetBody{overflow:auto;-webkit-overflow-scrolling:touch;padding:12px 16px 16px;flex:1 1 auto;min-height:0}
+  .sheetHead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .charts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  @media(max-width:720px){
+    .charts{grid-template-columns:1fr}
+    .overlay{padding:0;display:flex;align-items:stretch;overflow:hidden}
+    .sheet{width:100%;height:100dvh;max-height:100dvh;border-radius:0;box-sizing:border-box}
+    .sheetHead{padding:calc(env(safe-area-inset-top) + 10px) 14px 10px}
+    .sheetBody{padding:12px 14px calc(18px + env(safe-area-inset-bottom))}
+    .card.maxed{inset:0;border-radius:0;height:100dvh;
+      padding:calc(6px + env(safe-area-inset-top)) 12px calc(18px + env(safe-area-inset-bottom))}
+  }
+  canvas{width:100%;height:46px;display:block;background:#0b0f14;border:1px solid #1d2530;border-radius:8px}
+  /* 详情页趋势压成一条三列窄带：移动端不再纵向占三屏 */
+  .charts{grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:8px}
+  .charts .cap{font-size:10px;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .charts canvas{height:46px}
+  @media(max-width:720px){.charts canvas{height:40px}.charts{gap:6px}}
+  /* 头部关闭还原成 × 图标 */
+  .iconBtn{width:34px;height:34px;min-width:34px!important;padding:0;display:flex;align-items:center;justify-content:center;
+    font-size:18px;line-height:1;border-radius:9px}
+  /* 权限一行流：角色 + 有效期 + 三个动作，窄屏自动换行 */
+  .permBar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+  .permBar .permRole{margin:0}
+  .permBar .permTtl{margin:0;display:flex;align-items:center;gap:6px}
+  .permBar .permTtl select{width:auto;min-width:74px;padding:4px 8px;min-height:30px}
+  .permBar .permActions{display:flex;gap:6px;margin-left:auto}
+  .permBar .permActions button{min-height:32px;padding:4px 10px;font-size:12.5px;white-space:nowrap}
+  @media(max-width:520px){.permBar .permActions{margin-left:0;width:100%}.permBar .permActions button{flex:1}}
+  .cap{font-size:11px;color:#7d8798;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
+  .list{font-size:12.5px}
+  .list .row{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid #151b23}
+  .list .row .badge{flex:0 0 auto}
+  .who{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:2px}
+  .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px}
+  .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(5,1fr)}
+  .stat{background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px}
+  .stat .k{color:var(--dim);font-size:11px;letter-spacing:.02em}
+  .stat .v{font-size:19px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+
+  @media (max-width:760px){
+    .bar{flex-wrap:wrap;gap:8px;padding:calc(8px + env(safe-area-inset-top)) 12px 8px}
+    .bar h1{font-size:13px}
+    .seg{margin-left:0;width:100%;flex-wrap:wrap}
+    select,button,input,textarea{min-height:40px}
+    .wrap{padding:10px 12px calc(28px + env(safe-area-inset-bottom))}
+    table{display:block;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+    .stats{grid-template-columns:repeat(2,1fr)}
+    .stat{padding:9px 10px}
+    .stat .v{font-size:17px}
+  }
+
+  /* ===== 手机触控优先 ===== */
+  @media(max-width:640px){
+    .bar{flex-wrap:wrap;gap:8px;padding:10px 0}
+    .seg{width:100%;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+    .seg select,.seg button{min-height:44px;width:100%}
+    .wrap{padding:0 8px}
+    .card{padding:12px}
+    /* 16px 以上：否则 iOS 聚焦输入框会自动放大整页 */
+    input,select,textarea,button{font-size:16px}
+    button{min-height:42px;padding:0 12px}
+    .mini{min-height:34px;padding:0 10px;font-size:14px}
+    .filterbar input{min-height:42px}
+    /* 名册：9 列在手机上太挤，收掉"在做什么""基线"两列，保留操作面 */
+    table:has(tbody#agents) th:nth-child(3),
+    table:has(tbody#agents) td:nth-child(3),
+    table:has(tbody#agents) th:nth-child(7),
+    table:has(tbody#agents) td:nth-child(7){display:none}
+    .cardBody{overflow-x:auto}
+    thead th{font-size:11px;padding:6px 6px}
+    tbody td{padding:8px 6px;font-size:12.5px}
+    .stats{grid-template-columns:repeat(2,1fr)!important}
+    .charts canvas{height:40px}
+    .charts{gap:6px}
+    .sheet{padding:12px}
+    .list .row{flex-wrap:wrap}
+    .list .row .subsha{display:none}
+    .list .row .subid{overflow-wrap:anywhere}
+    .sheetHead button{min-width:72px}
+    /* 触控反馈 */
+    tr.clickable:active{background:#161d26}
+    button:active{transform:scale(.98)}
+  }
+</style>
+
+<div class="gate" id="gate">
+  <div class="box">
+    <h2>需要管理访问凭证</h2>
+    <p id="gateMsg">输入 admin token 后才能查看项目、名册与交付箱。凭证只存在本机浏览器。</p>
+    <input id="gateInput" type="password" placeholder="admin token" autocomplete="off">
+    <div class="row2">
+      <button class="primary" id="gateOk">连接</button>
+      <button id="gateCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div class="bar">
+  <h1>Synapse</h1>
+  <span class="muted" id="scope">—</span>
+  <span class="muted" id="build" title="构建标识">build —</span>
+  <div class="seg">
+    <span class="mono" id="liveDot" title="实时通道状态" style="cursor:pointer;border:1px solid #232a33;border-radius:6px;padding:6px 10px">○ 轮询</span>
+    <select id="proj" title="项目"></select>
+    <button class="ghost" id="btnSettings">可见性</button>
+  <button class="ghost" id="btnPurge" title="页面像旧的？点这里强制重载">更新页面</button>
+    <select id="autoRef" title="自动刷新频率">
+      <option value="0">不刷新</option>
+      <option value="15">15 秒</option>
+      <option value="30">30 秒</option>
+      <option value="60">1 分钟</option>
+      <option value="300">5 分钟</option>
+    </select>
+  </div>
+</div>
+
+<div class="wrap">
+<div class="tabs" id="tabs"></div>
+  <div class="alertbar" id="deliveryAlert" hidden>
+    <div class="grow">
+      <div id="deliveryAlertText"></div>
+      <div class="hint">任务 done 只表示执行结束，不代表交付已取；下载会自动标记为已取。</div>
+    </div>
+    <div class="acts">
+      <button class="primary" data-collect-all="1">全部下载并取走</button>
+      <button data-goto-delivery="1">查看交付箱</button>
+    </div>
+  </div>
+  <div class="card">
+    <h2>概览 <span class="muted" id="ovAt">—</span></h2>
+    <div class="stats" id="stats"><div class="stat"><div class="k">加载中</div><div class="v">—</div></div></div>
+  </div>
+  <div class="card">
+    <h2>注册审批 <span class="muted" id="enrStat"></span></h2>
+    <table>
+      <thead><tr><th>Agent</th><th>项目</th><th>申请权限</th><th>时间</th><th></th></tr></thead>
+      <tbody id="enr"><tr><td colspan="5" class="empty">无待审申请</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>签发 token <span class="muted">新 agent / 管理身份</span></h2>
+    <div class="form">
+      <label>Agent ID<input id="issueAgentId" placeholder="例如 worker-01" autocomplete="off"></label>
+      <div class="row">
+        <label>身份
+          <select id="issueRole">
+            <option value="agent">普通 agent</option>
+            <option value="admin">管理员</option>
+          </select>
+        </label>
+        <label>有效期
+          <select id="issueTtl">
+            <option value="7">7 天</option>
+            <option value="30" selected>30 天</option>
+            <option value="0">不限期</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnIssueToken">生成 token</button>
+        <span class="muted" style="align-self:center">明文只显示一次；同一 agent 旧 token 会立即失效。</span>
+      </div>
+      <div id="issueTokenBox" class="list"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>名册 <span class="muted" id="agentStat"></span></h2>
+    <table>
+      <thead><tr>
+        <th>Agent</th><th>状态</th><th>在做什么</th><th class="num">CPU</th>
+        <th class="num">内存</th><th class="num">磁盘</th><th>基线</th><th>心跳</th><th></th>
+      </tr></thead>
+      <tbody id="agents"><tr><td colspan="8" class="empty">未连接</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>交付箱 <span class="muted" id="subStat"></span></h2>
+    <table>
+      <thead><tr>
+        <th>提交</th><th>来源</th><th>基线</th><th>类型</th><th>状态</th><th>时间</th><th></th>
+      </tr></thead>
+      <tbody id="subs"><tr><td colspan="7" class="empty">暂无交付</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>消息流 <span class="muted" id="msgStat"></span></h2>
+    <table>
+      <thead><tr><th class="num">seq</th><th>topic</th><th>来自</th><th>收件</th><th>摘要</th><th>时间</th></tr></thead>
+      <tbody id="msgs"><tr><td colspan="6" class="empty">暂无消息</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>定向指令 <span class="muted" id="sndHint"></span></h2>
+    <div class="quick">
+      <select id="qCmd" title="常用指令">
+        <option value="sync">同步代码：拉取最新并回执 HEAD</option>
+        <option value="status">汇报状态：进度 + 磁盘 + 负载</option>
+        <option value="pause">暂停任务：停下等我新指令</option>
+        <option value="restart">重启心跳：重新拉起 agent</option>
+        <option value="clean">清缓存：清构建缓存并报释放空间</option>
+        <option value="wrap">收工：交付完待命</option>
+      </select>
+      <select id="qTo" title="发给谁">
+        <option value="online">只发在线</option>
+        <option value="all">全部（含失联）</option>
+        <option value="offline">只发失联</option>
+        <option value="busy">只发正在忙的</option>
+        <option value="idle">只发空闲的</option>
+      </select>
+      <button class="primary" id="btnQuick">执行</button>
+    </div>
+    <div class="muted" style="margin:10px 0 6px">或手动选人（可多选；不选=整项目广播）</div>
+    <div id="sndWho" class="who"></div>
+    <div class="row2" style="margin-top:8px">
+      <input id="sndTitle" placeholder="标题，如：main 已到 077644c4">
+      <select id="sndAck"><option value="1">需要回执</option><option value="0">仅通知</option></select>
+    </div>
+    <textarea id="sndBody" rows="3" placeholder="正文：要它做什么、验收标准"></textarea>
+    <div class="row2" style="margin-top:8px">
+      <button class="primary" id="btnSend">发送</button>
+      <span class="muted">按 agent 的 poll 周期（默认 8~60s）送达</span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>广播</h2>
+    <div class="form">
+      <label>标题<input id="bTitle" placeholder="main 已到 e5a17c93"></label>
+      <label>正文<textarea id="bBody" placeholder="请各自 git pull 后重新编译"></textarea></label>
+      <div class="row">
+        <label>目标 commit<input id="bTarget" placeholder="e5a17c93"></label>
+        <label>动作
+          <select id="bKind">
+            <option value="git_pull">git_pull</option>
+            <option value="report">report</option>
+            <option value="none">none</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>级别
+          <select id="bSeverity">
+            <option value="action">action</option>
+            <option value="info">info</option>
+            <option value="freeze">freeze</option>
+          </select>
+        </label>
+        <label>要求确认
+          <select id="bAck"><option value="1">是</option><option value="0">否</option></select>
+        </label>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnBroadcast">发布广播</button>
+        <span class="muted" id="bHint"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>登录封禁 <span class="muted" id="secStat"></span>
+      <button class="mini" id="btnUnblockAll" style="margin-left:auto">全部解封</button></h2>
+    <div class="tblwrap"><table>
+      <thead><tr><th>IP</th><th>失败次数</th><th>封禁至</th><th></th></tr></thead>
+      <tbody id="secs"><tr><td colspan="4" class="empty">暂无封禁</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <div class="foot" id="foot">浏览器访问经 Cloudflare Access 鉴权；CLI 走 /x/admin（Bearer）。</div>
+</div>
+
+<div id="detail" class="overlay" hidden>
+  <div class="sheet">
+    <div class="sheetHead"><b id="dName">agent</b><span class="muted" id="dMeta"></span>
+      <button class="ghost iconBtn" id="dClose" aria-label="关闭" title="关闭">×</button></div>
+    <div class="sheetBody">
+    <div class="charts">
+      <div><div class="cap">CPU %</div><canvas id="cCpu"></canvas></div>
+      <div><div class="cap">内存 MB</div><canvas id="cMem"></canvas></div>
+      <div><div class="cap">磁盘占用 %</div><canvas id="cDisk"></canvas></div>
+    </div>
+    <div class="quick" style="margin-top:10px">
+      <button class="ghost" data-dq="sync" data-da="__AGENT__">同步代码</button>
+      <button class="ghost" data-dq="status" data-da="__AGENT__">汇报状态</button>
+      <button class="ghost" data-dq="pause" data-da="__AGENT__">暂停任务</button>
+    </div>
+    <div class="cap" style="margin-top:12px">权限</div>
+    <div class="permBar">
+      <span id="dRole" class="permRole">—</span>
+      <label class="permTtl">有效期
+        <select id="dTtl">
+          <option value="7">7 天</option>
+          <option value="30" selected>30 天</option>
+          <option value="0">不限期</option>
+        </select>
+      </label>
+      <div class="permActions">
+        <button id="dReissue">生成新 token</button>
+        <button class="primary" id="dGrant">授予管理</button>
+        <button id="dDemote">收回管理</button>
+        <button id="dRevoke">吊销 token</button>
+      </div>
+    </div>
+    <div class="cap" style="margin-top:10px">项目参与</div>
+    <div class="permBar">
+      <label class="permTtl">目标项目
+        <select id="dMoveTo"></select>
+      </label>
+      <div class="permActions">
+        <button id="dJoinProject">加入项目</button>
+        <button id="dMoveProject">迁移项目</button>
+      </div>
+    </div>
+    <div id="dToken" class="list"></div>
+    <div class="cap" style="margin-top:12px">最近消息</div><div id="dMsgs" class="list"></div>
+    <div class="cap" style="margin-top:12px">提交历史</div><div id="dSubs" class="list"></div>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast" hidden></div>
+<script>
+const KEY = "hub.admin.token";
+let token = "";
+try { localStorage.removeItem(KEY); } catch {}
+// 统一转义：服务端数据一律不可信，进 DOM 前先变成实体
+const esc = (v) => String(v).replace(/[&<>"'`]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;","`":"&#96;"}[c]));
+const deepEsc = (v) => Array.isArray(v) ? v.map(deepEsc)
+  : (v && typeof v === "object") ? Object.fromEntries(Object.entries(v).map(([k,x]) => [k, deepEsc(x)]))
+  : (typeof v === "string" ? esc(v) : v);
+let policy = { mode: "all", projects: [] };
+let current = "";
+let allProjects = [];
+const BASE_TITLE = "Synapse · 控制台";
+let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
+let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
+let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
+let toastTimer = null;
+
+function pendingFor(agentId) {
+  return SUB_ROWS.filter((s) => s.state === "delivered" && s.agent_id === agentId).length;
+}
+function showToast(msg, ms = 6000) {
+  const el = $("toast");
+  if (!el) return;
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, ms);
+}
+
+window.addEventListener("error", (e) => {
+  const b = document.getElementById("build");
+  if (b) b.textContent = "ERR: " + (e.message || "unknown");
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const b = document.getElementById("build");
+  if (b) b.textContent = "REJ: " + ((e.reason && e.reason.message) || e.reason || "unknown");
+});
+const STUB = {
+  textContent: "", innerHTML: "", value: "", hidden: true, dataset: {}, style: {},
+  classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+  addEventListener() {}, appendChild() {}, insertBefore() {}, querySelector() { return null; },
+  querySelectorAll() { return []; }, setAttribute() {}, getAttribute() { return null; },
+  closest() { return null; }, onclick: null, after() {}, focus() {},
+};
+const $ = (id) => {
+  const el = document.getElementById(id);
+  if (el) return el;
+  console.warn("[hub] missing element #" + id);
+  return STUB;                       // 空壳：赋值不报错，但会留下 warning 便于定位
+};
+
+async function api(path, method = "GET", body) {
+  // /admin/* 在 Cloudflare Access 里未被放行（边缘直接 403），统一走 /console/admin/*
+  const url = path.startsWith("/admin") ? "/console" + path : path;
+  // token 为空时绝不能发 "Bearer "：Access 会把无效凭据直接判 403，
+  // 而浏览器本该靠 CF_Authorization / hub_sess 这两条 cookie 通过。
+  const h = { "content-type": "application/json" };
+  if (token) h["authorization"] = "Bearer " + token;
+  const r = await fetch(url, {
+    method,
+    headers: h,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (r.status === 401 || r.status === 403) {
+    // 不要递归弹窗：清掉凭证、锁屏、抛错让上层停止渲染
+    token = "";
+    lock("凭证无效或已吊销，请重新输入。");
+    throw new AuthError("unauthorized");
+  }
+  if (!r.status.toString().startsWith("2")) throw new Error(r.status + " " + (await r.text()).slice(0, 200));
+  const j = await r.json();
+  return deepEsc(j);          // 所有服务端字符串先转义，渲染器一律 innerHTML 也注入不了
+}
+
+class AuthError extends Error {}
+
+/* ── 锁屏 ─────────────────────────────────────────── */
+function lock(msg) {
+  document.body.classList.add("locked");
+  $("gateMsg").textContent = msg || "输入 admin token 后才能查看项目、名册与交付箱。";
+  $("gateInput").value = token || "";
+  setTimeout(() => $("gateInput").focus(), 30);
+}
+function unlock() { document.body.classList.remove("locked"); }
+
+async function tryConnect(candidate) {
+  token = (candidate || "").trim();
+  if (!token) { lock("请先填写 token。"); return false; }
+  try {
+    const d = await api("/admin/projects");     // 这一步同时验证凭证
+    /* 不持久化 token：控制台靠 HttpOnly 会话 cookie，XSS 读不走 */
+    policy = d.policy;
+    unlock();
+    return true;
+  } catch (e) {
+    if (e instanceof AuthError) return false;
+    lock("连接失败：" + e.message);
+    return false;
+  }
+}
+
+const ago = (s) => s == null ? "—" : s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.round(s / 3600) + "h";
+const pct = (v, bad) => v == null ? "—" : `<span class="${v >= bad ? "badv" : ""}">${v}%</span>`;
+
+async function loadProjects() {
+  const d = await api("/admin/projects");
+  policy = d.policy;
+  allProjects = d.projects || [];
+  $("scope").textContent = policy.mode === "all"
+    ? `全部项目 ${d.projects.length} 个`
+    : `指定项目 ${policy.projects.length} 个`;
+  const sel = $("proj");
+  sel.innerHTML = d.projects.map(p =>
+    `<option value="${p.project}">${p.display_name}</option>`).join("");
+  if (!current && d.projects.length) current = d.projects[0].project;
+  sel.value = current;
+  fillDetailProjects();
+  connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
+}
+
+function fillDetailProjects() {
+  const sel = $("dMoveTo");
+  if (!sel) return;
+  const list = (allProjects || []).filter((p) => p.project !== current);
+  sel.innerHTML = list.length
+    ? list.map((p) => `<option value="${p.project}">${p.display_name}</option>`).join("")
+    : `<option value="">无可选项目</option>`;
+  sel.disabled = !list.length;
+}
+
+async function loadAgents() {
+  const d = await api(`/admin/p/${current}/agents`);
+  const rows = d.agents || [];
+  const alive = rows.filter(a => a.alive === "alive").length;
+  $("agentStat").textContent = `${alive}/${rows.length} 在线`;
+  $("agents").innerHTML = rows.length ? rows.map(a => {
+    const w = a.work || {}, l = a.load || {}, dk = (l.disk || [{}])[0];
+    const cls = a.alive === "alive" ? "alive" : a.alive === "late" ? "late" : "offline";
+    const idle = (w.state || "idle") === "idle" ? " class=\"idle\"" : "";
+    // 失联的 agent 只保留最后上报的 work，不能当作"现在正在忙"
+    const doing = a.alive === "alive" ? (w.phase || w.state || "—") : "—";
+    const mem = (l.mem_used_mb != null) ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
+    return `<tr${idle} class="clickable" data-agent="${a.agent_id}" data-alive="${a.alive}" data-work="${a.alive === "alive" ? (w.state || "idle") : ""}">
+      <td><span class="dot ${cls}"></span>${a.agent_id}</td>
+      <td>${a.alive === "alive" ? "忙" : a.alive === "late" ? "迟到" : "失联"}</td>
+      <td>${doing}</td>
+      <td class="num">${pct(l.cpu_pct, 85)}</td>
+      <td class="num">${mem}</td>
+      <td class="num">${dk && dk.used_pct != null ? pct(dk.used_pct, 90) + (dk.free_gb != null ? ` <span class="muted">${dk.free_gb}G</span>` : "") : "—"}</td>
+      <td class="mono">${(a.env || {}).git_head || "—"}</td>
+      <td class="muted">${ago(a.age_s)}前</td>
+      <td style="white-space:nowrap">
+        <button class="ghost mini" data-detail="${a.agent_id}">详情</button>
+        <button class="ghost mini" data-revoke="${a.agent_id}" title="吊销该 agent 凭据">×</button>
+      </td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="9" class="empty">还没有 agent 接入</td></tr>`;
+  window._agents = rows;
+  bindBulk();
+  reapplyFilters();
+  renderSndWho(rows);
+}
+
+async function loadSubs() {
+  const raw = await api(`/admin/p/${current}/submissions`);
+  const d = Array.isArray(raw) ? raw : (raw.submissions || []);
+  SUB_ROWS = d;
+  SUB_STATE = new Map(d.map((s) => [s.submission_id, s.state]));
+  const pendingRows = d.filter((s) => s.state === "delivered");
+  const pending = pendingRows.length;
+  $("subStat").textContent = `${pending} 待取 / 共 ${d.length}`;
+  BADGES.deli = pending;
+  updateBadges();
+  renderDeliveryAlert(pendingRows);
+  if (pending > 0) setCardOpen("交付箱", true);
+  if (pending > (lastPending ?? 0)) {
+    const add = pending - (lastPending ?? 0);
+    showToast(`新增 ${add} 份交付待取；下载会自动标记为已取`, 8000);
+  }
+  lastPending = pending;
+  $("subs").innerHTML = d.length ? d.slice(0, 40).map(s => `
+    <tr data-state="${s.state}">
+      <td class="mono">${s.submission_id}</td>
+      <td>${s.agent_id}</td>
+      <td class="mono">${s.base_sha || "—"}</td>
+      <td>${s.kind}</td>
+      <td><span class="badge ${s.state}">${{delivered:"待取",collected:"已取",archived:"归档"}[s.state]}</span></td>
+      <td class="muted">${new Date(s.created_at).toLocaleString()}</td>
+      <td>
+        ${s.state === "delivered"
+          ? `<button class="ghost" data-collect="${s.submission_id}">下载并取走</button>`
+          : `<button class="ghost" data-dl="${s.submission_id}">下载</button>`}
+      </td>
+    </tr>`).join("") : `<tr><td colspan="7" class="empty">暂无交付</td></tr>`;
+  reapplyFilters();
+}
+
+function renderDeliveryAlert(pendingRows) {
+  const el = $("deliveryAlert");
+  if (!el) return;
+  const n = pendingRows.length;
+  document.title = n ? `(${n}) ${BASE_TITLE}` : BASE_TITLE;
+  if (!n) { el.hidden = true; return; }
+  const agents = [...new Set(pendingRows.map((s) => s.agent_id))];
+  const who = agents.slice(0, 3).join("、") + (agents.length > 3 ? ` 等 ${agents.length} 个 agent` : "");
+  $("deliveryAlertText").textContent = `有 ${n} 份交付待取（${who}）`;
+  el.hidden = false;
+}
+
+function subStateOf(id) {
+  if (SUB_STATE.has(id)) return SUB_STATE.get(id);
+  const row = SUB_ROWS.find((s) => s.submission_id === id);
+  return row ? row.state : "";
+}
+
+async function downloadBundle(id) {
+  try {
+    const r = await fetch(`/console/admin/p/${current}/submissions/${id}/bundle`,
+                          { credentials: "same-origin" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${id}.zip`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (e) {
+    alert("下载失败：" + e.message);
+    return false;
+  }
+  // 下载成功 = 已经取走。待取状态必须在这里原子地改掉，不能再让
+  // "文件已经下载到本地、控制台还显示待取"的错位状态存在。
+  if (subStateOf(id) === "delivered") {
+    try {
+      await api(`/admin/p/${current}/submissions/${id}/collect`, "POST", {});
+      SUB_STATE.set(id, "collected");
+      showToast(`已取走 ${id}`);
+      await loadSubs();
+      if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);
+    } catch (e) {
+      alert(`文件已下载，但标记已取失败：${e.message}\n请重试或手动点“取走”。`);
+    }
+  }
+  return true;
+}
+
+async function collect(id) {
+  // 下载成功后才改状态；下载失败时保持待取，允许重试
+  await downloadBundle(id);
+}
+
+async function collectAll() {
+  const pending = SUB_ROWS.filter((s) => s.state === "delivered");
+  if (!pending.length) { showToast("当前没有待取交付"); return; }
+  if (!confirm(`将逐个下载并取走 ${pending.length} 份交付。\n浏览器可能提示“允许下载多个文件”，请允许。继续？`)) return;
+  let ok = 0;
+  for (const s of pending) {
+    if (await downloadBundle(s.submission_id)) ok++;
+  }
+  await loadSubs();
+  showToast(`已处理 ${ok}/${pending.length} 份；未成功的仍会留在待取列表`);
+}
+
+async function broadcast() {
+  const title = $("bTitle").value.trim();
+  if (!title) { $("bHint").textContent = "标题必填"; return; }
+  const body = {
+    broadcast_id: "bc-" + new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14),
+    severity: $("bSeverity").value,
+    title,
+    body: $("bBody").value,
+    action_required: {
+      kind: $("bKind").value,
+      target_commit: $("bTarget").value.trim() || null,
+      ack_required: $("bAck").value === "1",
+    },
+  };
+  const r = await api(`/admin/p/${current}/broadcast`, "POST", body);
+  $("bHint").textContent = `已发布 seq=${r.seq}`;
+  $("bTitle").value = ""; $("bBody").value = "";
+}
+
+async function settings() {
+  const mode = prompt(`可见性当前：${policy.mode}\n输入 all 或 list`, policy.mode);
+  if (!mode) return;
+  let projects = [];
+  if (mode === "list") {
+    const csv = prompt("要可见的项目（逗号分隔）", policy.projects.join(",") || current);
+    projects = (csv || "").split(",").map(s => s.trim()).filter(Boolean);
+  }
+  await api("/admin/visibility", "POST", { mode, projects });
+  await loadProjects();
+}
+
+async function loadSec() {
+  const d = await api("/admin/security/blocks");
+  const rows = (d.blocks || []).filter((b) => b.active || b.permanent);
+  $("secStat").textContent = rows.length ? `${rows.length} 条生效` : "无封禁";
+  $("secs").innerHTML = rows.length
+    ? rows.map((b) => `<tr>
+        <td class="mono">${b.ip}</td>
+        <td class="muted">${b.fails}</td>
+        <td class="muted">${b.permanent ? "永久" : new Date(b.until).toLocaleString()}</td>
+        <td><button class="mini" data-unblock="${b.ip}">解封</button></td>
+      </tr>`).join("")
+    : `<tr><td colspan="4" class="empty">暂无封禁</td></tr>`;
+}
+
+async function loadEnr() {
+  if (!current) return;
+  let d;
+  try { d = await api("/admin/enrollments"); } catch { return; }
+  const rows = (d.enrollments || []).filter((e) => e.status === "pending");
+  $("enrStat").textContent = rows.length ? `${rows.length} 待审` : "";
+  BADGES.access = rows.length;
+  updateBadges();
+  if (!rows.length) { $("enr").innerHTML = `<tr><td colspan="5" class="empty">无待审申请</td></tr>`; return; }
+  $("enr").innerHTML = rows.map((e) => `
+    <tr><td>${e.agent_id}</td><td class="muted">${e.project}</td>
+      <td class="muted">${e.scopes}</td>
+      <td class="muted">${new Date(e.created_at).toLocaleString()}</td>
+      <td><button class="mini primary" data-approve="${e.id}">批准</button>
+          <button class="mini" data-reject="${e.id}">拒绝</button></td></tr>`).join("");
+  $("enr").querySelectorAll("[data-approve]").forEach((b) => b.onclick = async () => {
+    await api(`/admin/enrollments/${b.dataset.approve}/approve`, "POST", {});
+    await refresh();
+  });
+  $("enr").querySelectorAll("[data-reject]").forEach((b) => b.onclick = async () => {
+    await api(`/admin/enrollments/${b.dataset.reject}/reject`, "POST", {});
+    await refresh();
+  });
+}
+
+function renderSndWho(rows) {
+  $("sndWho").innerHTML = rows.map((a) => `
+    <label class="whoItem"><input type="checkbox" value="${a.agent_id}">
+      <span class="dot ${a.alive === "alive" ? "alive" : "offline"}"></span>${a.agent_id}
+      <span class="muted">${a.alive === "alive" ? "在线" : "失联"}</span></label>`).join("");
+}
+
+const QUICK = {
+  sync:    { title: "同步代码", body: "请 git pull 到最新分支，回执当前 HEAD 与是否有冲突", ack: true },
+  status:  { title: "汇报状态", body: "请汇报：当前任务进度、磁盘剩余、CPU/内存占用", ack: true },
+  pause:   { title: "暂停任务", body: "请停下当前任务，保持在线等待新指令", ack: true },
+  restart: { title: "重启心跳", body: "请重启 agent 进程并确认心跳恢复", ack: true },
+  clean:   { title: "清理缓存", body: "请清理构建缓存并汇报释放了多少空间", ack: true },
+  wrap:    { title: "收工", body: "请完成当前交付后进入待命状态", ack: true },
+  upgrade: { title: "升级 SDK", body: "请先自检版本（客户端 /sdk/manifest）：落后则升级并重启，完成后回报新版本号", ack: true, kind: "sdk_upgrade" },
+};
+
+async function quickRun() {
+  const cmd = QUICK[$("qCmd").value] || QUICK.sync;
+  const mode = $("qTo").value;
+  const all = (window._agents || []);
+  const pick = (fn) => all.filter(fn).map((a) => a.agent_id);
+  let targets = [];
+  if (mode === "online") targets = pick((a) => a.alive === "alive");
+  else if (mode === "offline") targets = pick((a) => a.alive !== "alive");
+  else if (mode === "busy") targets = pick((a) => a.alive === "alive" && (a.work?.state || "idle") !== "idle");
+  else if (mode === "idle") targets = pick((a) => a.alive === "alive" && (a.work?.state || "idle") === "idle");
+  else targets = pick(() => true);
+  if (!targets.length) { $("sndHint").textContent = "该分组下没有 agent"; return; }
+  const r = await api(`/admin/p/${current}/send`, "POST",
+    { to: targets, title: cmd.title, body: cmd.body, kind: cmd.kind || "task", ack_required: cmd.ack });
+  $("sndHint").textContent = `已发 ${r.sent.length} 个：${r.sent.map((x) => x.to + "#" + x.seq).join(" ")}（已刷新列表）`;
+  await refresh();
+  if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);   // 详情里的"最近消息"同步刷新
+  await refresh();
+}
+
+async function sendTargeted() {
+  const who = [...document.querySelectorAll("#sndWho input:checked")].map((x) => x.value);
+  const title = $("sndTitle").value.trim();
+  const body = $("sndBody").value.trim();
+  if (!title && !body) { $("sndHint").textContent = "标题或正文不能都为空"; return; }
+  const ack = $("sndAck").value === "1";
+  const payload = who.length
+    ? who.map((t) => ({ t }))
+    : [];
+  if (!who.length) {
+    // 不选人 = 广播给全项目（复用 broadcast 语义）
+    const r = await api(`/admin/p/${current}/broadcast`, "POST", {
+      broadcast_id: `bc-${Date.now()}`,
+      title: title || "(无标题)", body,
+      action_required: { kind: "task", ack_required: ack },
+    });
+    $("sndHint").textContent = `已广播 seq=${r.seq}（已刷新列表）`;
+    await refresh();
+    if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);
+    return;
+  }
+  const r = await api(`/admin/p/${current}/send`, "POST",
+    { to: who, title, body, ack_required: ack });
+  $("sndHint").textContent = `已发送 ${r.sent.length} 个：${r.sent.map((x) => x.to + "#" + x.seq).join(" ")}`;
+  $("sndTitle").value = ""; $("sndBody").value = "";
+  await refresh();
+}
+
+async function revoke(id) {
+  if (!confirm(`吊销 ${id}？该 agent 的 token 立刻失效，需重新申请接入。`)) return;
+  const r = await api(`/admin/p/${current}/revoke`, "POST", { agents: [id], confirm: true });
+  await refresh();
+  alert(`已吊销：${(r.revoked || []).join(", ")}`);
+}
+
+function drawLine(cv, vals, color) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 260, h = cv.clientHeight || 86;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  if (!vals.length) return;
+  const max = Math.max(...vals, 1), min = Math.min(...vals, 0);
+  g.strokeStyle = color; g.lineWidth = 1.4; g.beginPath();
+  vals.forEach((v, i) => {
+    const x = (i / Math.max(vals.length - 1, 1)) * (w - 8) + 4;
+    const y = h - 6 - ((v - min) / Math.max(max - min, 1)) * (h - 14);
+    i ? g.lineTo(x, y) : g.moveTo(x, y);
+  });
+  g.stroke();
+  // 三列窄图里 "now … / max …" 会相互覆盖；当前值和峰值分开贴左右角，小屏也不糊
+  g.fillStyle = "#7d8798"; g.font = "9px ui-monospace,monospace"; g.textAlign = "left";
+  if (w >= 150) {
+    g.fillText(`now ${Math.round(vals[vals.length - 1])} / max ${Math.round(max)}`, 5, 11);
+  } else {
+    // 三列窄图只放当前值；峰值由上方标题承担，避免左右两段文字叠在一起
+    g.fillText(`${Math.round(vals[vals.length - 1])}`, 5, 11);
+  }
+}
+
+let detailAgent = null;
+let detailRole = "agent";
+let detailReady = false;
+const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject"];
+function setDetailReady(on) {
+  detailReady = on;
+  for (const id of DETAIL_ACTIONS) {
+    const el = $(id);
+    if (el) el.disabled = !on;
+  }
+}
+function openAgent(id) {
+  detailAgent = id;
+  const ov = $("detail");
+  if (ov) { ov.hidden = false; ov.style.display = "flex"; document.body.classList.add("has-sheet"); ov.scrollTop = 0; }
+  $("dName").textContent = id;
+  $("dMeta").textContent = "加载中…";
+  document.querySelectorAll("#detail [data-dq]").forEach((b) => { b.dataset.da = id; });
+  $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
+  $("dToken").innerHTML = "";
+  $("dRole").textContent = "加载中…";
+  setDetailReady(false);
+  api(`/admin/p/${current}/agent/${encodeURIComponent(id)}`).then((d) => {
+    setDetailReady(true);
+    const hb = (d.hb || []).slice().reverse();
+    $("dMeta").textContent = `${d.agent?.role || "agent"} · ${(d.agent?.scopes || []).length} 项权限 · ${hb.length} 个采样`;
+    const role = d.agent?.role || "agent";
+    detailRole = role;
+    $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 只能收件与上报";
+    $("dRole").classList.toggle("admin", role === "admin");
+    fillDetailProjects();
+    drawLine($("cCpu"), hb.map((x) => x.cpu_pct ?? 0), "#6aa9ff");
+    drawLine($("cMem"), hb.map((x) => x.mem_used_mb ?? 0), "#8ee08e");
+    drawLine($("cDisk"), hb.map((x) => x.disk_used_pct ?? 0), "#ffc46a");
+    $("dMsgs").innerHTML = (d.messages || []).slice().reverse().map((m) => {
+      const pl = m.payload || {};
+      const done = m.kind === "done" || pl.status === "done";
+      const pend = done ? pendingFor(String(m.sender || "")) : 0;
+      const kindLabel = done && pend ? "完成待取" : (m.kind || "");
+      return `<div class="row"><span class="muted">#${m.seq}</span><span>${m.topic || ""}${kindLabel ? ` · ${kindLabel}` : ""}</span>
+        <span class="mono">${m.sender || ""}${m.to ? " → " + m.to : ""}</span>
+        <span class="muted">${String(pl.title || pl.body || (pl.submission_id ? `交付 ${pl.submission_id}` : "")
+          || (pl.task_id ? `任务 ${pl.task_id}` : "")).slice(0, 46)}${pend
+          ? ` <span class="warnv">· 交付待取 ${pend}</span>` : ""}</span>
+        <span class="muted" style="margin-left:auto">${m.at ? new Date(m.at).toLocaleTimeString() : ""}</span></div>`;
+    }).join("") || `<div class="muted">暂无</div>`;
+    $("dSubs").innerHTML = (d.submissions || []).map((x) => `
+      <div class="row subrow"><span class="mono subid">${x.submission_id}</span><span>${x.kind}</span>
+        <span class="badge ${x.state}">${x.state}</span>
+        <span class="muted mono subsha">${x.base_sha || ""}</span>
+        ${x.state === "delivered"
+          ? `<button class="ghost" data-collect="${x.submission_id}">下载并取走</button>`
+          : `<button class="ghost" data-dl="${x.submission_id}">下载</button>`}
+        <span class="muted" style="margin-left:auto">${new Date(x.created_at).toLocaleString()}</span></div>`).join("")
+      || `<div class="muted">暂无</div>`;
+    // 详情页的下载按钮也要知道状态，否则会漏掉"下载即取走"
+    (d.submissions || []).forEach((x) => SUB_STATE.set(x.submission_id, x.state));
+  }).catch((e) => { $("dMeta").textContent = "加载失败：" + e.message; setDetailReady(false); });
+}
+
+const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",
+                      "artifact.read","artifact.write","submissions.create"];
+const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",
+                           "artifact.read","artifact.write","submissions.create"];
+
+function renderToken(boxId, tok, note, hintText = "只显示这一次，关掉就没了；旧 token 已同时作废。") {
+  const box = $(boxId);
+  if (!box) return;
+  box.innerHTML = "";
+  const noteRow = document.createElement("div");
+  noteRow.className = "row";
+  noteRow.innerHTML = `<span class="muted">${esc(note)}</span>`;
+  const tokenRow = document.createElement("div");
+  tokenRow.className = "row";
+  const code = document.createElement("code");
+  code.className = "mono";
+  code.style.cssText = "word-break:break-all;flex:1";
+  code.textContent = tok;
+  const copy = document.createElement("button");
+  copy.className = "ghost";
+  copy.textContent = "复制";
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(tok);
+      copy.textContent = "已复制";
+    } catch {
+      copy.textContent = "长按选中复制";
+    }
+  };
+  tokenRow.append(code, copy);
+  const hint = document.createElement("div");
+  hint.className = "row muted";
+  hint.textContent = hintText;
+  box.append(noteRow, tokenRow, hint);
+}
+
+function renderTokenError(boxId, message) {
+  const box = $(boxId);
+  if (!box) return;
+  box.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "row muted";
+  row.textContent = `操作失败：${message}`;
+  box.appendChild(row);
+}
+
+function showToken(tok, note) {
+  renderToken("dToken", tok, note);
+}
+
+async function signToken(agentId, role, ttl, boxId, label) {
+  const scopes = role === "admin" ? ADMIN_SCOPES : AGENT_BASE_SCOPES;
+  const r = await api("/admin/agents", "POST", {
+    project: current, agent_id: agentId, role, scopes, ttl_days: ttl, rotate: true,
+  });
+  renderToken(boxId, r.token, `${label}：role=${role}，有效期 ${ttl || "不限"} 天`);
+  return r;
+}
+
+async function issueFor(role, reissue = false) {
+  if (!detailAgent || !current || !detailReady) return;
+  const ttl = Number($("dTtl").value || 30);
+  const scopes = role === "admin" ? ADMIN_SCOPES : AGENT_BASE_SCOPES;
+  const label = reissue ? "生成新 token" : (role === "admin" ? "授予管理权限" : "收回管理权限");
+  if (!confirm(`${label}：${detailAgent} 会拿到新 token，旧 token 立即失效。继续？`)) return;
+  try {
+    await signToken(detailAgent, role, ttl, "dToken", label);
+    $("dMeta").textContent = `${role} · ${scopes.length} 项权限`;
+    $("dRole").textContent = role === "admin"
+      ? "管理身份 · 可下发/广播/下载"
+      : "普通 agent · 只能收件与上报";
+    $("dRole").classList.toggle("admin", role === "admin");
+    detailRole = role;
+    await loadAgents().catch(() => {});
+  } catch (e) {
+    renderTokenError("dToken", e.message || e);
+  }
+}
+
+$("dGrant").onclick = () => issueFor("admin");
+$("dDemote").onclick = () => issueFor("agent");
+$("dReissue").onclick = () => issueFor(detailRole, true);
+
+$("btnIssueToken").onclick = async () => {
+  if (!current) return renderTokenError("issueTokenBox", "请先选择项目");
+  const agentId = $("issueAgentId").value.trim();
+  const role = $("issueRole").value;
+  const ttl = Number($("issueTtl").value || 30);
+  if (!/^[a-zA-Z0-9._-]{2,40}$/.test(agentId)) {
+    return renderTokenError("issueTokenBox", "Agent ID 需为 2-40 位字母、数字、点、下划线或短横线");
+  }
+  if (!confirm(`生成 token：${agentId}（${role}）\n同一 agent 旧 token 会立即失效。继续？`)) return;
+  try {
+    await signToken(agentId, role, ttl, "issueTokenBox", "生成 token");
+    await loadAgents().catch(() => {});
+  } catch (e) {
+    renderTokenError("issueTokenBox", e.message || e);
+  }
+};
+$("dRevoke").onclick = async () => {
+  if (!detailAgent || !current || !detailReady) return;
+  if (!confirm(`吊销 ${detailAgent} 的全部 token？该 agent 会立刻断开。`)) return;
+  await api("/admin/agents", "DELETE", { project: current, agent_id: detailAgent });
+  $("dToken").innerHTML = `<div class="row muted">已吊销。</div>`;
+  openAgent(detailAgent);
+};
+
+async function changeAgentProject(keepSource) {
+  if (!detailAgent || !current || !detailReady) return;
+  const to = $("dMoveTo").value;
+  if (!to || to === current) return renderTokenError("dToken", "请选择一个其它项目");
+  const ttl = Number($("dTtl").value || 30);
+  const label = keepSource ? "加入项目" : "迁移项目";
+  if (!confirm(`${label}：${detailAgent}\n${current} → ${to}\n${keepSource ? "源项目 token 保持有效" : "成功后会吊销源项目 token"}。继续？`)) return;
+  try {
+    const r = await api("/admin/agents/move", "POST", {
+      from_project: current, to_project: to, agent_id: detailAgent,
+      ttl_days: ttl, keep_source: keepSource,
+    });
+    renderToken("dToken", r.token,
+      `${label}：${current} → ${to}；role=${r.role}，有效期 ${ttl || "不限"} 天`,
+      keepSource
+        ? "只显示这一次；源项目 token 仍有效，需要用另一个实例接入目标项目。"
+        : "只显示这一次；源项目 token 已吊销，客户端需要切换到目标项目。");
+    $("dMeta").textContent = `${r.role} · ${String(r.scopes || "").split(",").filter(Boolean).length} 项权限`;
+    $("dRole").textContent = r.role === "admin"
+      ? "管理身份 · 可下发/广播/下载"
+      : "普通 agent · 只能收件与上报";
+    $("dRole").classList.toggle("admin", r.role === "admin");
+    detailRole = r.role;
+    await loadAgents().catch(() => {});
+  } catch (e) {
+    renderTokenError("dToken", e.message || e);
+  }
+}
+$("dJoinProject").onclick = () => changeAgentProject(true);
+$("dMoveProject").onclick = () => changeAgentProject(false);
+
+function decorateCards() {
+  document.querySelectorAll(".card").forEach((c) => {
+    if (c.dataset.deco) return;
+    c.dataset.deco = "1";
+    const h = c.querySelector("h2");
+    if (!h) return;
+    const tools = document.createElement("div");
+    tools.className = "cardTools";
+    const max = document.createElement("button");
+    max.className = "ghost mini"; max.textContent = "⤢"; max.title = "最大化/还原";
+    const col = document.createElement("button");
+    col.className = "ghost mini"; col.textContent = "▾"; col.title = "折叠/展开";
+    tools.append(max, col); h.appendChild(tools);
+
+    const body = document.createElement("div");
+    body.className = "cardBody";
+    [...c.children].filter((x) => x !== h).forEach((x) => body.appendChild(x));
+    c.appendChild(body);
+
+    // 只保留两块常驻：概览（一眼看健康度）、名册（最小操作面），其余默认收起
+    const title = (h.textContent || "").trim().replace(/[▸▾⤢⤡]/g, "").trim();
+    const keep = /^(概览|名册|注册审批|签发 token)/.test(title);   // 待审批准与签发入口默认展开
+    const key = `hub.fold2.${title}`;
+    let folded = !keep;
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved !== null) folded = saved === "1";
+    } catch {}
+    if (folded) { c.classList.add("collapsed"); col.textContent = "▸"; }
+
+    col.onclick = (e) => {
+      e.stopPropagation();
+      c.classList.toggle("collapsed");
+      const now = c.classList.contains("collapsed");
+      col.textContent = now ? "▸" : "▾";
+      try { localStorage.setItem(key, now ? "1" : "0"); } catch {}
+    };
+    max.onclick = (e) => {
+      e.stopPropagation();
+      c.classList.toggle("maxed");
+      const now = c.classList.contains("maxed");
+      max.textContent = now ? "⤡" : "⤢";
+      document.body.classList.toggle("has-max", !!document.querySelector(".card.maxed"));
+      if (now) c.scrollTop = 0;
+      if (now && c.classList.contains("collapsed")) {
+        c.classList.remove("collapsed");
+        col.textContent = "▾";
+        try { localStorage.setItem(key, "0"); } catch {}
+      }
+    };
+  });
+}
+
+// 全局退出最大化：固定按钮 + Esc，两者都不依赖卡片内部的滚动位置
+(function bindMaxExit() {
+  const btn = document.createElement("button");
+  btn.id = "maxExit"; btn.textContent = "✕ 退出全屏"; btn.type = "button";
+  btn.onclick = () => {
+    document.querySelectorAll(".card.maxed").forEach((c) => {
+      c.classList.remove("maxed");
+      const m = c.querySelector(".cardTools .ghost");
+      if (m) m.textContent = "⤢";
+    });
+    document.body.classList.remove("has-max");
+  };
+  document.body.appendChild(btn);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.querySelector(".card.maxed")) btn.click();
+  });
+})();
+
+function bindAutoRefresh() {
+  const sel = $("autoRef");
+  if (!sel) return;
+  let saved = null;
+  try { saved = localStorage.getItem("hub.autoRef"); } catch {}
+  if (saved !== null) sel.value = saved;
+  let timer = null;
+  const arm = () => {
+    if (timer) clearInterval(timer);
+    timer = null;
+    const sec = Number(sel.value);
+    if (sec > 0) timer = setInterval(() => {
+      if (!document.body.classList.contains("locked")) refresh();
+    }, sec * 1000);
+  };
+  sel.onchange = () => {
+    try { localStorage.setItem("hub.autoRef", sel.value); } catch {}
+    arm();
+    refresh();                       // 改频率立刻刷一次，不必等下一拍
+  };
+  arm();
+}
+
+function addFilter(card, placeholder, opts) {
+  if (card.querySelector(".filterbar")) return;
+  const bar = document.createElement("div");
+  bar.className = "filterbar";
+  let sel = null;
+  if (opts && opts.items) {
+    sel = document.createElement("select");
+    sel.className = "filterSel";
+    sel.innerHTML = opts.items.map((o) => `<option value="${o.v}">${o.label}</option>`).join("");
+    bar.append(sel);
+  }
+  const inp = document.createElement("input");
+  inp.type = "search";
+  inp.placeholder = placeholder;
+  const cnt = document.createElement("span");
+  cnt.className = "muted";
+  bar.append(inp, cnt);
+  const h = card.querySelector("h2");
+  h.after(bar);
+  const apply = () => {
+    const q = inp.value.trim().toLowerCase();
+    const body = card.querySelector(".cardBody") || card;
+    const rows = [...body.querySelectorAll("tbody tr")];
+    const v = sel ? sel.value : "all";
+    let shown = 0;
+    rows.forEach((r) => {
+      if (r.querySelector(".empty")) return;
+      const okSel = !opts || !opts.test || opts.test(r, v);
+      const okTxt = !q || (r.textContent || "").toLowerCase().includes(q);
+      const hit = okSel && okTxt;
+      r.style.display = hit ? "" : "none";
+      if (hit) shown++;
+    });
+    cnt.textContent = (q || v !== "all") ? `${shown}/${rows.length}` : "";
+  };
+  inp.oninput = apply;
+  if (sel) sel.onchange = apply;      // 原来只绑了 input，下拉选了根本不触发
+  card._applyFilter = apply;
+  return apply;
+}
+
+function reapplyFilters() {
+  document.querySelectorAll(".card").forEach((c) => {
+    if (c._applyFilter) c._applyFilter();
+  });
+}
+
+function bindFilters() {
+  document.querySelectorAll(".card").forEach((c) => {
+    const t = (c.querySelector("h2")?.textContent || "").trim();
+    if (/^消息流/.test(t)) addFilter(c, "搜 agent / 内容", {
+      items: [
+        { v: "all", label: "全部" },
+        { v: "announce", label: "广播" },
+        { v: "task", label: "任务" },
+        { v: "ack", label: "回执" },
+        { v: "artifact", label: "交付" },
+        { v: "report", label: "报告" },
+      ],
+      test: (row, v) => v === "all" || (row.dataset.topic || "") === v,
+    });
+    else if (/^名册/.test(t)) addFilter(c, "搜 agent 名 / 基线", {
+      items: [
+        { v: "all", label: "全部" },
+        { v: "alive:alive", label: "在线" },
+        { v: "alive:late", label: "迟到" },
+        { v: "alive:offline", label: "失联" },
+        { v: "work:work", label: "忙" },
+        { v: "work:idle", label: "闲" },
+      ],
+      test: (row, v) => {
+        if (v === "all") return true;
+        const [k, want] = v.split(":");
+        return (row.dataset[k] || "") === want;
+      },
+    });
+    else if (/^交付箱/.test(t)) addFilter(c, "搜 提交号 / agent", {
+      items: [
+        { v: "all", label: "全部" },
+        { v: "delivered", label: "待取" },
+        { v: "collected", label: "已取" },
+        { v: "archived", label: "归档" },
+      ],
+      test: (row, v) => v === "all" || (row.dataset.state || "") === v,
+    });
+  });
+}
+
+const GROUPS = [
+  { id: "overview", label: "总览", cards: ["概览", "名册"] },
+  { id: "msg",      label: "消息", cards: ["消息流", "定向指令", "广播"] },
+  { id: "deli",     label: "交付", cards: ["交付箱"] },
+  { id: "access",   label: "接入", cards: ["签发 token", "注册审批", "登录封禁"] },
+];
+
+function setCardOpen(title, open) {
+  const c = cardsAll().find((x) => titleOf(x).startsWith(title));
+  if (!c) return;
+  c.classList.toggle("collapsed", !open);
+  const col = c.querySelector(".cardTools .ghost:last-child");
+  if (col) col.textContent = open ? "▾" : "▸";
+  try { localStorage.setItem(`hub.fold2.${title}`, open ? "0" : "1"); } catch {}
+}
+
+const BADGES = { access: 0, deli: 0, msg: 0 };
+let MSG_MAX = 0;
+let ACTIVE_TAB = "overview";
+function markMsgSeen() {
+  if (MSG_MAX) { try { localStorage.setItem("hub.lastSeq", String(MSG_MAX)); } catch {} }
+  BADGES.msg = 0;
+  updateBadges();
+}
+
+function updateBadges() {
+  const bar = $("tabs");
+  if (!bar) return;
+  Object.entries({ access: BADGES.access, deli: BADGES.deli, msg: BADGES.msg }).forEach(([g, n]) => {
+    const el = bar.querySelector(`[data-cnt="${g}"]`);
+    if (el) el.textContent = n > 0 ? ` ${n}` : "";
+  });
+}
+
+function cardsAll() { return [...document.querySelectorAll(".card")]; }
+function titleOf(c) { return (c.querySelector("h2")?.textContent || "").trim(); }
+
+function bindTabs() {
+  const bar = $("tabs");
+  if (!bar || bar.dataset.done) return;
+  bar.dataset.done = "1";
+  bar.innerHTML = GROUPS.map((g) =>
+    `<button data-tab="${g.id}">${g.label}<span class="cnt" data-cnt="${g.id}"></span></button>`).join("");
+  const saved = localStorage.getItem("hub.tab") || "overview";
+  const apply = (id) => {
+    ACTIVE_TAB = id;
+    const g = GROUPS.find((x) => x.id === id) || GROUPS[0];
+    cardsAll().forEach((c) => {
+      const t = titleOf(c);
+      const inGroup = g.cards.some((name) => t.startsWith(name));
+      const anyGroup = GROUPS.some((x) => x.cards.some((n) => t.startsWith(n)));
+      c.style.display = !anyGroup || inGroup ? "" : "none";
+      if (!inGroup) c.classList.remove("maxed");
+    });
+    [...bar.querySelectorAll("button")].forEach((b) =>
+      b.classList.toggle("on", b.dataset.tab === g.id));
+    localStorage.setItem("hub.tab", g.id);
+    if (g.id === "msg") markMsgSeen();
+    window.scrollTo({ top: 0 });
+  };
+  bar.onclick = (e) => {
+    const b = e.target.closest("[data-tab]");
+    if (b) apply(b.dataset.tab);
+  };
+  apply(saved);
+}
+
+function cardByTitle(name) {
+  return [...document.querySelectorAll(".card")].find(
+    (c) => (c.querySelector("h2")?.textContent || "").trim().startsWith(name));
+}
+
+function addCardBtn(card, text, fn) {
+  const h = card && card.querySelector("h2");
+  if (!h || !h.querySelector(".cardTools")) return;
+  if ([...h.querySelectorAll("button")].some((b) => b.textContent === text)) return;
+  const b = document.createElement("button");
+  b.className = "ghost mini";
+  b.textContent = text;
+  b.onclick = (e) => { e.stopPropagation(); fn(); };
+  h.querySelector(".cardTools").prepend(b);
+}
+
+function bindBulk() {
+  // 注册审批：一次批完，不用逐个点
+  const enr = cardByTitle("注册审批");
+  if (enr) addCardBtn(enr, "全部批准", async () => {
+    const ids = [...document.querySelectorAll("[data-approve]")].map((b) => b.dataset.approve);
+    if (!ids.length) return;
+    if (!confirm(`批准 ${ids.length} 个待审申请？`)) return;
+    for (const id of ids) await api(`/admin/enrollments/${id}/approve`, "POST", {});
+    await refresh();
+  });
+  // 名册：一键清掉失联的残留号
+  const ros = cardByTitle("名册");
+  if (ros) addCardBtn(ros, "清失联", async () => {
+    const off = (window._agents || []).filter((a) => a.alive !== "alive").map((a) => a.agent_id);
+    if (!off.length) { alert("没有失联的 agent"); return; }
+    if (!confirm(`吊销 ${off.length} 个失联 agent？\n${off.slice(0, 8).join(", ")}${off.length > 8 ? " …" : ""}`)) return;
+    await api(`/admin/p/${current}/revoke`, "POST", { agents: off, confirm: true });
+    await refresh();
+  });
+}
+
+function bindFoldAll() {
+  if ($("foldAll")) return;
+  const seg = document.querySelector(".seg") || document.body;
+  const b = document.createElement("button");
+  b.id = "foldAll"; b.className = "ghost";
+  b.textContent = "全收";
+  seg.insertBefore(b, seg.querySelector("#autoRef"));
+  const extras = () => [...document.querySelectorAll(".card")].filter((c) => {
+    const t = (c.querySelector("h2")?.textContent || "").trim();
+    return !/^(概览|名册)/.test(t);
+  });
+  b.onclick = () => {
+    const cards = extras();
+    const open = cards.some((c) => !c.classList.contains("collapsed"));
+    cards.forEach((c) => {
+      const h = c.querySelector("h2");
+      const t = h ? (h.textContent || "").trim() : "";
+      if (/^(概览|名册|注册审批)/.test(t)) return;   // 关键信息不参与批量收起
+      c.classList.toggle("collapsed", open);
+      const col = c.querySelector(".cardTools .ghost:last-child");
+      if (col) col.textContent = open ? "▸" : "▾";
+      try { localStorage.setItem(`hub.fold2.${t}`, open ? "1" : "0"); } catch {}
+    });
+    b.textContent = open ? "全展" : "全收";
+  };
+}
+
+async function loadMsgs() {
+  if (!current) return;
+  let d;
+  try { d = await api(`/admin/p/${current}/messages?limit=120`); } catch { return; }
+  const rows = (d.messages || []).slice().reverse();
+  MSG_MAX = rows.reduce((a, m) => Math.max(a, m.seq || 0), 0);
+  const lastSeen = Number(localStorage.getItem("hub.lastSeq") || 0);
+  BADGES.msg = rows.filter((m) => (m.seq || 0) > lastSeen).length;
+  if (ACTIVE_TAB === "msg") { markMsgSeen(); } else { updateBadges(); }
+  $("msgStat").textContent = rows.length ? `最近 ${rows.length} 条` : "";
+  $("msgs").innerHTML = rows.length ? rows.map((m) => {
+    const pl = m.payload || {};
+    const txt = pl.title || pl.body || pl.text
+      || (pl.submission_id ? `交付 ${pl.submission_id}` : "")
+      || (pl.task_id ? `任务 ${pl.task_id}` : "")
+      || (pl.action_required ? `任务 ${pl.action_required.kind || "sync"}` : "") || "—";
+    const done = m.kind === "done" || pl.status === "done";
+    const pending = done ? pendingFor(String(m.sender || "")) : 0;
+    // done 且仍有交付待取时，合成一个状态显示；不要把“执行完成”和“交付待取”并排成矛盾画面
+    const kindLabel = done && pending ? "完成待取" : (m.kind || "");
+    return `<tr data-topic="${m.topic || ""}">
+      <td class="num muted">${m.seq}</td>
+      <td>${m.topic || "—"}${kindLabel ? ` · ${kindLabel}` : ""}</td>
+      <td class="mono">${m.sender || "—"}</td>
+      <td class="muted">${m.to ? `<b>${m.to}</b>` : "广播"}</td>
+      <td class="muted">${String(txt).slice(0, 60)}${pending
+        ? ` <span class="warnv">· 该 agent 还有 ${pending} 份交付待取</span>` : ""}</td>
+      <td class="muted">${(m.ts || m.at) ? new Date(m.ts || m.at).toLocaleTimeString() : "—"}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="6" class="empty">暂无消息</td></tr>`;
+  reapplyFilters();
+}
+
+async function loadStats() {
+  if (!current) return;
+  const d = await api("/admin/stats").catch(() => null);
+  if (!d) return;
+  const sub = d.submissions || {};
+  const total = Object.values(sub).reduce((a, b) => a + b, 0);
+  const items = [
+    ["在线 agent", d.agents_online ?? 0],
+    ["注册 agent", d.agents_active ?? 0],
+    ["24h 有心跳", d.agents_heartbeat_24h ?? 0],
+    ["待审注册", d.enrollments_pending ?? 0],
+    ["项目", d.projects ?? 0],
+    ["交付", total],
+  ];
+  $("stats").innerHTML = items.map(([k, v]) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  $("ovAt").textContent = new Date(d.at).toLocaleTimeString();
+}
+
+async function refresh() {
+  if (!current) return;
+  // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
+  await Promise.all([loadAgents(), loadSec(), loadStats(), loadEnr()]);
+  await loadSubs();
+  await loadMsgs();
+}
+
+$("proj").onchange = (e) => {
+  current = e.target.value;
+  lastPending = null;
+  SUB_ROWS = [];
+  SUB_STATE = new Map();
+  fillDetailProjects();
+  refresh();
+  connectLive();
+};
+// 实时通道：有新消息就防抖刷新一次，复用现有渲染路径
+let liveWs = null, liveTimer = null, liveMode = localStorage.getItem("hub.live") || "ws";
+function paintLive(on, note, why) {
+  const el = $("liveDot"); if (!el) return;
+  el.textContent = on ? "● 实时" : "○ " + (why || (liveMode === "ws" ? "连接中" : "轮询"));
+  el.style.color = on ? "#3fb950" : "#8b95a5";
+  el.title = note + (on ? "（点击切到轮询）" : "（点击尝试实时）");
+}
+function scheduleRefresh() { clearTimeout(liveTimer); liveTimer = setTimeout(refresh, 400); }
+function closeLive() { if (liveWs) { try { liveWs.close(); } catch {} liveWs = null; } }
+function connectLive() {
+  closeLive();
+  if (!current) return;
+  if (liveMode === "poll") { paintLive(false, "轮询模式：按刷新频率拉取"); return; }
+  try {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}/p/${encodeURIComponent(current)}/ws`);
+    ws.onopen = () => paintLive(true, "实时模式：服务端推送");
+    ws.onmessage = (ev) => { try { if (JSON.parse(ev.data).type === "msg") scheduleRefresh(); } catch {} };
+    ws.onclose = (e) => { paintLive(false, "实时断开，5 秒后重连", "轮询·断开" + (e.code ? ` ${e.code}` : "")); liveWs = null;
+      setTimeout(() => { if (liveMode === "ws" && current && document.visibilityState !== "hidden") connectLive(); }, 5000); };
+    ws.onerror = () => paintLive(false, "实时连不上", "轮询·失败");
+    liveWs = ws;
+  } catch { paintLive(false, "浏览器不支持 WebSocket"); }
+}
+const liveEl = $("liveDot");
+if (liveEl) liveEl.onclick = () => {
+  if (liveMode === "ws" && !liveWs) { connectLive(); return; }   // 还没连上时，点一下=重试而不是切走
+  liveMode = liveMode === "ws" ? "poll" : "ws";
+  localStorage.setItem("hub.live", liveMode);
+  connectLive();
+};
+connectLive();
+$("btnReload").onclick = refresh;
+$("btnBroadcast").onclick = broadcast;
+const btnSendEl = $("btnSend");
+if (btnSendEl) btnSendEl.onclick = sendTargeted;
+const btnQuickEl = $("btnQuick");
+if (btnQuickEl) btnQuickEl.onclick = quickRun;
+const dCloseEl = $("dClose");
+if (dCloseEl) dCloseEl.onclick = () => { const d = $("detail"); if (d) { d.hidden = true; d.style.display = ""; document.body.classList.remove("has-sheet"); } };
+const dOv = $("detail");
+if (dOv) dOv.onclick = (e) => { if (e.target === dOv) { dOv.hidden = true; document.body.classList.remove("has-sheet"); } };
+$("btnSettings").onclick = settings;
+$("gateOk").onclick = async () => {
+  if (await tryConnect($("gateInput").value)) { await loadProjects(); await refresh(); }
+};
+$("gateInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("gateOk").click();
+});
+$("gateCancel").onclick = () => {
+  token = ""; localStorage.removeItem(KEY);
+  lock("已取消：没有凭证时不会显示任何项目数据。点“连接”可重新输入。");
+};
+document.addEventListener("click", async (e) => {
+  const el = e.target;
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery]");
+  // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
+  if (btn) {
+    const ca = btn.getAttribute("data-collect-all");
+    if (ca) return collectAll();
+    const gd = btn.getAttribute("data-goto-delivery");
+    if (gd) {
+      const tab = document.querySelector('#tabs button[data-tab="deli"]');
+      if (tab) tab.click();
+      setCardOpen("交付箱", true);
+      const c = cardsAll().find((x) => titleOf(x).startsWith("交付箱"));
+      if (c) c.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    const rv = btn.getAttribute("data-revoke");
+    if (rv) return revoke(rv);
+    const dt = btn.getAttribute("data-detail");
+    if (dt) return openAgent(dt);
+    const dl = btn.getAttribute("data-dl");
+    if (dl) return downloadBundle(dl);
+    const co = btn.getAttribute("data-collect");
+    if (co) return collect(co);
+    const ub = btn.getAttribute("data-unblock");
+    if (ub) { await api("/admin/security/unblock", "POST", { ip: ub }); return loadSec(); }
+    return;
+  }
+  const dq = el.getAttribute && el.getAttribute("data-dq");
+  if (dq && el.getAttribute("data-da")) {
+    const id = el.getAttribute("data-da");
+    const q = (typeof QUICK !== "undefined" && QUICK[dq]) || { title: dq, body: dq, ack: true };
+    const r = await api(`/admin/p/${current}/send`, "POST",
+      { to: [id], title: q.title, body: q.body, ack_required: q.ack });
+    alert(`已发给 ${id}，seq=${r.sent?.[0]?.seq}`);
+    return;
+  }
+  const agId = el.closest && el.closest("[data-agent]")?.getAttribute("data-agent");
+  if (agId) return openAgent(agId);
+  const dlId = el.getAttribute && el.getAttribute("data-dl");
+  if (dlId) return downloadBundle(dlId);
+  const collectId = el.getAttribute && el.getAttribute("data-collect");
+  if (collectId) return collect(collectId);
+  const ip = el.getAttribute && el.getAttribute("data-unblock");
+  if (ip) { await api("/admin/security/unblock", "POST", { ip }); await loadSec(); }
+});
+$("btnUnblockAll").onclick = async () => {
+  if (!confirm("解除全部 IP 封禁？")) return;
+  await api("/admin/security/unblock", "POST", { ip: "*" });
+  await loadSec();
+};
+
+(async function boot() {
+  let diag = "?";
+  let buildTag = "?";
+  try {
+    const d = await (await fetch("/console/debug", { credentials: "same-origin" })).json();
+    diag = `jwt=${!!d.jwt_present} sess=${!!d.session} id=${d.cookie_identity ?? "—"}`;
+  } catch (e) { diag = "diag-fail"; }
+  buildTag = await fetch("/ver").then((r) => r.json()).then((v) => v.build || "?").catch(() => "?");
+  $("build").textContent = `build ${buildTag} · ${diag}`;
+  if (diag.includes("sess=false") && !diag.includes("id=")) { /* 仅记录，不阻断 */ }
+  // 先尝试用 Access 身份换会话（/console/whoami 在 Access 覆盖范围内，会带上 CF 令牌）
+  await fetch("/console/whoami", { credentials: "same-origin" })
+    .then((r) => r.json()).catch(() => null);
+  // 凭证可能是 Cloudflare Access 会话（浏览器带 CF cookie，服务端验 JWT），
+  // 因此不预判 localStorage，先打一次接口：通了就渲染，401 才锁屏。
+  try {
+    const step = (name, fn) => { try { fn(); } catch (e) { console.error("[hub]", name, e); } };
+    step("decorate", decorateCards);
+    step("foldall", bindFoldAll);
+    step("tabs", bindTabs);
+    step("filters", bindFilters);
+    step("autoref", bindAutoRefresh);
+    await loadProjects(); await refresh(); unlock();
+  } catch (e) {
+    if (e instanceof AuthError) lock("需要登录：请完成 Cloudflare Access 登录，或输入 admin token。");
+    else lock("连接失败：" + e.message);
+  }
+})();
+const purgeEl = $("btnPurge");
+if (purgeEl) purgeEl.onclick = async () => {
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map((r) => r.unregister()));
+    const keys = await caches.keys();
+    await Promise.all(keys.map((k) => caches.delete(k)));
+  } catch {}
+  location.replace(`/console?reset=1&t=${Date.now()}`);
+};
+if ("serviceWorker" in navigator) { navigator.serviceWorker.register("/sw.js?v=5").catch(() => {}); }
+</script>

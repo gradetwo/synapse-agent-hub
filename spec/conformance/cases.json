@@ -1,0 +1,24 @@
+{
+  "version": "0.2",
+  "note": "语言无关的一致性用例，执行器见 run.py。任何 SDK/服务端实现必须全绿才能发布。",
+  "runner": "python3 spec/conformance/run.py --endpoint http://127.0.0.1:18099 --project yanshi --lease 3",
+  "cases": [
+    { "id": "01", "name": "心跳往返 + 名册可见",
+      "assert": ["heartbeat ok=true", "admin/agents 至少 1 条", "alive ∈ {alive, late}"] },
+    { "id": "02", "name": "游标续传不丢不重",
+      "assert": ["首轮新消息数=1", "cursor 前移", "次轮仅 1 条新消息且 seq > cursor"] },
+    { "id": "03", "name": "幂等发布",
+      "assert": ["同 dedupe_key 两次返回同一 seq", "第二次 deduped=true"] },
+    { "id": "04", "name": "上传 → 建交付 → 去重 → 下载",
+      "assert": ["PUT 201/stored", "submission state=delivered", "重复提交仅 1 条记录",
+                 "下载内容 sha256 与 manifest 一致"] },
+    { "id": "05", "name": "离线 outbox",
+      "assert": ["断网时 publish 返回 queued=true 且落盘 1 份",
+                 "恢复后 drain 交付 1 份、outbox 清空",
+                 "重发同 dedupe_key 服务端 deduped=true"] },
+    { "id": "06", "name": "租约到期被他人认领",
+      "assert": ["首认领 ok", "租约到期后他人 claim ok"] },
+    { "id": "07", "name": "广播 + ack + supersedes",
+      "assert": ["广播返回 seq", "ack ok", "supersedes 后新广播 seq 更大"] }
+  ]
+}

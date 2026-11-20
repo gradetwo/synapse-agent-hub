@@ -1,0 +1,39 @@
+Synapse agent-hub 完整源码 / 提示词模板 / 文档包
+=================================================
+
+build:        functional-multiproject2-20261120
+sdk_version:  0.5.1
+snapshot:     2026-11-20
+
+包含
+----
+- README.md / DESIGN.md / BUILD.md / SECURITY-AUDIT.md
+- docs/ 当前接入、异步循环、唤醒语义；docs/archive/ 历史审计快照
+- prompts/ 01-04 客户端/管理/常驻/多项目提示词模板
+- worker/ Cloudflare Worker + Durable Object 源码、schema.sql
+- admin/index.html 管理面板（token 签发/复制、加入/迁移项目、项目参与）
+- scripts/install.sh 唯一 Linux x64 安装入口（/dl/install.sh 同源）
+- scripts/install.ps1 Windows 本地 exe 安装辅助
+- scripts/hubctl 管理 CLI（含 agent-move）
+- sdk/python、sdk/ts、sdk/rust 三端源码与构建产物
+- spec/openapi.yaml（0.5.1，31 paths）、conformance、mock_hub
+- dist/ 当前 Linux x64 预编译二进制 + SHA256SUMS
+
+未包含
+------
+- node_modules / sdk/ts/node_modules / sdk/rust/target
+- worker/.wrangler 本地状态
+- bundle/ 与 sdk/rust/dist/ 的重复二进制（已统一为 dist/）
+- __pycache__ / *.pyc
+
+校验
+----
+在包根目录执行：
+  sha256sum -c dist/SHA256SUMS
+预期两行 OK：Linux 二进制、scripts/install.sh。
+
+安装（Linux x64，客户端）
+------------------------------
+  curl -fsSL https://synapse.wangda.today/dl/install.sh | sh
+
+其它平台：按 BUILD.md 由维护者/使用者自行编译，客户端不执行 cargo/pip。

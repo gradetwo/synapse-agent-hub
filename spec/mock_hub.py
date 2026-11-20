@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""mock_hub —— 内存版 Agent Hub，用于在本地跑一致性用例（不需要 CF 账号）。
+
+刻意与 worker 语义保持一致：
+  · seq 每项目单调递增；dedupe_key 幂等
+  · 心跳覆盖写、alive/late/offline 判定、采样桶
+  · 任务租约（默认 3 秒，便于测试；生产 120 秒）
+  · 交付三态 delivered/collected/archived
+  · blob 内容寻址（sha256 即 key）
+
+用法： python3 spec/mock_hub.py --port 18099 --lease 3
+"""
+import argparse
+import hashlib
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+LEASE_TTL = 3
+HB_PERIOD = 60
+LOCK = threading.RLock()
+PROJECTS = {"yanshi": {"project": "yanshi", "display_name": "偃师", "status": "active"}}
+POLICY = {"mode": "all", "projects": []}
+STATE = {}          # project -> dict(seq, msgs, dedupe, hb, tasks, acks, bc, superseded)
+SUBS = {}           # (project, sid) -> dict
+BLOBS = {}          # (project, sha) -> bytes
+
+
+def st(project):
+    with LOCK:
+        if project not in STATE:
+            STATE[project] = {"seq": 0, "msgs": {}, "dedupe": {}, "hb": {},
+                              "tasks": {"T-1": {"id": "T-1", "state": "open", "owner": None, "lease_until": 0}},
+                              "acks": {}, "bc": {}, "superseded": set()}
+        return STATE[project]
+
+
+def append(project, msg):
+    s = st(project)
+    s["seq"] += 1
+    msg["seq"] = s["seq"]
+    msg["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    s["msgs"][s["seq"]] = msg
+    if msg.get("dedupe_key"):
+        s["dedupe"][msg["dedupe_key"]] = s["seq"]
+    return s["seq"]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    # ── 工具 ────────────────────────────────────────────
+    def _body(self):
+        n = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        if self.headers.get("content-type", "").startswith("application/json"):
+            return json.loads(raw or b"{}")
+        return raw
+
+    def _out(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        tok = (self.headers.get("authorization") or "").replace("Bearer ", "").strip()
+        if tok == "ADMIN":
+            return {"ok": True, "agent_id": "admin", "role": "admin"}
+        if tok:
+            return {"ok": True, "agent_id": tok, "role": "agent"}
+        return {"ok": False}
+
+    def _parts(self):
+        u = urlparse(self.path)
+        return [p for p in u.path.split("/") if p], parse_qs(u.query)
+
+    # ── 路由 ────────────────────────────────────────────
+    def do_GET(self):
+        if self.path == "/":
+            return self._out({"ok": True, "mock": True})
+        seg, q = self._parts()
+        if not self._auth()["ok"]:
+            return self._out({"error": "missing_token"}, 401)
+
+        if seg[:1] == ["p"] and len(seg) >= 3:
+            project, action = seg[1], "/".join(seg[2:])
+            if action == "inbox":
+                since = int(q.get("since", ["0"])[0])
+                s = st(project)
+                msgs = [m for k, m in sorted(s["msgs"].items()) if k > since]
+                nxt = msgs[-1]["seq"] if msgs else since
+                return self._out({"messages": msgs[:100], "next_cursor": nxt, "has_more": len(msgs) > 100})
+            if action.startswith("artifact/"):
+                sha = action.split("/", 1)[1]
+                data = BLOBS.get((project, sha))
+                if not data:
+                    return self._out({"error": "blob_not_found"}, 404)
+                self.send_response(200)
+                self.send_header("content-type", "application/octet-stream")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        if seg[:1] == ["admin"]:
+            if seg == ["admin", "projects"]:
+                rows = [p for p in PROJECTS.values()
+                        if POLICY["mode"] == "all" or p["project"] in POLICY["projects"]]
+                return self._out({"policy": POLICY, "projects": rows,
+                                  "hidden": len(PROJECTS) - len(rows)})
+            if seg == ["admin", "visibility"]:
+                return self._out(POLICY)
+            if len(seg) == 4 and seg[1] == "p" and seg[3] == "agents":
+                project = seg[2]
+                s = st(project)
+                now = int(time.time() * 1000)
+                rows = []
+                for aid, h in s["hb"].items():
+                    age = now - h["last_hb_ms"]
+                    alive = "alive" if age <= 2 * HB_PERIOD * 1000 else \
+                            "late" if age <= 5 * HB_PERIOD * 1000 else "offline"
+                    rows.append({**h, "agent_id": aid, "alive": alive, "age_s": age // 1000})
+                return self._out({"agents": rows})
+            if len(seg) == 4 and seg[1] == "p" and seg[3] == "submissions":
+                project = seg[2]
+                rows = [v for k, v in SUBS.items() if k[0] == project]
+                return self._out(rows)
+        return self._out({"error": "not_found", "path": self.path}, 404)
+
+    def do_PUT(self):
+        seg, _ = self._parts()
+        if not self._auth()["ok"]:
+            return self._out({"error": "missing_token"}, 401)
+        if len(seg) >= 4 and seg[0] == "p" and seg[2] == "artifact":
+            project, sha = seg[1], seg[3]
+            data = self._body()
+            if hashlib.sha256(data).hexdigest() != sha:
+                return self._out({"error": "sha_mismatch"}, 422)
+            BLOBS[(project, sha)] = data
+            return self._out({"stored": True, "sha256": sha})
+        return self._out({"error": "not_found"}, 404)
+
+    def do_POST(self):
+        seg, _ = self._parts()
+        auth = self._auth()
+        if not auth["ok"]:
+            return self._out({"error": "missing_token"}, 401)
+        b = self._body()
+        project = seg[1] if seg[:1] == ["p"] and len(seg) > 2 else None
+        action = "/".join(seg[2:]) if project else None
+
+        if project:
+            b.setdefault("agent_id", auth["agent_id"])
+            b.setdefault("project", project)
+            s = st(project)
+
+            if action == "publish":
+                if not b.get("dedupe_key"):
+                    return self._out({"error": "dedupe_key_required"}, 422)
+                if b["dedupe_key"] in s["dedupe"]:
+                    return self._out({"seq": s["dedupe"][b["dedupe_key"]], "deduped": True})
+                return self._out({"seq": append(project, b)})
+
+            if action == "heartbeat":
+                s["hb"][b["agent_id"]] = {
+                    "work": b.get("work", {"state": "idle"}), "load": b.get("load", {}),
+                    "env": b.get("env", {}), "last_hb_ms": int(time.time() * 1000),
+                    "hb_count": s["hb"].get(b["agent_id"], {}).get("hb_count", 0) + 1,
+                }
+                for t in s["tasks"].values():
+                    if t["owner"] == b["agent_id"] and t["state"] == "claimed":
+                        t["lease_until"] = int(time.time() * 1000) + LEASE_TTL * 1000
+                return self._out({"ok": True, "next_in_s": HB_PERIOD, "server_ms": int(time.time() * 1000)})
+
+            if action == "ack":
+                box = s["acks"].get(b["seq"])
+                if not box:
+                    return self._out({"ok": False, "reason": "no_such_broadcast"}, 404)
+                box["pending"] = [a for a in box["pending"] if a != b["agent_id"]]
+                box["done"][b["agent_id"]] = {"status": b["status"], "detail": b.get("detail", {})}
+                append(project, {"sender": b["agent_id"], "topic": "ack", "kind": b["status"],
+                                 "payload": {"seq": b["seq"]}, "dedupe_key": f"ack:{b['seq']}:{b['agent_id']}"})
+                return self._out({"ok": True})
+
+            if action == "report":
+                return self._out({"ok": True, "seq": append(project, {
+                    "sender": b["agent_id"], "topic": "report", "kind": b.get("report_id", "report"),
+                    "payload": b, "dedupe_key": f"report:{b.get('report_id')}:{b['agent_id']}"})})
+
+            if action == "tasks/claim":
+                t = s["tasks"].get(b["task_id"])
+                if not t:
+                    return self._out({"error": "not_found"}, 404)
+                now = int(time.time() * 1000)
+                if t["state"] != "open" and not (t["state"] == "claimed" and t["lease_until"] < now):
+                    return self._out({"error": "locked", "owner": t["owner"]}, 409)
+                t.update(state="claimed", owner=b["agent_id"], lease_until=now + LEASE_TTL * 1000)
+                return self._out({"ok": True, "lease_until": t["lease_until"]})
+
+            if action == "tasks/release":
+                t = s["tasks"].get(b["task_id"])
+                if not t:
+                    return self._out({"error": "not_found"}, 404)
+                if t["owner"] != b["agent_id"]:
+                    return self._out({"error": "not_owner"}, 403)
+                t.update(state=b.get("state", "done"), owner=None, lease_until=0)
+                return self._out({"ok": True})
+
+            if action == "submissions":
+                if not b.get("base_sha"):
+                    return self._out({"error": "base_sha_required"}, 422)
+                for r in b.get("refs", []):
+                    if (project, r["sha256"]) not in BLOBS:
+                        return self._out({"error": f"blob_missing:{r['sha256']}"}, 422)
+                key = (project, b["submission_id"])
+                if key in SUBS:
+                    SUBS[key]["updated_at"] = int(time.time() * 1000)
+                    return self._out({"submission_id": b["submission_id"], "state": SUBS[key]["state"], "deduped": True})
+                rec = {**b, "state": "delivered", "result": None,
+                       "refs_json": json.dumps(b.get("refs", [])), "checks_json": json.dumps(b.get("checks", {})),
+                       "created_at": int(time.time() * 1000), "updated_at": int(time.time() * 1000)}
+                SUBS[key] = rec
+                append(project, {"sender": b["agent_id"], "topic": "artifact", "kind": b["kind"],
+                                 "payload": {"submission_id": b["submission_id"]},
+                                 "dedupe_key": f"sub:{b['submission_id']}:{b['agent_id']}"})
+                return self._out({"submission_id": b["submission_id"], "state": "delivered"})
+
+        if seg[:1] == ["admin"]:
+            if seg == ["admin", "projects"]:
+                PROJECTS[b["project"]] = {"project": b["project"],
+                                          "display_name": b.get("display_name", b["project"]), "status": "active"}
+                return self._out({"ok": True})
+            if seg == ["admin", "visibility"]:
+                POLICY.update(mode=b.get("mode", "all"), projects=b.get("projects", []))
+                return self._out({"ok": True})
+            if seg == ["admin", "agents"]:
+                return self._out({"token": b.get("agent_id", "agent"), "scopes": ["poll", "publish"]})
+            if len(seg) == 4 and seg[1] == "p" and seg[3] == "broadcast":
+                project = seg[2]
+                s = st(project)
+                if b["broadcast_id"] in s["bc"]:
+                    return self._out({"seq": s["bc"][b["broadcast_id"]], "deduped": True})
+                seq = append(project, {"sender": "admin", "topic": "announce", "kind": "broadcast",
+                                       "payload": b, "dedupe_key": f"bc:{b['broadcast_id']}"})
+                s["bc"][b["broadcast_id"]] = seq
+                s["acks"][seq] = {"pending": list(s["hb"].keys()), "done": {},
+                                  "required": b.get("action_required", {}).get("ack_required", False)}
+                if b.get("supersedes"):
+                    old = s["bc"].get(b["supersedes"])
+                    if old:
+                        s["superseded"].add(old)
+                return self._out({"seq": seq})
+            m = [x for x in seg]
+            if len(seg) == 5 and seg[1] == "p" and seg[3] == "submissions" and seg[4] in ("collect", "archive"):
+                pass
+            if len(seg) == 6 and seg[1] == "p" and seg[3] == "submissions":
+                project, sid, op = seg[2], seg[4], seg[5]
+                rec = SUBS.get((project, sid))
+                if not rec:
+                    return self._out({"error": "not_found"}, 404)
+                if op == "collect":
+                    rec["state"] = "collected"
+                elif op == "archive":
+                    rec["state"] = "archived"
+                elif op == "result":
+                    rec["result"] = b.get("result")
+                rec["updated_at"] = int(time.time() * 1000)
+                return self._out({"ok": True})
+        return self._out({"error": "not_found", "path": self.path}, 404)
+
+
+def main():
+    global LEASE_TTL
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=18099)
+    ap.add_argument("--lease", type=int, default=3)
+    a = ap.parse_args()
+    LEASE_TTL = a.lease
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)
+    print(f"mock hub on http://127.0.0.1:{a.port} lease={LEASE_TTL}s", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

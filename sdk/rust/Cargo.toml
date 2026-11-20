@@ -1,0 +1,15 @@
+[package]
+name = "synapse-agent"
+version = "0.5.1"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+sha2 = "0.10"   # artifact 上传：本地计算内容寻址 SHA256（对齐 Python hashlib）
+
+[[bin]]
+name = "synapse-agent"
+path = "src/main.rs"

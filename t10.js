@@ -1,0 +1,13 @@
+const fs=require("fs"); const {JSDOM}=require("jsdom");
+const html=fs.readFileSync("admin/index.html","utf8");
+const dom=new JSDOM(html,{runScripts:"dangerously",url:"https://x.test/console",pretendToBeVisual:true});
+const w=dom.window, d=w.document;
+console.log("sheetBody:", !!d.querySelector(".sheetBody"));
+console.log("dName 在 body 内:", !!d.querySelector(".sheetBody") && !!d.querySelector("#dName"));
+console.log("sheetExit:", !!d.querySelector("#sheetExit"));
+console.log("maxExit:", !!d.querySelector("#maxExit"));
+const ov=d.querySelector("#detail");
+ov.hidden=false; d.body.classList.add("has-sheet");
+console.log("has-sheet 时滚动锁:", d.body.classList.contains("has-sheet"));
+d.querySelector("#dClose").click();
+console.log("点关闭后 hidden:", ov.hidden, "class:", d.body.classList.contains("has-sheet"));

@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""hubctl —— 集成者的管理端 CLI（只打 control plane，与面板同源策略）。
+
+用法：
+  export HUB=https://synapse.wangda.today
+  export HUB_ADMIN_TOKEN=...
+  python3 scripts/hubctl projects
+  python3 scripts/hubctl agents --project yanshi
+  hubctl inbox --project yanshi
+  hubctl get sub-a-0049-r2 --project yanshi --to ./incoming
+  hubctl collect sub-a-0049-r2 --project yanshi
+  hubctl result sub-a-0049-r2 --project yanshi --text "已并入 PR #12"
+  hubctl broadcast --project yanshi --target e5a17c93 --title "main 已到 e5a17c93" --ack
+  hubctl visibility --mode list --projects yanshi,yeban
+"""
+import argparse
+import hashlib
+import json
+import os
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# 双栈环境里 Python 常先选 IPv6，而本机的 IPv6 到 Cloudflare 是黑洞。
+# hubctl 只做管理请求，优先 IPv4；IPv4 不可用时仍回退原解析结果。
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_first(host, port, family=0, type=0, proto=0, flags=0):
+    rows = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    v4 = [r for r in rows if r[0] == socket.AF_INET]
+    return v4 or rows
+socket.getaddrinfo = _ipv4_first
+
+HUB = os.environ.get("HUB", "").rstrip("/")
+TOKEN = os.environ.get("HUB_ADMIN_TOKEN", "")
+
+
+def req(method: str, path: str, body=None):
+    if not HUB or not TOKEN:
+        sys.exit("需要 HUB 与 HUB_ADMIN_TOKEN 环境变量")
+    url = f"{HUB}{path}"
+    headers = {"authorization": f"Bearer {TOKEN}", "content-type": "application/json",
+               "user-agent": "hubctl/0.5 (agent-hub)"}
+
+    # 优先 requests：stdlib 在本机双栈/TLS 上会稳定 EOF；requests 有连接池与重试更好。
+    try:
+        import requests  # type: ignore
+    except Exception:  # noqa: BLE001
+        requests = None
+    if requests is not None:
+        for attempt in range(3 if method == "GET" else 1):
+            try:
+                r = requests.request(method, url, json=body, headers=headers, timeout=(10, 30))
+                if r.status_code >= 400:
+                    msg = {"401": "token 无效/已吊销", "403": "权限或项目不可见",
+                           "423": "项目已暂停"}.get(str(r.status_code), "")
+                    sys.exit(f"HTTP {r.status_code} {msg} {r.text[:300]}")
+                return r.json() if r.content else {}
+            except requests.RequestException as e:
+                if attempt >= 2:
+                    sys.exit(f"网络请求失败（已重试 3 次）：{e}")
+                time.sleep(1.5 * (attempt + 1))
+
+    # 无 requests 时的 stdlib 回退（保持单文件可运行）
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(url, data=data, method=method)
+    for k, v in headers.items():
+        r.add_header(k, v)
+    for attempt in range(3 if method == "GET" else 1):
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:300]
+            msg = {"401": "token 无效/已吊销", "403": "权限或项目不可见",
+                   "423": "项目已暂停"}.get(str(e.code), "")
+            sys.exit(f"HTTP {e.code} {msg} {detail}")
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError, ConnectionError) as e:
+            if attempt >= 2:
+                sys.exit(f"网络请求失败（已重试 3 次）：{e}")
+            time.sleep(1.5 * (attempt + 1))
+
+
+def cmd_projects(a):
+    d = req("GET", "/x/admin/projects")
+    print(f"policy={d['policy']['mode']} hidden={d.get('hidden', 0)}")
+    for p in d["projects"]:
+        print(f"  {p['project']:<12} {p['display_name']:<10} {p['status']}")
+
+
+def cmd_agents(a):
+    d = req("GET", f"/x/admin/p/{a.project}/agents")
+    print(f"{'agent':<16}{'状态':<8}{'在做什么':<22}{'CPU':<6}{'内存':<14}{'磁盘':<10}")
+    for g in d["agents"]:
+        w = g.get("work") or {}
+        load = g.get("load") or {}
+        disk = (load.get("disk") or [{}])[0]
+        mem = f"{load.get('mem_used_mb','?')}/{load.get('mem_total_mb','?')}"
+        print(f"{g['agent_id']:<16}{g['alive']:<8}"
+              f"{(w.get('phase') or w.get('state') or '-'):<22}"
+              f"{str(load.get('cpu_pct','-'))+'%':<6}{mem:<14}"
+              f"{str(disk.get('free_gb','?'))+'G '+str(disk.get('used_pct','?'))+'%':<10}")
+
+
+def cmd_inbox(a):
+    d = req("GET", f"/x/admin/p/{a.project}/submissions")
+    rows = [x for x in d if x["state"] == "delivered"]
+    print(f"待取 {len(rows)} 份")
+    for s in rows:
+        print(f"  {s['submission_id']:<28} {s['agent_id']:<12} {s['base_sha']:<10} {s['kind']:<8}")
+
+
+def cmd_get(a):
+    if getattr(a, "bundle", False):
+        name = f"{a.project}-{a.submission_id}.zip"
+        os.makedirs(a.to, exist_ok=True)
+        out = os.path.join(a.to, name)
+        url = f"{HUB}/x/admin/p/{a.project}/submissions/{a.submission_id}/bundle"
+        data = fetch_bytes(url)
+        with open(out, "wb") as f:
+            f.write(data)
+        print(f"  ↓ {out} ({os.path.getsize(out)} B, 含 PROVENANCE.json)")
+        return
+
+    d = req("GET", f"/x/admin/p/{a.project}/submissions")
+    target = next((s for s in d if s["submission_id"] == a.submission_id), None)
+    if not target:
+        sys.exit("找不到该提交")
+    os.makedirs(a.to, exist_ok=True)
+    for ref in json.loads(target["refs_json"]):
+        sha = ref["sha256"]
+        name = os.path.basename(ref.get("name") or sha)          # 只取末段，拒绝 ../ 与绝对路径
+        if not name or name in (".", ".."):
+            name = sha
+        url = f"{HUB}/p/{a.project}/artifact/{sha}"
+        r = urllib.request.Request(url, headers={"authorization": f"Bearer {TOKEN}", "user-agent": "hubctl/0.4 (agent-hub)"})
+        out = os.path.join(a.to, name)
+        root = os.path.realpath(a.to)
+        if not os.path.realpath(out).startswith(root + os.sep):
+            sys.exit(f"拒绝写出目录外：{ref.get('name')}")
+        with urllib.request.urlopen(r, timeout=120) as resp, open(out, "wb") as f:
+            data = resp.read()
+        got = hashlib.sha256(data).hexdigest()
+        if got != sha:
+            os.unlink(out)
+            sys.exit(f"哈希不符：期望 {sha}，实际 {got}；已删除")
+        with open(out, "wb") as f:
+            f.write(data)
+        print(f"  ↓ {out} ({len(data)} B, sha256 校验通过)")
+    print(f"base_sha={target['base_sha']}  result={target.get('result') or '-'}")
+
+
+def cmd_collect(a):
+    print(req("POST", f"/x/admin/p/{a.project}/submissions/{a.submission_id}/collect", {}))
+
+
+def cmd_result(a):
+    print(req("POST", f"/x/admin/p/{a.project}/submissions/{a.submission_id}/result", {"result": a.text}))
+
+
+def cmd_task_new(a):
+    tid = a.id or f"T-{int(time.time()*1000)}"
+    print(req("POST", f"/x/admin/p/{a.project}/tasks",
+              {"task_id": tid, "title": a.title, "body": a.body, "to": a.to or None}))
+
+
+def cmd_task_list(a):
+    print(req("GET", f"/x/admin/p/{a.project}/tasks"))
+
+
+def cmd_broadcast(a):
+    bid = a.broadcast_id or f"bc-{time.strftime('%Y%m%d%H%M%S')}"
+    body = {
+        "broadcast_id": bid,
+        "severity": a.severity,
+        "title": a.title,
+        "body": a.body or "",
+        "action_required": {"kind": a.kind, "target_commit": a.target,
+                            "ack_required": a.ack, "deadline": a.deadline},
+    }
+    if a.supersedes:
+        body["supersedes"] = a.supersedes
+    print(req("POST", f"/x/admin/p/{a.project}/broadcast", body))
+
+
+def cmd_agent_move(a):
+    body = {
+        "from_project": a.from_project,
+        "to_project": a.to_project,
+        "agent_id": a.agent_id,
+        "ttl_days": a.ttl_days,
+        "keep_source": a.keep_source,
+    }
+    print(json.dumps(req("POST", "/x/admin/agents/move", body), ensure_ascii=False, indent=2))
+
+
+def cmd_visibility(a):
+    if a.mode == "list":
+        print(req("POST", "/x/admin/visibility", {"mode": "list", "projects": (a.projects or "").split(",")}))
+    else:
+        print(req("POST", "/x/admin/visibility", {"mode": "all"}))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="hubctl")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("projects").set_defaults(fn=cmd_projects)
+
+    for name, fn in (("agents", cmd_agents), ("inbox", cmd_inbox)):
+        s = sub.add_parser(name); s.add_argument("--project", required=True); s.set_defaults(fn=fn)
+
+    g = sub.add_parser("get"); g.add_argument("submission_id"); g.add_argument("--project", required=True)
+    g.add_argument("--to", default="./incoming"); g.add_argument("--bundle", action="store_true",
+                    help="一次性打包 zip（含 PROVENANCE.json）")
+    g.set_defaults(fn=cmd_get)
+
+    c = sub.add_parser("collect"); c.add_argument("submission_id"); c.add_argument("--project", required=True)
+    c.set_defaults(fn=cmd_collect)
+
+    r = sub.add_parser("result"); r.add_argument("submission_id"); r.add_argument("--project", required=True)
+    r.add_argument("--text", required=True); r.set_defaults(fn=cmd_result)
+
+    tn = sub.add_parser("task-new"); tn.add_argument("--project", required=True)
+    tn.add_argument("--id", default=None); tn.add_argument("--title", required=True)
+    tn.add_argument("--body", default=""); tn.add_argument("--to", default=None)
+    tn.set_defaults(fn=cmd_task_new)
+
+    tl = sub.add_parser("task-list"); tl.add_argument("--project", required=True)
+    tl.set_defaults(fn=cmd_task_list)
+
+    b = sub.add_parser("broadcast"); b.add_argument("--project", required=True)
+    b.add_argument("--target", default=None); b.add_argument("--title", required=True)
+    b.add_argument("--body", default=""); b.add_argument("--severity", default="action")
+    b.add_argument("--kind", default="git_pull"); b.add_argument("--ack", action="store_true")
+    b.add_argument("--deadline", default=None); b.add_argument("--broadcast-id", dest="broadcast_id", default=None)
+    b.add_argument("--supersedes", default=None); b.set_defaults(fn=cmd_broadcast)
+
+    mv = sub.add_parser("agent-move")
+    mv.add_argument("--from", dest="from_project", required=True)
+    mv.add_argument("--to", dest="to_project", required=True)
+    mv.add_argument("--agent", dest="agent_id", required=True)
+    mv.add_argument("--ttl", dest="ttl_days", type=int, default=30)
+    mv.add_argument("--keep-source", dest="keep_source", action="store_true",
+                    help="加入项目；不传则迁移并吊销源 token")
+    mv.set_defaults(fn=cmd_agent_move)
+
+    v = sub.add_parser("visibility"); v.add_argument("--mode", choices=["all", "list"], required=True)
+    v.add_argument("--projects", default=""); v.set_defaults(fn=cmd_visibility)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

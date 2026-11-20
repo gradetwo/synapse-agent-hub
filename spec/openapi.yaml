@@ -1,0 +1,667 @@
+openapi: 3.1.0
+info:
+  title: Synapse Agent Hub
+  version: 0.5.1
+  description: |
+    多项目 agent 协作中枢。data plane 使用 agent token；control plane 使用 admin token
+    或 Cloudflare Access 会话。`/admin/*` 的浏览器别名是 `/console/admin/*`，CLI 别名是
+    `/x/admin/*`。所有时间戳由服务端盖章，`seq` 是唯一排序与续传依据。
+servers:
+  - url: https://synapse.wangda.today
+    description: 生产环境
+  - url: http://127.0.0.1:8787
+    description: 本地 mock / wrangler dev
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: agent token 或 admin token；明文只在签发时返回一次，库中只存 SHA-256
+  parameters:
+    Project:
+      name: project
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z0-9-]+$' }
+  schemas:
+    Envelope:
+      type: object
+      required: [seq, project, sender, topic, kind, ts]
+      properties:
+        seq: { type: integer, minimum: 1 }
+        id: { type: string }
+        project: { type: string }
+        sender: { type: string }
+        topic:
+          type: string
+          enum: [announce, task, artifact, report, ack, status, alert, admin]
+        kind: { type: string }
+        to:
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+        payload: { type: object }
+        refs:
+          type: array
+          items: { $ref: '#/components/schemas/Ref' }
+        dedupe_key: { type: string }
+        ts: { type: string, format: date-time }
+    Ref:
+      type: object
+      required: [sha256, name]
+      properties:
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        name: { type: string }
+        bytes: { type: integer }
+    Work:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [busy, idle, blocked] }
+        task_id: { type: [string, 'null'] }
+        phase: { type: [string, 'null'] }
+        progress_pct: { type: [integer, 'null'], minimum: 0, maximum: 100 }
+    Load:
+      type: object
+      properties:
+        cpu_pct: { type: integer, minimum: 0, maximum: 100, description: 区间均值，不是瞬时值 }
+        load1: { type: number }
+        cores: { type: integer }
+        mem_used_mb: { type: integer }
+        mem_total_mb: { type: integer }
+        disk:
+          type: array
+          items:
+            type: object
+            properties:
+              mount: { type: string }
+              free_gb: { type: number }
+              used_pct: { type: integer }
+        degraded: { type: boolean, description: 采集失败时的标记，不是错误 }
+    Heartbeat:
+      type: object
+      required: [agent_id, work, load]
+      properties:
+        hb: { type: integer }
+        agent_id: { type: string }
+        work: { $ref: '#/components/schemas/Work' }
+        load: { $ref: '#/components/schemas/Load' }
+        env:
+          type: object
+          properties:
+            git_head: { type: [string, 'null'] }
+            dirty: { type: [boolean, 'null'] }
+        sdk_version: { type: string }
+    Submission:
+      type: object
+      required: [submission_id, agent_id, base_sha, kind, refs]
+      properties:
+        submission_id: { type: string, maxLength: 128 }
+        agent_id: { type: string }
+        base_sha: { type: string, pattern: '^[a-f0-9]{7,64}$' }
+        kind: { type: string, enum: [patch, bundle, report, asset] }
+        title: { type: string }
+        refs:
+          type: array
+          items: { $ref: '#/components/schemas/Ref' }
+        checks: { type: object }
+        notes: { type: string }
+        state: { type: string, enum: [delivered, collected, archived], readOnly: true }
+        result: { type: string, description: 纯信息备注，不改状态 }
+    Broadcast:
+      type: object
+      required: [broadcast_id, severity, title]
+      properties:
+        broadcast_id: { type: string, description: 幂等键 }
+        severity: { type: string, enum: [info, action, freeze] }
+        title: { type: string }
+        body: { type: string }
+        action_required:
+          type: object
+          properties:
+            kind: { type: string, enum: [git_pull, report, none] }
+            target_commit: { type: [string, 'null'] }
+            deadline: { type: [string, 'null'], format: date-time }
+            ack_required: { type: boolean }
+        supersedes: { type: [string, 'null'] }
+    IssueTokenRequest:
+      type: object
+      required: [project, agent_id]
+      properties:
+        project: { type: string, pattern: '^[a-z0-9-]{2,40}$' }
+        agent_id: { type: string, pattern: '^[a-zA-Z0-9._-]{2,40}$' }
+        role: { type: string, enum: [agent, admin], default: agent }
+        scopes:
+          oneOf:
+            - type: string
+              description: 逗号分隔
+            - type: array
+              items: { type: string }
+        ttl_days:
+          type: integer
+          minimum: 0
+          maximum: 3650
+          default: 30
+          description: 0 表示不限期
+        rotate:
+          type: boolean
+          default: true
+          description: true 时立即吊销同 agent 旧 token；false 保留多钥
+    MoveAgentRequest:
+      type: object
+      required: [from_project, to_project, agent_id]
+      properties:
+        from_project: { type: string, pattern: '^[a-z0-9-]{2,40}$' }
+        to_project: { type: string, pattern: '^[a-z0-9-]{2,40}$' }
+        agent_id: { type: string, pattern: '^[a-zA-Z0-9._-]{2,40}$' }
+        ttl_days: { type: integer, minimum: 0, maximum: 3650, default: 30 }
+        keep_source:
+          type: boolean
+          default: false
+          description: true 为加入项目，false 为迁移项目并吊销源 token
+    Project:
+      type: object
+      properties:
+        project: { type: string }
+        display_name: { type: string }
+        status: { type: string, enum: [active, paused, archived] }
+        max_agents: { type: integer }
+        max_storage_mb: { type: integer }
+        max_msgs_per_min: { type: integer }
+        retention_days: { type: integer }
+        created_at: { type: integer }
+paths:
+  /p/{project}/publish:
+    post:
+      summary: 发布消息（dedupe_key 幂等）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, kind, dedupe_key]
+              properties:
+                topic: { type: string }
+                kind: { type: string }
+                payload: { type: object }
+                dedupe_key: { type: string }
+                to:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+      responses:
+        '200':
+          description: 返回 seq；重复时 deduped=true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  seq: { type: integer }
+                  deduped: { type: boolean }
+        '401': { description: token 缺失/无效/过期 }
+        '403': { description: scope 不足或项目越界 }
+  /p/{project}/inbox:
+    get:
+      summary: 拉取 since 之后的消息（短轮询；服务端不做长轮询）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: since, in: query, schema: { type: integer, default: 0 } }
+        - { name: topics, in: query, schema: { type: string }, description: 逗号分隔 }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+        - { name: timeout, in: query, schema: { type: integer, default: 0 }, description: 兼容参数，服务端当前忽略 }
+      responses:
+        '200':
+          description: 消息列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items: { $ref: '#/components/schemas/Envelope' }
+                  next_cursor: { type: integer }
+                  epoch: { type: string }
+                  has_more: { type: boolean }
+  /p/{project}/heartbeat:
+    post:
+      summary: 心跳（覆盖写 + 顺带续租 + 每 5 分钟采样）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Heartbeat' }
+      responses:
+        '200':
+          description: 接受
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  next_in_s: { type: integer }
+                  server_ms: { type: integer }
+  /p/{project}/ack:
+    post:
+      summary: 确认广播（done / refused / blocked / stale）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seq, status]
+              properties:
+                seq: { type: integer }
+                status: { type: string, enum: [done, refused, blocked, stale] }
+                detail: { type: object }
+      responses:
+        '200': { description: ok }
+        '403': { description: 不是发给你的消息 }
+        '404': { description: unknown_seq }
+  /p/{project}/report:
+    post:
+      summary: 点收汇报（任务 + 资源）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [report_id, task]
+              properties:
+                report_id: { type: string }
+                task: { type: object }
+                resources: { $ref: '#/components/schemas/Load' }
+                env: { type: object }
+      responses:
+        '200': { description: ok }
+  /p/{project}/tasks/claim:
+    post:
+      summary: 认领任务（租约 120s，心跳续租）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id]
+              properties:
+                task_id: { type: string }
+      responses:
+        '200': { description: 成功，返回 lease_until }
+        '409': { description: 已被他人持有 }
+  /p/{project}/tasks/release:
+    post:
+      summary: 交还 / 完成
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id]
+              properties:
+                task_id: { type: string }
+                state: { type: string, enum: [done, blocked] }
+      responses:
+        '200': { description: ok }
+  /p/{project}/artifact/{sha256}:
+    parameters:
+      - $ref: '#/components/parameters/Project'
+      - { name: sha256, in: path, required: true, schema: { type: string, pattern: '^[a-f0-9]{64}$' } }
+    put:
+      summary: 二进制直传 R2（流式，不经过 DO）
+      requestBody:
+        required: true
+        content: { application/octet-stream: { schema: { type: string, format: binary } } }
+      responses:
+        '200': { description: stored }
+        '413': { description: 超过单文件上限（默认 100 MB） }
+    get:
+      summary: 下载（需同一项目 token）
+      responses:
+        '200': { description: 二进制流 }
+        '404': { description: 不存在 }
+  /p/{project}/submissions:
+    post:
+      summary: 建交付（校验 blob 存在 + base_sha）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Submission' }
+      responses:
+        '200': { description: 已创建或幂等返回 }
+        '422': { description: base_sha 缺失 / blob_missing / secret_detected }
+  /p/{project}/ws-ticket:
+    get:
+      summary: 用 Bearer 换一次性 WebSocket 票据
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses:
+        '200':
+          description: 票据
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket: { type: string }
+                  exp_ms: { type: integer }
+                  ttl_s: { type: integer, default: 90 }
+  /p/{project}/wsstat:
+    get:
+      summary: 当前 WebSocket 连接数
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses:
+        '200': { description: '{ sockets: N }' }
+  /p/enroll:
+    post:
+      summary: 自助注册（创建 pending enrollment，等待管理员审批）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project, agent_id, token, machine]
+              properties:
+                project: { type: string }
+                agent_id: { type: string }
+                token: { type: string, description: 客户端生成，服务端存 SHA-256 }
+                scopes:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+                machine: { type: string }
+      responses:
+        '200': { description: 返回 enrollment id / code / poll_after_s }
+        '422': { description: bad_scope 等 }
+  /admin/stats:
+    get:
+      summary: 总览统计
+      responses: { '200': { description: 统计对象 } }
+  /admin/projects:
+    get:
+      summary: 按可见性策略返回项目
+      responses:
+        '200': { description: '{ policy, projects, hidden }' }
+    post:
+      summary: 新建项目
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project]
+              properties:
+                project: { type: string, pattern: '^[a-z0-9-]{2,40}$' }
+                display_name: { type: string }
+                max_agents: { type: integer, default: 20 }
+                max_storage_mb: { type: integer, default: 2048 }
+                max_msgs_per_min: { type: integer, default: 60 }
+                retention_days: { type: integer, default: 30 }
+      responses: { '200': { description: ok + quotas } }
+  /admin/visibility:
+    get:
+      summary: 读取可见性策略
+      responses: { '200': { description: '{ mode, projects }' } }
+    post:
+      summary: 设置可见性（all | list）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [all, list] }
+                projects:
+                  type: array
+                  items: { type: string }
+      responses: { '200': { description: ok } }
+  /admin/agents:
+    post:
+      summary: 签发 token（明文只返回一次，库中只存 SHA-256）
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueTokenRequest' }
+      responses:
+        '200':
+          description: 签发成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: 32 位十六进制，只显示这一次 }
+                  agent_id: { type: string }
+                  role: { type: string, enum: [agent, admin] }
+                  scopes: { type: string }
+                  expires_at: { type: [integer, 'null'] }
+                  ttl_days: { type: integer }
+        '422': { description: 参数错误 / scope 非法 }
+    delete:
+      summary: 吊销某项目某 agent 的全部未吊销 token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project, agent_id]
+              properties:
+                project: { type: string }
+                agent_id: { type: string }
+      responses:
+        '200': { description: '{ ok, revoked_keys }' }
+  /admin/agents/move:
+    post:
+      summary: 加入或迁移项目
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveAgentRequest' }
+      responses:
+        '200':
+          description: 目标项目新 token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  agent_id: { type: string }
+                  from_project: { type: string }
+                  to_project: { type: string }
+                  role: { type: string, enum: [agent, admin] }
+                  scopes: { type: string }
+                  expires_at: { type: [integer, 'null'] }
+                  ttl_days: { type: integer }
+                  kept_source: { type: boolean }
+        '404': { description: source_agent_not_found / target_project_not_found }
+        '409': { description: agent_quota_exceeded }
+  /admin/p/{project}/agents:
+    get:
+      summary: 名册（alive / late / offline + age_s）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses: { '200': { description: '{ agents: [] }' } }
+  /admin/p/{project}/snapshot:
+    get:
+      summary: seq + agents + tasks
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses: { '200': { description: snapshot } }
+  /admin/p/{project}/tasks:
+    get:
+      summary: 任务台账
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses: { '200': { description: '{ tasks: [] }' } }
+    post:
+      summary: 创建任务（task_id 幂等）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, title]
+              properties:
+                task_id: { type: string }
+                title: { type: string }
+                body: { type: string }
+                to: { type: string, nullable: true }
+      responses:
+        '200': { description: 任务创建成功 }
+        '409': { description: task_exists }
+  /admin/p/{project}/broadcast:
+    post:
+      summary: 广播（broadcast_id 幂等，支持 supersedes）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Broadcast' }
+      responses: { '200': { description: '{ seq }' } }
+  /admin/p/{project}/send:
+    post:
+      summary: 定向指令（发给一个或多个 agent）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                to:
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items: { type: string }
+                topic: { type: string, default: task }
+                kind: { type: string, default: task }
+                title: { type: string }
+                body: { type: string }
+                ack_required: { type: boolean }
+      responses: { '200': { description: '{ ok, sent }' } }
+  /admin/p/{project}/messages:
+    get:
+      summary: 最近消息（管理员视角，含定向私信）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: limit, in: query, schema: { type: integer, default: 40, maximum: 200 } }
+      responses: { '200': { description: '{ messages }' } }
+  /admin/p/{project}/submissions:
+    get:
+      summary: 交付箱列表
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: state, in: query, schema: { type: string, enum: [delivered, collected, archived] } }
+      responses: { '200': { description: 提交数组 } }
+    post:
+      summary: 管理端代建交付（测试/补录）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Submission' }
+      responses: { '200': { description: 已创建 } }
+  /admin/p/{project}/submissions/{id}/collect:
+    post:
+      summary: 标记已取走
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: ok } }
+  /admin/p/{project}/submissions/{id}/archive:
+    post:
+      summary: 归档
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: ok } }
+  /admin/p/{project}/submissions/{id}/result:
+    post:
+      summary: 写台账备注（纯信息，不改状态）
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                result: { type: string }
+      responses: { '200': { description: ok } }
+  /ver:
+    get:
+      summary: 公开 build 探针
+      security: []
+      responses:
+        '200':
+          description: build / sdk / at
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  build: { type: string }
+                  sdk: { type: string }
+                  tabs: { type: boolean }
+                  at: { type: integer }
+  /sdk/manifest:
+    get:
+      summary: SDK 版本与二进制清单
+      security: []
+      responses:
+        '200': { description: version / install_url / binaries }
+  /dl:
+    get:
+      summary: 当前分发的文件清单
+      security: []
+      responses:
+        '200': { description: '{ binaries: [{name,size,url,sha256}] }' }
+  /dl/{name}:
+    get:
+      summary: 下载分发包（install.sh / 二进制 / sha256）
+      security: []
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string, pattern: '^[a-z0-9._-]+$' } }
+      responses:
+        '200': { description: 文件流；响应头带 x-sha256 }
+        '404': { description: not_found }
