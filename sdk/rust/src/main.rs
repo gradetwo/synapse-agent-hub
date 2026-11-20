@@ -445,7 +445,9 @@ fn main() {
 
     // 单实例：同一 state dir 只允许一个 run/ws 常驻，避免两个进程抢游标、
     // 重复消费、服务端堆出多条死连接（flock 随进程退出自动释放）。
-    let _run_lock = if matches!(cfg.cmd.as_str(), "run" | "ws" | "wait") {
+    // YANSHI_HB_ONLY 修复：wait 是一次性检查命令，不该和常驻 run 抢同一把锁。
+    // 否则 run 常驻持锁时，任何 wait 都会 exit(3) 报"已有进程持锁"，导致对话回合永远检查不到消息。
+    let _run_lock = if matches!(cfg.cmd.as_str(), "run" | "ws") {
         match acquire_run_lock(&cfg.dir) {
             Some(f) => Some(f),
             None => {
@@ -518,7 +520,13 @@ fn main() {
         // 长连接优先：连不上（环境不支持/代理拦/握手失败）再退回轮询；
         // 轮询只是临时降级，过一段时间必须再试 WS，不能一次失败就永久留在 poll。
         "run" | "ws" => {
-            let force_poll = std::env::var("YANSHI_NO_WS").map(|v| v == "1").unwrap_or(false);
+            // YANSHI_HB_ONLY=1：纯心跳守护进程。只维持在线，绝不消费 inbox/推游标/ack。
+            // 用于 WorkBuddy/CodeBuddy 等回合制 agent：消息必须留给对话回合里的 `wait`。
+            // 否则后台 run 会先一步 fetch_inbox + ack + 推游标，把消息吞掉，
+            // 对话回合的 wait 从新游标往后拉就是空的 → "后台收到了但对话收不到"。
+            let hb_only = std::env::var("YANSHI_HB_ONLY").map(|v| v == "1").unwrap_or(false);
+            let force_poll = std::env::var("YANSHI_NO_WS").map(|v| v == "1").unwrap_or(false) || hb_only;
+            if hb_only { eprintln!("YANSHI_HB_ONLY=1：纯心跳模式，不消费 inbox（消息留给对话回合的 wait）"); }
             if force_poll {
                 if cfg.cmd == "ws" { eprintln!("YANSHI_NO_WS=1 与 ws 冲突"); std::process::exit(2); }
                 eprintln!("YANSHI_NO_WS=1：强制轮询");
@@ -1335,8 +1343,10 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
         })
     };
 
+    // YANSHI_HB_ONLY=1：纯心跳模式下不重放 WAL，不执行任何消息，inbox 全部留给 wait。
+    let hb_only_poll = std::env::var("YANSHI_HB_ONLY").map(|v| v == "1").unwrap_or(false);
     // 先启动心跳，再重放 WAL：重放里的 exec 任务再慢，也不会让心跳停摆。
-    let replay: Vec<Value> = journal.lock().unwrap().clone();
+    let replay: Vec<Value> = if hb_only_poll { Vec::new() } else { journal.lock().unwrap().clone() };
     for m in replay {
         if let Some(seq) = seq_of(&m) {
             let _ = ack_message(cfg, agent, base, seq, "done",
@@ -1346,6 +1356,12 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
         if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
         dequeue_message(&cfg.dir, &journal, &m);
         last_msg.store(now_ms() as u64, Ordering::Relaxed);
+    }
+
+    // YANSHI_HB_ONLY=1：心跳线程已在上面启动并保持在线，主线程只阻塞休眠，绝不消费 inbox。
+    // 这样对话回合的 `wait` 能从游标位置取到全部消息。
+    if hb_only_poll {
+        loop { thread::sleep(Duration::from_secs(3600)); }
     }
 
     let started = Instant::now();
