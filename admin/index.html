@@ -571,8 +571,14 @@ async function loadProjects() {
   const sel = $("proj");
   sel.innerHTML = d.projects.map(p =>
     `<option value="${p.project}">${p.display_name}</option>`).join("");
-  if (!current && d.projects.length) current = d.projects[0].project;
+  // 记住上次选的项目；否则刷新后总是回到最早创建的项目，容易把新项目里的 agent 看漏。
+  let saved = "";
+  try { saved = localStorage.getItem("hub.project") || ""; } catch {}
+  if (!current || !d.projects.some((p) => p.project === current)) {
+    current = d.projects.some((p) => p.project === saved) ? saved : (d.projects[0]?.project || "");
+  }
   sel.value = current;
+  try { localStorage.setItem("hub.project", current); } catch {}
   fillDetailProjects();
   connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
 }
@@ -778,10 +784,22 @@ async function loadEnr() {
     <tr><td>${e.agent_id}</td><td class="muted">${e.project}</td>
       <td class="muted">${e.scopes}</td>
       <td class="muted">${new Date(e.created_at).toLocaleString()}</td>
-      <td><button class="mini primary" data-approve="${e.id}">批准</button>
+      <td><button class="mini primary" data-approve="${e.id}" data-project="${e.project}">批准</button>
           <button class="mini" data-reject="${e.id}">拒绝</button></td></tr>`).join("");
   $("enr").querySelectorAll("[data-approve]").forEach((b) => b.onclick = async () => {
+    const project = b.dataset.project;
     await api(`/admin/enrollments/${b.dataset.approve}/approve`, "POST", {});
+    // 批准的是别的项目时，当前名册还停在旧项目，会误以为 agent 没上线。
+    if (project && project !== current) {
+      current = project;
+      $("proj").value = project;
+      try { localStorage.setItem("hub.project", project); } catch {}
+      lastPending = null;
+      SUB_ROWS = [];
+      SUB_STATE = new Map();
+      fillDetailProjects();
+      connectLive();
+    }
     await refresh();
   });
   $("enr").querySelectorAll("[data-reject]").forEach((b) => b.onclick = async () => {
@@ -1465,6 +1483,7 @@ async function refresh() {
 
 $("proj").onchange = (e) => {
   current = e.target.value;
+  try { localStorage.setItem("hub.project", current); } catch {}
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
