@@ -22,12 +22,13 @@ case "$ARCH" in x86_64|amd64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
 
 echo "→ endpoint=$ENDPOINT project=$PROJECT os=$OS arch=$ARCH"
 
-# 唯一发布通道：linux-x64 预编译 musl 二进制。
+# 唯一发布通道：Linux 预编译 musl 二进制（x64 / arm64）。
 # 不在客户端做 pip/cargo 回退：PyPI 版本落后，cargo 又要求本机编译，均不符合统一安装入口。
 case "$OS-$ARCH" in
-  linux-x64) BIN="synapse-agent-x86_64-linux-musl" ;;
+  linux-x64)   BIN="synapse-agent-x86_64-linux-musl" ;;
+  linux-arm64) BIN="synapse-agent-aarch64-linux-musl" ;;
   *)
-    echo "✗ 当前只发布 linux-x64 预编译包；你的平台是 ${OS}-${ARCH}。"
+    echo "✗ 当前只发布 Linux x64 / arm64 预编译包；你的平台是 ${OS}-${ARCH}。"
     echo "  已停止安装，不会自动 pip/cargo，也不会在本机编译。请让管理员提供对应平台安装包。"
     exit 1
     ;;

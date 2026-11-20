@@ -11,8 +11,9 @@
 | SDK version | `0.5.1` |
 | 安装入口 | `https://synapse.wangda.today/dl/install.sh` |
 | Linux x64 二进制 | `/dl/synapse-agent-x86_64-linux-musl` |
-| install.sh sha256 | `a3b72d51dc845f9c3a69bc208015c10a42a0a0f6ec264e77672b316c98b12e0c` |
-| Linux binary sha256 | `ac9fa1fe3ac4fa3a596054b0db35d3b95ac81702fc3fb743c6b54a70d9f55998` |
+| Linux ARM64 二进制 | `/dl/synapse-agent-aarch64-linux-musl` |
+| Windows x64 二进制 | `/dl/synapse-agent-x86_64-windows-msvc.exe` |
+| 校验值 | 以 `/dl/<name>.sha256` 和 `/sdk/manifest` 为准 |
 | 设计单源 | [`DESIGN.md`](./DESIGN.md) |
 | 构建/发布 | [`BUILD.md`](./BUILD.md) |
 | SDK 接入 | [`docs/SDK-接入与差异.md`](./docs/SDK-接入与差异.md) |
@@ -39,8 +40,9 @@ worker/schema.sql         D1 表（projects / agents / admin_policy / hb_hist /
                           submissions / login_guard / enrollments / ws_tickets /
                           settings / archive / artifacts）
 admin/index.html          单文件控制台（构建时内联进 Worker，线上路径 /console）
-scripts/install.sh        唯一 Linux x64 安装入口（被 /dl/install.sh 提供）
+scripts/install.sh        唯一 Linux x64/arm64 安装入口（被 /dl/install.sh 提供）
 scripts/install.ps1       Windows 自动下载预编译 exe（SHA-256 校验；也可 -Binary）
+scripts/deploy.sh         自动化部署：bootstrap（空账号）/ release（线上增量）
 scripts/hubctl            管理端 CLI（只打 /x/admin/*）
 scripts/schema-smoke.py   schema 冒烟
 sdk/python/synapse/       Python SDK + CLI（包名 synapse-agent）
@@ -51,7 +53,7 @@ sdk/rust/src/winmsg.rs    Windows 窗口桥（枚举/激活/注入文字/读文�
 sdk/rust/src/localbus.rs  本机消息总线（命名管道 / Unix socket）
 sdk/rust/BINARIES.md      多平台编译与 R2 发布说明
 docs/WINDOW-BRIDGE.md     Windows 窗口桥 + 本机消息总线接入文档
-dist/                     当前 Linux x64 二进制 + SHA256SUMS
+dist/                     当前 Linux x64/ARM64、Windows x64 二进制 + SHA256SUMS
 spec/openapi.yaml         协议定义（0.5.1）
 spec/conformance/         语言无关一致性用例
 prompts/                  客户端/管理节点提示词模板
@@ -80,6 +82,11 @@ npx wrangler secret put SESSION_SECRET
 # 4) 上线
 npx wrangler deploy
 ```
+
+自动化脚本把两种流程分开：空账号用 `./scripts/deploy.sh bootstrap --fresh --yes`，
+已有线上用 `./scripts/deploy.sh release --yes`。`release` 只做增量：检测变化、按需重建
+Linux x64 / Linux ARM64 / Windows x64 binary、上传 R2、必要时 deploy Worker，不会重复建
+D1/R2，也不会重跑 `schema.sql`。详见 [`BUILD.md`](./BUILD.md)。
 
 `wrangler.toml` 里已经配置：
 
@@ -123,7 +130,7 @@ printf 'admin token: %s\n' "$TOKEN"
 
 ## 客户端安装（唯一入口）
 
-Linux x86_64（静态 musl，免 Python / 免编译）：
+Linux x86_64 / ARM64（静态 musl，免 Python / 免编译）：
 
 ```bash
 curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
@@ -135,13 +142,13 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 
 脚本行为：
 
-1. 识别 `uname -s` / `uname -m`；当前只发布 `linux-x64`。
-2. 非 Linux x64 **直接报错退出**，不会 pip / cargo / 本机编译。
-3. 从 `/dl/synapse-agent-x86_64-linux-musl` 下载，动态取 `.sha256` 边车或 `x-sha256` 响应头校验。
+1. 识别 `uname -s` / `uname -m`，支持 `linux-x64` 和 `linux-arm64`。
+2. 其它平台直接报错退出，不会 pip / cargo / 本机编译。
+3. 按架构从 `/dl/synapse-agent-x86_64-linux-musl` 或 `/dl/synapse-agent-aarch64-linux-musl` 下载，动态取 `.sha256` 边车或 `x-sha256` 响应头校验。
 4. 安装到 `~/.local/bin/synapse-agent`，执行 `init` 写 `~/.synapse-agent/config.json`（600）。
 5. 有 systemd 用户会话时注册 `synapse-agent.service`；没有则打印手动常驻命令。
 
-其它平台（macOS / Linux arm64 / Windows）由维护者按 [`BUILD.md`](./BUILD.md) 编译后，手动执行：
+macOS 由维护者按 [`BUILD.md`](./BUILD.md) 编译后，手动执行：
 
 ```bash
 synapse-agent init --endpoint https://synapse.wangda.today \
@@ -149,7 +156,7 @@ synapse-agent init --endpoint https://synapse.wangda.today \
 synapse-agent run
 ```
 
-Windows 默认用 `scripts/install.ps1` 从 `/dl` 下载预编译 exe，校验 SHA-256 后执行 `init`；也可用 `-Binary` 指定本机编译的 exe。当前 R2 只发布 Linux x64，Windows exe 需要先上传到 `/dl`，否则脚本会明确报下载失败。
+Windows 默认用 `scripts/install.ps1` 从 `/dl` 下载预编译 exe，校验 SHA-256 后执行 `init`；也可用 `-Binary` 指定本机编译的 exe。发布时需同时上传 `synapse-agent-x86_64-windows-msvc.exe` 和对应 `.sha256`，否则脚本会明确报下载失败。
 
 ---
 
@@ -336,7 +343,7 @@ python3 spec/conformance/run.py --endpoint http://127.0.0.1:18099 --project yans
 - 心跳不进消息流（防刷屏）。
 - agent 只读 git：没有写冲突，只有 `base_sha` 提示。
 - 单进程原生多项目尚未实现；当前用多实例隔离配置。
-- 仅发布 Linux x64 预编译包；其它平台由维护者编译，Rust 资源采集在非 Linux 平台为降级状态。
+- Linux x64 / ARM64 走 `/dl/install.sh` 预编译通道；Windows 走 `scripts/install.ps1`；macOS 由维护者编译，不自动安装。
 - `/ver` 与 `/dl` 是刻意公开的版本/分发信息。
 
 ---

@@ -199,20 +199,16 @@ export default {
 
     if (path === "/sdk/manifest") {
       // sha 从 R2 对象真实内容算（并写回元数据），不再硬编码，避免升级校验与服务端不一致
-      const key = "bin/synapse-agent-x86_64-linux-musl";
-      const obj = await env.BLOBS.get(key);
-      let sha = String((obj as any)?.customMetadata?.sha256 ?? "");
-      if (obj && !sha) {
-        const buf = new Uint8Array(await obj.arrayBuffer());
-        sha = await sha256Bytes(buf);
-        try { await env.BLOBS.put(key, buf, { customMetadata: { sha256: sha } }); } catch {}
-      }
+      const x64Key = "bin/synapse-agent-x86_64-linux-musl";
+      const arm64Key = "bin/synapse-agent-aarch64-linux-musl";
+      const [shaX64, shaArm64] = await Promise.all([r2Sha(env, x64Key), r2Sha(env, arm64Key)]);
+      const binaries: any[] = [];
+      if (shaX64) binaries.push({ platform: "linux-x86_64", url: "/dl/synapse-agent-x86_64-linux-musl", sha256: shaX64 });
+      if (shaArm64) binaries.push({ platform: "linux-aarch64", url: "/dl/synapse-agent-aarch64-linux-musl", sha256: shaArm64 });
       return json({
         version: SDK_VERSION,
         install_url: "/dl/install.sh",
-        binaries: [
-          { platform: "linux-x86_64", url: "/dl/synapse-agent-x86_64-linux-musl", sha256: sha },
-        ],
+        binaries,
         notes: ["长连接优先，自动回退轮询", "SDK 回声过滤", "管理面 Admin 门面"],
         at: Date.now(),
       });
@@ -1329,6 +1325,18 @@ async function loadPolicy(env: Env): Promise<{ mode: "all" | "list"; projects: s
   let projects: string[] = [];
   try { projects = JSON.parse(row.projects_json ?? "[]"); } catch { projects = []; }
   return { mode: row.mode === "list" ? "list" : "all", projects };
+}
+
+async function r2Sha(env: Env, key: string): Promise<string> {
+  const obj = await env.BLOBS.get(key);
+  if (!obj) return "";
+  let sha = String((obj as any).customMetadata?.sha256 ?? "");
+  if (!sha) {
+    const buf = new Uint8Array(await obj.arrayBuffer());
+    sha = await sha256Bytes(buf);
+    try { await env.BLOBS.put(key, buf, { customMetadata: { sha256: sha } }); } catch {}
+  }
+  return sha;
 }
 
 async function sha256Bytes(buf: Uint8Array): Promise<string> {

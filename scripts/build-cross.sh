@@ -606,12 +606,12 @@ ok "构建流程结束。targets=$TARGETS"
 if [ "$DRY_RUN" = 0 ]; then
   case " $TARGETS " in
     *" linux-arm64 "*)
-      warn "Linux ARM64 二进制已生成；当前公共 /dl/install.sh 只接受 linux-x64，分发前要更新 install.sh 的 BIN 映射和 /sdk/manifest。"
+      warn "Linux ARM64 二进制已生成；/dl/install.sh 已支持 linux-arm64，/sdk/manifest 会按 R2 中是否存在该对象自动列出。"
       ;;
   esac
   case " $TARGETS " in
     *" win-x64 "*)
-      warn "Windows 产物不走 /dl/install.sh；用 scripts/install.ps1 -Binary <exe> 安装，并自行注册常驻服务。"
+      warn "Windows 产物不走 /dl/install.sh；用 scripts/install.ps1 从 /dl 自动下载对应 exe（msvc/gnu）安装，并自行注册常驻服务。"
       ;;
   esac
 fi
