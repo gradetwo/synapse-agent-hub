@@ -7,9 +7,15 @@
 #   YANSHI_BASE     服务地址（默认 https://synapse.wangda.today）
 #   YANSHI_BIN_DIR  安装目录（默认 /usr/local/bin，不可写时退到 ~/.local/bin）
 #   YANSHI_VERSION  保留位，当前只发布 latest
+#   YANSHI_LIBC     musl（默认）或 gnu（动态 glibc 版，受限环境用）
 set -eu
 
 BASE="${YANSHI_BASE:-https://synapse.wangda.today}"
+LIBC="${YANSHI_LIBC:-musl}"
+case "$LIBC" in
+  musl|gnu) ;;
+  *) printf '错误：YANSHI_LIBC 只能是 musl 或 gnu，当前：%s\n' "$LIBC" >&2; exit 1 ;;
+esac
 
 say() { printf '%s\n' "$*"; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -23,7 +29,7 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
 case "$OS-$ARCH" in
-  linux-x86_64|linux-amd64) ASSET="synapse-agent-x86_64-linux-musl" ;;
+  linux-x86_64|linux-amd64) ASSET="synapse-agent-x86_64-linux-${LIBC}" ;;
   linux-aarch64|linux-arm64)
     die "aarch64 版未发布；请由维护者按 BUILD.md 编译，客户端不要在本机编译" ;;
   darwin-*)

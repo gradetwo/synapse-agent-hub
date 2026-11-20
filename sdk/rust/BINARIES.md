@@ -92,4 +92,4 @@ curl -fsSL https://synapse.wangda.today/dl/synapse-agent-x86_64-linux-gnu.sha256
 ```
 
 `install.sh` 支持 Linux x64 / ARM64；`install.ps1` 支持 Windows msvc / gnu。
-注意：gnu 版 Linux 产物目前要手工下载安装，`install.sh` 仍只拉 musl 版（通道开关待后续加）。
+gnu 版 Linux 产物用 `install.sh --libc gnu`（或环境变量 `SYNAPSE_LINUX_LIBC=gnu`）安装；`/sdk/manifest` 在 R2 里存在 gnu 对象时会自动列出。

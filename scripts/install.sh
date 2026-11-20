@@ -3,17 +3,23 @@
 set -eu
 
 ENDPOINT=""; PROJECT=""; TOKEN=""; AGENT=""
+LIBC="${SYNAPSE_LINUX_LIBC:-musl}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --endpoint) ENDPOINT="$2"; shift 2;;
     --project)  PROJECT="$2";  shift 2;;
     --token)    TOKEN="$2";    shift 2;;
     --agent)    AGENT="$2";    shift 2;;
+    --libc)     LIBC="$2";     shift 2;;
     *) shift;;
   esac
 done
 [ -n "$ENDPOINT" ] && [ -n "$PROJECT" ] && [ -n "$TOKEN" ] || {
-  echo "usage: install.sh --endpoint URL --project NAME --token TOKEN [--agent ID]"; exit 2; }
+  echo "usage: install.sh --endpoint URL --project NAME --token TOKEN [--agent ID] [--libc musl|gnu]"; exit 2; }
+case "$LIBC" in
+  musl|gnu) ;;
+  *) echo "✗ --libc 只能是 musl 或 gnu，当前：$LIBC"; exit 2;;
+esac
 ENDPOINT="${ENDPOINT%/}"
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -22,11 +28,13 @@ case "$ARCH" in x86_64|amd64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac
 
 echo "→ endpoint=$ENDPOINT project=$PROJECT os=$OS arch=$ARCH"
 
-# 唯一发布通道：Linux 预编译 musl 二进制（x64 / arm64）。
+# 发布通道：Linux 预编译二进制（x64 / arm64），libc 通道由 --libc 选：
+# musl 是静态版（默认）；gnu 是动态 glibc 版，给 musl 自带 DNS 解析
+# 不可用的受限沙箱环境。
 # 不在客户端做 pip/cargo 回退：PyPI 版本落后，cargo 又要求本机编译，均不符合统一安装入口。
 case "$OS-$ARCH" in
-  linux-x64)   BIN="synapse-agent-x86_64-linux-musl" ;;
-  linux-arm64) BIN="synapse-agent-aarch64-linux-musl" ;;
+  linux-x64)   BIN="synapse-agent-x86_64-linux-${LIBC}" ;;
+  linux-arm64) BIN="synapse-agent-aarch64-linux-${LIBC}" ;;
   *)
     echo "✗ 当前只发布 Linux x64 / arm64 预编译包；你的平台是 ${OS}-${ARCH}。"
     echo "  已停止安装，不会自动 pip/cargo，也不会在本机编译。请让管理员提供对应平台安装包。"
@@ -34,7 +42,11 @@ case "$OS-$ARCH" in
     ;;
 esac
 
-echo "→ 通道：预编译二进制（静态 musl，免 glibc）"
+if [ "$LIBC" = "gnu" ]; then
+  echo "→ 通道：预编译二进制（动态 glibc）"
+else
+  echo "→ 通道：预编译二进制（静态 musl，免 glibc）"
+fi
   mkdir -p "${HOME}/.local/bin"
   TMP="$(mktemp)"
   trap 'rm -f "$TMP"' EXIT INT TERM

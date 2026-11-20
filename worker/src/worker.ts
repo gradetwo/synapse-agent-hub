@@ -201,10 +201,19 @@ export default {
       // sha 从 R2 对象真实内容算（并写回元数据），不再硬编码，避免升级校验与服务端不一致
       const x64Key = "bin/synapse-agent-x86_64-linux-musl";
       const arm64Key = "bin/synapse-agent-aarch64-linux-musl";
-      const [shaX64, shaArm64] = await Promise.all([r2Sha(env, x64Key), r2Sha(env, arm64Key)]);
+      const x64GnuKey = "bin/synapse-agent-x86_64-linux-gnu";
+      const arm64GnuKey = "bin/synapse-agent-aarch64-linux-gnu";
+      const [shaX64, shaArm64, shaX64Gnu, shaArm64Gnu] = await Promise.all([
+        r2Sha(env, x64Key),
+        r2Sha(env, arm64Key),
+        r2Sha(env, x64GnuKey),
+        r2Sha(env, arm64GnuKey),
+      ]);
       const binaries: any[] = [];
       if (shaX64) binaries.push({ platform: "linux-x86_64", url: "/dl/synapse-agent-x86_64-linux-musl", sha256: shaX64 });
       if (shaArm64) binaries.push({ platform: "linux-aarch64", url: "/dl/synapse-agent-aarch64-linux-musl", sha256: shaArm64 });
+      if (shaX64Gnu) binaries.push({ platform: "linux-x86_64-gnu", url: "/dl/synapse-agent-x86_64-linux-gnu", sha256: shaX64Gnu });
+      if (shaArm64Gnu) binaries.push({ platform: "linux-aarch64-gnu", url: "/dl/synapse-agent-aarch64-linux-gnu", sha256: shaArm64Gnu });
       return json({
         version: SDK_VERSION,
         install_url: "/dl/install.sh",
