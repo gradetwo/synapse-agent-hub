@@ -27,9 +27,12 @@ export interface Task {
   /** 兼容旧记录；新记录只写 task_id */
   id?: string;
   title?: string;
-  state: "open" | "claimed" | "done" | "blocked";
+  /** released = 执行侧已交付放手、但仍有交付未被管理侧取走；取完最后一件才转 done */
+  state: "open" | "claimed" | "released" | "done" | "blocked";
   owner: string | null;
   lease_until: number;
+  /** state = released 时尚未取走的交付数；其余状态为 0 或缺省 */
+  pending_submissions?: number;
   base_sha?: string;
   paths?: string[];
 }

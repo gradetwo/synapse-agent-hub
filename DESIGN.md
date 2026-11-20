@@ -163,7 +163,7 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | POST | `/p/{p}/ack` | ack | `status: done \| refused \| blocked \| stale` |
 | POST | `/p/{p}/report` | report | 任务 + 资源详单 |
 | POST | `/p/{p}/tasks/claim` | publish | 租约 120s |
-| POST | `/p/{p}/tasks/release` | publish | `done \| blocked` |
+| POST | `/p/{p}/tasks/release` | publish | `done \| blocked`；目标 done 且该任务仍有待取交付时只进 `released`（见 §7 联动） |
 | PUT | `/p/{p}/artifact/{sha256}` | artifact.write | 流式直传 R2 |
 | GET | `/p/{p}/artifact/{sha256}` | poll | 下载 |
 | POST | `/p/{p}/submissions` | submissions.create | 建交付（校验 blob 存在 + base_sha） |
@@ -262,6 +262,13 @@ delivered ──▶ collected ──▶ archived
 - 下载失败时不得改状态，仍保持 `delivered` 以便重试；已归档的交付不会被下载动作改回 `collected`。
 - 待取交付必须在控制台顶部常驻黄条、标签页角标和浏览器标题计数中可见；新交付出现时弹一次 toast。
 - `task · done` 只表示 agent 的执行结束，不是交付已取；仍有待取时控制台合并显示为 `task · 完成待取`，并标注“该 agent 还有 N 份交付待取”。
+
+### 任务与交付的联动（2026-11-20）
+
+- 交付建单时可带 `task_id`（落库 `submissions.task_id`，迁移见 `worker/migrations/20261120-submissions-task-id.sql`）。
+- `tasks/release` 目标为 `done` 时，DO 按 `(project, task_id, state='delivered')` 查待取数：大于 0 则任务只进 `released`（已交付待取，`pending_submissions` 记待取数），不许直接 `done`；显式传 `blocked` 等其它状态不走联动。release 响应带 `state` 与 `pending_submissions`。
+- 管理侧 `collect` / `archive` 一件带 `task_id` 的交付后，Worker 回调 DO `tasks/submission-settled` 重算待取数；`released` 且归零时 DO 把任务收成 `done` 并追加一条 `kind=done`（`closed_by: "collection"`）。回调失败不回滚取走状态，但 collect 响应的 `task_link` 会把失败响亮标出。
+- 没有 `task_id` 的旧交付与无交付的任务行为与此前完全一致（release 直接 `done`）。
 
 ### 提交清单
 

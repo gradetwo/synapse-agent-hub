@@ -9,7 +9,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "submission-collect-20261120";
+const BUILD_TAG = "task-closure-link-20261120";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.1";
 
@@ -821,16 +821,18 @@ async function admin(req: Request, env: Env, url: URL) {
         const obj = await env.BLOBS.head(`p/${project}/artifacts/${r.sha256}`);
         if (!obj) return err(422, `blob_missing:${r.sha256}`);
       }
+      const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id);
+      if (taskId !== null && !/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
       await env.DB.prepare(
         `INSERT OR REPLACE INTO submissions
-         (project, submission_id, agent_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
-      ).bind(project, b.submission_id, b.agent_id, b.base_sha, b.kind, b.title ?? "",
+         (project, submission_id, agent_id, task_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
+      ).bind(project, b.submission_id, b.agent_id, taskId, b.base_sha, b.kind, b.title ?? "",
              JSON.stringify(b.refs ?? []), JSON.stringify(b.checks ?? {}), Date.now(), Date.now()).run();
       const seq = await stub.fetch(new Request("https://do/publish", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ project, sender: b.agent_id, topic: "artifact", kind: b.kind,
-                               payload: { submission_id: b.submission_id }, dedupe_key: `sub:${b.submission_id}` }),
+                               payload: { submission_id: b.submission_id, task_id: taskId }, dedupe_key: `sub:${b.submission_id}` }),
       }));
       return Response.json({ submission_id: b.submission_id, state: "delivered", seq: await seq.json() });
     }
@@ -855,19 +857,35 @@ async function admin(req: Request, env: Env, url: URL) {
     if (col && req.method === "POST") {
       const [, id, op] = col;
       const row = await env.DB.prepare(
-        "SELECT submission_id FROM submissions WHERE project = ? AND submission_id = ?"
+        "SELECT submission_id, task_id FROM submissions WHERE project = ? AND submission_id = ?"
       ).bind(project, id).first<any>();
       if (!row) return err(404, "submission_not_found");
       if (op === "result") {
         const b: any = await req.json().catch(() => ({}));
         await env.DB.prepare(`UPDATE submissions SET result = ?, updated_at = ? WHERE project = ? AND submission_id = ?`)
           .bind(b.result, Date.now(), project, id).run();
-      } else {
-        const state = op === "collect" ? "collected" : "archived";
-        await env.DB.prepare(`UPDATE submissions SET state = ?, updated_at = ? WHERE project = ? AND submission_id = ?`)
-          .bind(state, Date.now(), project, id).run();
+        return Response.json({ ok: true });
       }
-      return Response.json({ ok: true });
+      const state = op === "collect" ? "collected" : "archived";
+      await env.DB.prepare(`UPDATE submissions SET state = ?, updated_at = ? WHERE project = ? AND submission_id = ?`)
+        .bind(state, Date.now(), project, id).run();
+      // 联动：这件交付挂在某个任务上时，通知 DO 重算该任务的待取数；
+      // 任务处于 released 且待取归零，DO 会把它收成 done。
+      // 通知失败不回滚已落库的取走状态，但必须在响应里响亮标出，不许静默脱钩。
+      let taskLink: any = null;
+      if (row.task_id) {
+        try {
+          const dr = await stub.fetch(new Request("https://do/tasks/submission-settled", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ project, task_id: row.task_id, submission_id: id, sender: "admin" }),
+          }));
+          taskLink = await dr.json().catch(() => null);
+          if (!dr.ok) taskLink = { error: "do_http_" + dr.status, detail: taskLink };
+        } catch (e: any) {
+          taskLink = { error: "do_unreachable", detail: String(e?.message ?? e) };
+        }
+      }
+      return Response.json({ ok: true, task_link: taskLink });
     }
   }
 
@@ -1113,19 +1131,21 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
     const head = await env.BLOBS.head(`p/${project}/artifacts/${rr.sha256}`);
     if (!head) return err(422, `blob_missing:${rr.sha256}`);
   }
+  const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id);
+  if (taskId !== null && !/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
   const now = Date.now();
   const res = await env.DB.prepare(
     `INSERT OR IGNORE INTO submissions
-     (project, submission_id, agent_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
-  ).bind(project, b.submission_id, agentId, b.base_sha, b.kind ?? "patch", b.title ?? "",
+     (project, submission_id, agent_id, task_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
+  ).bind(project, b.submission_id, agentId, taskId, b.base_sha, b.kind ?? "patch", b.title ?? "",
          JSON.stringify(refs), JSON.stringify(b.checks ?? {}), now, now).run();
 
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
   const seqRes = await stub.fetch(new Request("https://do/publish", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind: b.kind ?? "patch",
-                           payload: { submission_id: b.submission_id, base_sha: b.base_sha,
+                           payload: { submission_id: b.submission_id, task_id: taskId, base_sha: b.base_sha,
                                       title: b.title ?? "", agent_id: agentId },
                            dedupe_key: `sub:${b.submission_id}` }),
   }));

@@ -898,14 +898,18 @@ function setDetailReady(on) {
   }
 }
 function openAgent(id) {
-  detailAgent = id;
   const ov = $("detail");
+  // 同一 agent 的详情刷新（下载交付后、发消息后、吊销后都会重进 openAgent）不清 #dToken：
+  // 刚签发的 token 只显示这一次，被刷新擦掉就再也看不到；吊销后的「已吊销。」提示同理。
+  // 换 agent、或关掉详情再打开，才清。
+  const sameAgentRefresh = id === detailAgent && ov && !ov.hidden;
+  detailAgent = id;
   if (ov) { ov.hidden = false; ov.style.display = "flex"; document.body.classList.add("has-sheet"); ov.scrollTop = 0; }
   $("dName").textContent = id;
   $("dMeta").textContent = "加载中…";
   document.querySelectorAll("#detail [data-dq]").forEach((b) => { b.dataset.da = id; });
   $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
-  $("dToken").innerHTML = "";
+  if (!sameAgentRefresh) $("dToken").innerHTML = "";
   $("dRole").textContent = "加载中…";
   setDetailReady(false);
   api(`/admin/p/${current}/agent/${encodeURIComponent(id)}`).then((d) => {
@@ -924,7 +928,9 @@ function openAgent(id) {
       const pl = m.payload || {};
       const done = m.kind === "done" || pl.status === "done";
       const pend = done ? pendingFor(String(m.sender || "")) : 0;
-      const kindLabel = done && pend ? "完成待取" : (m.kind || "");
+      const kindLabel = m.kind === "released"
+        ? `已交付 · 待取 ${pl.pending_submissions ?? ""}`.trim()
+        : (done && pend ? "完成待取" : (m.kind || ""));
       return `<div class="row"><span class="muted">#${m.seq}</span><span>${m.topic || ""}${kindLabel ? ` · ${kindLabel}` : ""}</span>
         <span class="mono">${m.sender || ""}${m.to ? " → " + m.to : ""}</span>
         <span class="muted">${String(pl.title || pl.body || (pl.submission_id ? `交付 ${pl.submission_id}` : "")

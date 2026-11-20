@@ -50,6 +50,7 @@ export class ProjectRoom implements DurableObject {
       case "report":       return this.report(body);
       case "tasks/claim":  return this.claim(body);
       case "tasks/release":return this.release(body);
+      case "tasks/submission-settled": return this.submissionSettled(body);
       case "tasks/list":   return this.listTasks();
       case "tasks/create": return this.createTask(body);
       case "broadcast":    return this.broadcast(body);
@@ -351,14 +352,50 @@ export class ProjectRoom implements DurableObject {
     return json({ ok: true, lease_until: lease });
   }
 
+  /** 该任务还有多少件交付没被管理侧取走（state = delivered）。真源在 D1 submissions。 */
+  private async pendingDeliveries(project: string, taskId: string): Promise<number> {
+    if (!project) return 0;
+    const row = await this.env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM submissions WHERE project = ? AND task_id = ? AND state = 'delivered'"
+    ).bind(project, taskId).first<any>();
+    return Number(row?.n ?? 0);
+  }
+
   private async release(b: any) {
     const t: any = await this.st.get(`task:${b.task_id}`);
     if (!t) return json({ error: "not_found" }, 404);
     if (t.owner !== b.agent_id) return json({ error: "not_owner" }, 403);
-    await this.st.put(`task:${b.task_id}`, { ...t, state: b.state ?? "done", owner: null, lease_until: 0 });
-    await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: b.state ?? "done",
-                        payload: { task_id: b.task_id }, dedupe_key: `release:${b.task_id}:${Date.now()}` });
-    return json({ ok: true });
+    const want = b.state ?? "done";
+    let state = want;
+    let pending = 0;
+    // 联动：目标是 done 时先看交付——还有没取走的，任务只进 released（已交付待取），
+    // 不许直接 done。最后一件被取走时由 submissionSettled 收成 done。
+    // 显式传其它状态（如 blocked）不走联动，照旧。
+    if (want === "done") {
+      pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
+      if (pending > 0) state = "released";
+    }
+    await this.st.put(`task:${b.task_id}`, { ...t, state, owner: null, lease_until: 0, pending_submissions: pending });
+    await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: state,
+                        payload: { task_id: b.task_id, pending_submissions: pending }, dedupe_key: `release:${b.task_id}:${Date.now()}` });
+    return json({ ok: true, state, pending_submissions: pending });
+  }
+
+  /** 管理侧取走/归档一件交付后由 Worker 回调：重算待取数；released 且归零 → 收成 done。 */
+  private async submissionSettled(b: any) {
+    const t: any = await this.st.get(`task:${b.task_id}`);
+    if (!t) return json({ error: "not_found" }, 404);
+    const pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
+    let state = t.state;
+    if (t.state === "released" && pending === 0) {
+      state = "done";
+      await this.st.put(`task:${b.task_id}`, { ...t, state, pending_submissions: 0 });
+      await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task", kind: "done",
+                          payload: { task_id: b.task_id, closed_by: "collection" }, dedupe_key: `close:${b.task_id}` });
+    } else {
+      await this.st.put(`task:${b.task_id}`, { ...t, pending_submissions: pending });
+    }
+    return json({ ok: true, task_id: b.task_id, state, pending_submissions: pending });
   }
 
   private async listTasks() {

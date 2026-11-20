@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   project       TEXT NOT NULL,
   submission_id TEXT NOT NULL,
   agent_id      TEXT NOT NULL,
+  task_id       TEXT,
   base_sha      TEXT,
   kind          TEXT NOT NULL,
   title         TEXT,
