@@ -58,7 +58,7 @@ tail -n 20 "$HOME/.synapse-agent/agent.log"
 - `/ver` 返回当前 build
 - 60 秒内面板名册出现该 agent（`alive` 或 `late`）
 
-安装完成后不要停在“已连接”：继续按 `03-run-agent-loop.md` 常驻收件，回复消息前先读 `05-agent-messaging.md`（**ack 不是内容回复**）。
+安装完成后不要停在“已连接”：继续按 `03-run-agent-loop.md` 常驻收件并回复；`03` 已自包含回复命令，不需要客户端读取仓库里的 `05` 或 `docs`。
 
 ## 汇报格式
 
