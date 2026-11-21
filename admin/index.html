@@ -16,6 +16,8 @@ if (location.search.includes("reset=1")) {
 </script>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/dl/icon-192.png" sizes="192x192" type="image/png">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0e1116">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -1454,7 +1456,7 @@ function bindBulk() {
 }
 
 function bindFoldAll() {
-  if ($("foldAll")) return;
+  if (document.getElementById("foldAll")) return;
   const seg = document.querySelector(".seg") || document.body;
   const b = document.createElement("button");
   b.id = "foldAll"; b.className = "ghost";
