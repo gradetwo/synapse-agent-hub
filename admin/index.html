@@ -463,6 +463,20 @@ let token = "";
 try { localStorage.removeItem(KEY); } catch {}
 // 统一转义：服务端数据一律不可信，进 DOM 前先变成实体
 const esc = (v) => String(v).replace(/[&<>"'`]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;","`":"&#96;"}[c]));
+function messageText(m) {
+  const pl = (m && m.payload) || {};
+  const task = pl.task && typeof pl.task === "object" ? pl.task : {};
+  const detail = pl.detail && typeof pl.detail === "object" ? pl.detail : {};
+  return pl.title || pl.body || pl.text
+    || task.body || task.title || task.summary
+    || detail.note
+    || (pl.submission_id ? `交付 ${pl.submission_id}` : "")
+    || (task.task_id ? `任务 ${task.task_id}` : "")
+    || (pl.task_id ? `任务 ${pl.task_id}` : "")
+    || (pl.action_required ? `任务 ${pl.action_required.kind || "sync"}` : "")
+    || (m && m.topic === "ack" ? `回执 ${m.kind || ""}`.trim() : "")
+    || "—";
+}
 const deepEsc = (v) => Array.isArray(v) ? v.map(deepEsc)
   : (v && typeof v === "object") ? Object.fromEntries(Object.entries(v).map(([k,x]) => [k, deepEsc(x)]))
   : (typeof v === "string" ? esc(v) : v);
@@ -972,15 +986,15 @@ function openAgent(id, project) {
     drawLine($("cDisk"), hb.map((x) => x.disk_used_pct ?? 0), "#ffc46a");
     $("dMsgs").innerHTML = (d.messages || []).slice().reverse().map((m) => {
       const pl = m.payload || {};
-      const done = m.kind === "done" || pl.status === "done";
+      const done = m.kind === "done" || pl.status === "done" || (pl.task && pl.task.state === "done");
       const pend = done ? pendingFor(String(m.sender || "")) : 0;
+      const text = esc(String(messageText(m)));
       const kindLabel = m.kind === "released"
         ? `已交付 · 待取 ${pl.pending_submissions ?? ""}`.trim()
         : (done && pend ? "完成待取" : (m.kind || ""));
       return `<div class="row"><span class="muted">#${m.seq}</span><span>${m.topic || ""}${kindLabel ? ` · ${kindLabel}` : ""}</span>
         <span class="mono">${m.sender || ""}${m.to ? " → " + m.to : (["ack", "report"].includes(m.topic || "") ? " → 管理端" : "")}</span>
-        <span class="muted">${String(pl.title || pl.body || (pl.submission_id ? `交付 ${pl.submission_id}` : "")
-          || (pl.task_id ? `任务 ${pl.task_id}` : "")).slice(0, 46)}${pend
+        <span class="muted" title="${text}">${text.slice(0, 46)}${pend
           ? ` <span class="warnv">· 交付待取 ${pend}</span>` : ""}</span>
         <span class="muted" style="margin-left:auto">${m.at ? new Date(m.at).toLocaleTimeString() : ""}</span></div>`;
     }).join("") || `<div class="muted">暂无</div>`;
@@ -1257,6 +1271,7 @@ function addFilter(card, placeholder, opts) {
     let shown = 0;
     rows.forEach((r) => {
       if (r.querySelector(".empty")) return;
+      if (r.dataset.msgDetail) return;   // 消息正文展开行不参与筛选
       const okSel = !opts || !opts.test || opts.test(r, v);
       const okTxt = !q || (r.textContent || "").toLowerCase().includes(q);
       const hit = okSel && okTxt;
@@ -1459,25 +1474,26 @@ async function loadMsgs() {
   const lastSeen = Number(localStorage.getItem("hub.lastSeq") || 0);
   BADGES.msg = rows.filter((m) => (m.seq || 0) > lastSeen).length;
   if (ACTIVE_TAB === "msg") { markMsgSeen(); } else { updateBadges(); }
-  $("msgStat").textContent = rows.length ? `最近 ${rows.length} 条` : "";
+  $("msgStat").textContent = rows.length ? `最近 ${rows.length} 条 · 点击行看完整内容` : "";
   $("msgs").innerHTML = rows.length ? rows.map((m) => {
     const pl = m.payload || {};
-    const txt = pl.title || pl.body || pl.text
-      || (pl.submission_id ? `交付 ${pl.submission_id}` : "")
-      || (pl.task_id ? `任务 ${pl.task_id}` : "")
-      || (pl.action_required ? `任务 ${pl.action_required.kind || "sync"}` : "") || "—";
-    const done = m.kind === "done" || pl.status === "done";
+    const task = pl.task && typeof pl.task === "object" ? pl.task : {};
+    const txt = esc(String(messageText(m)));
+    const done = m.kind === "done" || pl.status === "done" || task.state === "done";
     const pending = done ? pendingFor(String(m.sender || "")) : 0;
     // done 且仍有交付待取时，合成一个状态显示；不要把“执行完成”和“交付待取”并排成矛盾画面
     const kindLabel = done && pending ? "完成待取" : (m.kind || "");
-    return `<tr data-topic="${m.topic || ""}">
+    return `<tr data-topic="${m.topic || ""}" data-seq="${m.seq}" class="clickable">
       <td class="num muted">${m.seq}</td>
       <td>${m.topic || "—"}${kindLabel ? ` · ${kindLabel}` : ""}</td>
       <td class="mono">${m.sender || "—"}</td>
       <td class="muted">${m.to ? `<b>${m.to}</b>` : (["ack", "report"].includes(m.topic || "") ? "管理端" : "广播")}</td>
-      <td class="muted">${String(txt).slice(0, 60)}${pending
+      <td class="muted" title="${txt}">${txt.slice(0, 60)}${pending
         ? ` <span class="warnv">· 该 agent 还有 ${pending} 份交付待取</span>` : ""}</td>
       <td class="muted">${(m.ts || m.at) ? new Date(m.ts || m.at).toLocaleTimeString() : "—"}</td>
+    </tr>
+    <tr class="msgDetail" data-msg-detail="${m.seq}" hidden>
+      <td colspan="6"><pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">${esc(JSON.stringify(m, null, 2))}</pre></td>
     </tr>`;
   }).join("") : `<tr><td colspan="6" class="empty">暂无消息</td></tr>`;
   reapplyFilters();
@@ -1565,6 +1581,14 @@ $("proj").onchange = (e) => {
   refresh();
   connectLive();
 };
+// 消息流：点一行展开完整 payload；筛选时不把展开行计入
+const msgTable = $("msgs");
+if (msgTable) msgTable.addEventListener("click", (e) => {
+  const row = e.target.closest("tr[data-seq]");
+  if (!row) return;
+  const detail = msgTable.querySelector(`tr[data-msg-detail="${row.dataset.seq}"]`);
+  if (detail) detail.hidden = !detail.hidden;
+});
 // 实时通道：有新消息就防抖刷新一次，复用现有渲染路径
 let liveWs = null, liveTimer = null, liveMode = localStorage.getItem("hub.live") || "ws";
 function paintLive(on, note, why) {
