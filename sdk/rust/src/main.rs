@@ -309,7 +309,8 @@ fn format_hub_message(m: &Value) -> Option<String> {
     if title.trim().is_empty() && body.trim().is_empty() {
         return None;
     }
-    let seq = seq_of(m).map(|s| format!("#{s} ")).unwrap_or_default();
+    // 统一用方括号标签，send_text_click_paste_checked 会把它当作重试去重标记。
+    let seq = seq_of(m).map(|s| format!("[Synapse #{s}] ")).unwrap_or_default();
     let mut text = String::new();
     if !title.trim().is_empty() {
         text.push_str(title.trim());
@@ -390,42 +391,45 @@ fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
             }
         }
     }
-    // 同一套 binary 同时支持豆包和 WorkBuddy：配置可写 "豆包,WorkBuddy"。
-    // 用户当前正在哪个窗口里工作，就把消息投到哪个；都不在前台时按配置顺序。
+    // 同一套 binary 同时支持豆包和 WorkBuddy，但一条消息只能投给一个应用：
+    // 当前前台窗口在候选里就选它，否则选配置里的第一个。不能在前台/后台应用之间
+    // 依次尝试，否则一次回读失败就会把同一条消息送进两个应用。
     let foreground = winmsg::foreground_hwnd();
-    if foreground != 0 {
-        if let Some(pos) = resolved.iter().position(|(_, hwnd, _)| *hwnd == foreground) {
-            let active = resolved.remove(pos);
-            resolved.insert(0, active);
-            eprintln!("[window] seq={seq} 前台窗口是 {}，优先投递", resolved[0].2);
-        }
+    let foreground_pos = if foreground != 0 {
+        resolved.iter().position(|(_, hwnd, _)| *hwnd == foreground)
+    } else {
+        None
+    };
+    if let Some(pos) = foreground_pos {
+        eprintln!("[window] seq={seq} 前台窗口是 {}，投递到该应用", resolved[pos].2);
     }
     if resolved.is_empty() {
         eprintln!("[window] seq={seq} 没有可用窗口，保留 WAL 且不 ACK：{last_err}");
         return false;
     }
-    for attempt in 1..=3u32 {
-        for (app, hwnd, title) in &resolved {
-            for &(cx, cy) in fallback_clicks(app) {
-                match winmsg::send_text_click_paste_checked(*hwnd, &text, true, cx, cy) {
-                    Ok(verified) => {
-                        if verified {
-                            eprintln!("[window] seq={seq} 已注入 {title:?}（{app}）并自动回车（UIA 已验证）");
-                        } else {
-                            eprintln!("[window] seq={seq} 已粘贴 {title:?}（{app}）并自动回车（按 {cx}/{cy} 点击，Ctrl+A/C 已复核）");
-                        }
-                        return true;
-                    }
-                    Err(e) => {
-                        last_err = format!("{app}@{cx}/{cy}: {e}");
-                    }
-                }
+    // 只选一个目标应用，绝不在多个应用之间轮询重试。
+    // 否则第一个应用其实已经上屏、只是回读失败时，第二个应用会再收到一遍，造成重复投送。
+    let selected = if let Some(pos) = foreground_pos {
+        resolved.remove(pos)
+    } else {
+        resolved.remove(0)
+    };
+    let (app, hwnd, title) = selected;
+    let &(cx, cy) = fallback_clicks(&app).first().unwrap_or(&(0.53, 0.83));
+    match winmsg::send_text_click_paste_checked(hwnd, &text, true, cx, cy) {
+        Ok(verified) => {
+            if verified {
+                eprintln!("[window] seq={seq} 已注入 {title:?}（{app}）并自动回车（UIA 已验证）");
+            } else {
+                eprintln!("[window] seq={seq} 已粘贴 {title:?}（{app}）并自动回车（按 {cx}/{cy} 点击，Ctrl+A/C 已复核）");
             }
+            true
         }
-        if attempt < 3 { std::thread::sleep(std::time::Duration::from_secs(2)); }
+        Err(e) => {
+            eprintln!("[window] seq={seq} 投递失败，保留 WAL 且不 ACK：{app}@{cx}/{cy}: {e}");
+            false
+        }
     }
-    eprintln!("[window] seq={seq} 投递失败，保留 WAL 且不 ACK：{last_err}");
-    false
 }
 
 fn forward_to_window(cfg: &Cfg, m: &Value) -> bool {
@@ -1035,6 +1039,28 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&json!({
                 "hwnd": w.hwnd, "title": w.title,
                 "elements": winmsg::dump_uia(w.hwnd)
+            })).unwrap_or_default());
+            return;
+        }
+        "uia-text" => {
+            // 诊断：确认 UIA TextPattern 能否读到聊天正文，以及 composer 当前内容。
+            let app = args_map.get("app").cloned().unwrap_or_default();
+            let title = args_map.get("title").cloned().unwrap_or_default();
+            let w = match resolve_target(&app, &title, &cfg.window_app) {
+                Ok(w) => w, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            };
+            let doc = winmsg::document_text(w.hwnd).unwrap_or_default();
+            let comp = winmsg::composer_text(w.hwnd).unwrap_or_default();
+            let needle = args_map.get("needle").cloned().unwrap_or_default();
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "hwnd": w.hwnd, "title": w.title,
+                "document_len": doc.chars().count(),
+                "composer_len": comp.chars().count(),
+                "needle": needle,
+                "needle_in_document": if needle.is_empty() { 0 } else { doc.matches(&needle).count() },
+                "needle_in_composer": if needle.is_empty() { 0 } else { comp.matches(&needle).count() },
+                "document_head": doc.chars().take(200).collect::<String>(),
+                "document_tail": doc.chars().rev().take(200).collect::<String>().chars().rev().collect::<String>(),
             })).unwrap_or_default());
             return;
         }
@@ -2203,9 +2229,9 @@ mod tests {
     #[test]
     fn hub_message_formats_for_composer() {
         let m = json!({"seq": 12, "payload": {"title": "定向", "body": "git pull"}});
-        assert_eq!(format_hub_message(&m).as_deref(), Some("#12 定向\ngit pull"));
+        assert_eq!(format_hub_message(&m).as_deref(), Some("[Synapse #12] 定向\ngit pull"));
         let task = json!({"seq": 3, "payload": {"task": {"title": "t", "body": "b"}}});
-        assert_eq!(format_hub_message(&task).as_deref(), Some("#3 t\nb"));
+        assert_eq!(format_hub_message(&task).as_deref(), Some("[Synapse #3] t\nb"));
         assert_eq!(format_hub_message(&json!({"payload": {}})), None);
         assert!(is_task_notice(&json!({"kind": "task_notice"})));
         assert!(!is_task_notice(&json!({"kind": "task", "payload": {"title": "x"}})));

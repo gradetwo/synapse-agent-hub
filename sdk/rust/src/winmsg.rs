@@ -211,6 +211,14 @@ mod uia {
                 if w < 160 || h < min_h {
                     continue;
                 }
+                let editor_like = ["tiptap", "prosemirror", "contenteditable"]
+                    .iter().any(|x| lower_class.contains(x));
+                let in_input_container = lower_class.contains("input-content");
+                // 已发送的聊天气泡也可能带 tiptap/ProseMirror，并且很长；真正的 composer
+                // 外层带 input-content-container，内部编辑区只有一行到几行，不会是高块。
+                if h > 180 && editor_like && !in_input_container {
+                    continue;
+                }
                 let focusable = el.CurrentIsKeyboardFocusable().map(|b| b.as_bool()).unwrap_or(false);
                 // 聊天正文是 Document，通常占满大半窗口；composer 一般不超过 320px。
                 // 但记事本等原生 Edit 会占满窗口，不能一刀切排除，否则连普通 Edit 都找不到。
@@ -225,6 +233,9 @@ mod uia {
                 let lower = name.to_lowercase();
                 let mut score = if ct == UIA_EditControlTypeId { 8 } else { 2 };
                 if class_looks_like_composer { score += 16; }
+                // 真正的 composer 在 input-content-container 里；消息气泡没有这个祖先，
+                // 给输入容器加权，避免聊天记录一多就把气泡当成输入框。
+                if in_input_container { score += 12; }
                 // 深层的 tiptap/ProseMirror 才是真正接收键盘的编辑区；外层只是带边框的容器。
                 if ["tiptap", "prosemirror", "contenteditable"].iter()
                     .any(|x| lower_class.contains(x)) { score += 10; }
@@ -313,6 +324,42 @@ mod uia {
             } else {
                 None
             }
+        }
+    }
+
+    /// 读窗口正文（聊天记录）的文本，用于重试前去重：同一条消息如果已经上屏，
+    /// 即使上一轮回读失败、没有打上 _window_delivered，也不能再粘贴一次。
+    /// 只读 UIA TextPattern，不动剪贴板、不选正文。
+    pub fn document_text(hwnd: usize) -> Option<String> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)).ok()?;
+            if let Ok(pattern) = root.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+                if let Ok(range) = pattern.DocumentRange() {
+                    if let Ok(text) = range.GetText(-1) {
+                        let s = text.to_string();
+                        if !s.trim().is_empty() { return Some(s); }
+                    }
+                }
+            }
+            let condition = automation.CreateTrueCondition().ok()?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition).ok()?;
+            let count = elements.Length().ok()?;
+            for i in 0..count {
+                let Ok(el) = elements.GetElement(i) else { continue };
+                if el.CurrentControlType().ok() != Some(UIA_DocumentControlTypeId) { continue; }
+                if let Ok(pattern) = el.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+                    if let Ok(range) = pattern.DocumentRange() {
+                        if let Ok(text) = range.GetText(-1) {
+                            let s = text.to_string();
+                            if !s.trim().is_empty() { return Some(s); }
+                        }
+                    }
+                }
+            }
+            None
         }
     }
 
@@ -713,6 +760,16 @@ pub fn composer_text(_hwnd: usize) -> Option<String> {
 }
 
 #[cfg(windows)]
+pub fn document_text(hwnd: usize) -> Option<String> {
+    uia::document_text(hwnd)
+}
+
+#[cfg(not(windows))]
+pub fn document_text(_hwnd: usize) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
 pub fn input_has_focus(hwnd: usize) -> bool {
     uia::input_has_focus(hwnd)
 }
@@ -772,7 +829,11 @@ pub fn send_text_click_paste(
         let (cx, cy) = match uia::find_input_rect(hwnd) {
             Some((l, t, r, b)) if r > l && b > t => {
                 eprintln!("[winmsg] UIA 输入框 rect=({l},{t},{r},{b})");
-                (((l + r) / 2) as c_long, ((t + b) / 2) as c_long)
+                let h = b - t;
+                // 豆包的 doc_editor 可能把聊天正文和输入区都包进同一个矩形；
+                // 点垂直中心会点到上方的消息气泡。输入区永远在底部，偏下点击。
+                let cy = if h > 100 { b - 30 } else { (t + b) / 2 };
+                (((l + r) / 2) as c_long, cy as c_long)
             }
             _ => {
                 eprintln!("[winmsg] UIA 未找到输入框，回退固定比例 {click_x_ratio}/{click_y_ratio}");
@@ -830,6 +891,36 @@ pub fn send_text_click_paste(
 pub fn send_text_click_paste_checked(
     hwnd: usize, text: &str, press_enter: bool, click_x_ratio: f64, click_y_ratio: f64,
 ) -> Result<bool, String> {
+    // 去重标记取消息头部的方括号标签（如 [Synapse #551]），不要取前 24 个字符：
+    // format_hub_message 会在标签后换行/拼接标题，按 24 字符截取会跨行，UIA 正文里
+    // 往往匹配不到，重试时就会漏掉“已经上屏”的判断。
+    let trimmed = text.trim();
+    let marker: String = if let Some(end) = trimmed.find(']') {
+        trimmed[..=end].trim().to_string()
+    } else {
+        trimmed.chars().take(24).collect()
+    };
+    if marker.is_empty() {
+        return Err("待发送文本为空".into());
+    }
+
+    // 重试/崩溃恢复的第一道闸：正文里已经有这条 marker，就绝不再粘贴。
+    // composer 里出现 marker 只算草稿，不能当成已上屏。
+    let composer_now = uia::composer_text(hwnd).unwrap_or_default();
+    let value_now = uia::input_value(hwnd).unwrap_or_default();
+    // 这里不能用“composer 里有没有 marker”直接判草稿：豆包的聊天正文和输入区
+    // 都可能被 UIA 归到同一个 doc_editor 容器里。用出现次数区分：
+    // 正文次数 > 容器次数，说明至少有一条已经在聊天记录里，属于重复投递。
+    let composer_count = composer_now.matches(&marker).count()
+        .max(value_now.matches(&marker).count());
+    let doc_before = uia::document_text(hwnd);
+    let doc_before_count = doc_before.as_deref()
+        .map(|d| d.matches(&marker).count()).unwrap_or(0);
+    if doc_before_count > composer_count {
+        eprintln!("[winmsg] 正文已含 {marker:?}（document={doc_before_count} > composer={composer_count}），判定已投递，跳过重复粘贴");
+        return Ok(true);
+    }
+
     let had_value = uia::input_value(hwnd);
     // 豆包/tiptap 这类没有 ValuePattern 的 composer，改用 UIA Text 子节点读输入区；
     // 不能用 Ctrl+A/C 读整页（回车后会把已发送的对话正文也选中，误判为没发出去）。
@@ -845,13 +936,9 @@ pub fn send_text_click_paste_checked(
     } else {
         send_text_click_paste(hwnd, text, false, click_x_ratio, click_y_ratio)?;
     }
-    let marker: String = text.trim().chars().take(24).collect();
-    if marker.is_empty() {
-        return Err("待发送文本为空".into());
-    }
     let mut entered = false;
     if had_value.is_some() {
-        for _ in 0..20 {
+        for _ in 0..30 {
             if uia::input_value(hwnd).map(|v| v.contains(&marker)).unwrap_or(false) {
                 entered = true;
                 break;
@@ -859,7 +946,7 @@ pub fn send_text_click_paste_checked(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     } else if direct_text {
-        for _ in 0..10 {
+        for _ in 0..20 {
             if uia::composer_text(hwnd).map(|t| t.contains(&marker)).unwrap_or(false) {
                 entered = true;
                 break;
@@ -870,7 +957,7 @@ pub fn send_text_click_paste_checked(
         // 豆包 composer 是 Group，没有 ValuePattern；用“点击后 Ctrl+A/C”读 composer。
         // 如果点击落到了聊天正文，读到的正文不含本条 seq 标记，验证会失败，
         // 不会再把“只点了鼠标”当成已投递。
-        for _ in 0..10 {
+        for _ in 0..20 {
             if read_window_text(hwnd, true).map(|t| t.contains(&marker)).unwrap_or(false) {
                 entered = true;
                 break;
@@ -879,43 +966,68 @@ pub fn send_text_click_paste_checked(
         }
     }
     if !entered {
+        // 豆包实测：粘贴动作可能直接触发提交，composer 随即清空/收起，
+        // 此时 input_value/composer_text 都读不到 marker，但正文已经多了一条。
+        // 如果只看 composer 就会误判失败并重投，造成同一消息重复上屏。
+        let doc_after_count = uia::document_text(hwnd)
+            .map(|d| d.matches(&marker).count()).unwrap_or(0);
+        if doc_after_count > doc_before_count {
+            let composer_after = uia::composer_text(hwnd).unwrap_or_default();
+            let value_after = uia::input_value(hwnd).unwrap_or_default();
+            if !composer_after.contains(&marker) && !value_after.contains(&marker) {
+                eprintln!("[winmsg] composer 读不到 {marker:?}，但正文新增了该标记，判定已上屏");
+                return Ok(true);
+            }
+        }
         return Err("粘贴后输入框没有出现预期文本：点击没有把焦点送进 composer".into());
     }
     if !press_enter {
         return Ok(had_value.is_some() || direct_text);
     }
-    unsafe { enter_key(); }
+
+    // 回车前最后确认目标窗口仍是前台，避免把 Enter 送到别的窗口。
+    unsafe {
+        if sys::GetForegroundWindow() != hwnd as sys::HWND {
+            return Err("回车前目标窗口不是前台，已中止发送".into());
+        }
+        enter_key();
+    }
+
+    // 回车是提交动作。之后的回读只用于日志：如果回读失败还返回 Err，
+    // 调用方会保留 WAL 并重试，结果就是同一条消息被再次粘贴/回车（真机已复现）。
+    // 因此只要 Enter 已发出，就按“已提交”处理，宁可日志标为未确认，也不重复投递。
+    let mut cleared = false;
     if had_value.is_some() {
-        for _ in 0..20 {
+        for _ in 0..30 {
             match uia::input_value(hwnd) {
                 Some(v) if v.contains(&marker) => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                _ => return Ok(true),
+                _ => { cleared = true; break; }
             }
         }
-        return Err("文字已进入输入框，但回车后输入框仍未清空，可能没有真正发送".into());
-    }
-    if direct_text {
-        // 回车后 composer 可能被收起；此时 UIA 读不到输入区就是已提交。
-        for _ in 0..10 {
+    } else if direct_text {
+        for _ in 0..20 {
             match uia::composer_text(hwnd) {
                 Some(t) if t.contains(&marker) => {
                     std::thread::sleep(std::time::Duration::from_millis(150));
                 }
-                _ => return Ok(true),
+                _ => { cleared = true; break; }
             }
         }
-        return Err("文字已进入输入框，但回车后 composer 仍保留文本，可能没有真正发送".into());
-    }
-    // 没有 ValuePattern 的 Electron composer：回车后用同样的 Ctrl+A/C 复核输入框已清空。
-    for _ in 0..10 {
-        if read_window_text(hwnd, true).map(|t| !t.contains(&marker)).unwrap_or(false) {
-            return Ok(false);
+    } else {
+        for _ in 0..20 {
+            if read_window_text(hwnd, true).map(|t| !t.contains(&marker)).unwrap_or(false) {
+                cleared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
-        std::thread::sleep(std::time::Duration::from_millis(150));
     }
-    Err("文字已进入输入框，但回车后输入框仍保留文本，可能没有真正发送".into())
+    if !cleared {
+        eprintln!("[winmsg] 已按回车，但回读未确认输入框清空；为避免重复投递，按已提交处理");
+    }
+    Ok(true)
 }
 
 #[cfg(not(windows))]
