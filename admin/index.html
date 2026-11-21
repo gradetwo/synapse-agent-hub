@@ -115,7 +115,18 @@ if (location.search.includes("reset=1")) {
   .tabs button{flex:0 0 auto;padding:7px 14px;border-radius:8px;border:1px solid #202836;background:#0e1319;color:#9aa4b2;font-size:13px}
   .tabs button.on{color:#eaf0f8;border-color:#2f6da8;background:#132234}
   .tabs .cnt{color:#7d8798;font-size:11px;margin-left:4px}
-  .quick{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin:8px 0}
+  .sndForm{display:grid;gap:10px;padding:12px 14px 14px}
+  .quick{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}
+  .sndTop{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(120px,.75fr) auto;gap:8px;align-items:center}
+  .sndTop select,.sndTop button{width:100%;min-height:38px}
+  .sndTop button{min-width:74px}
+  .sndLabel{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:8px;margin-top:2px}
+  .sndLabel span{font-size:11px;color:#7d8798}
+  .sndFields{display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:8px}
+  .sndFields input,.sndFields select,.sndForm textarea{width:100%;box-sizing:border-box}
+  .sndForm textarea{min-height:88px}
+  .sndActions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .sndActions button{min-width:88px}
   .permBar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 8px}
   .permRole{font-size:12.5px;color:#9aa4b2;border:1px solid #232a33;border-radius:6px;padding:4px 8px}
   .permRole.admin{color:#eaf0f8;border-color:#2f6da8;background:#132234}
@@ -124,7 +135,7 @@ if (location.search.includes("reset=1")) {
   .permGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .permGrid .primary{grid-column:1 / -1;min-height:40px}
   .permGrid button{min-height:38px}
-  @media(max-width:640px){.quick{grid-template-columns:1fr}}
+  @media(max-width:640px){.sndTop{grid-template-columns:1fr}.sndTop button{width:100%}.sndFields{grid-template-columns:1fr}.quick{grid-template-columns:1fr}}
   .filterbar{display:flex;align-items:center;gap:8px;margin:8px 0 4px}
   .filterbar input{flex:1;min-width:0}
   .mini{padding:1px 7px;font-size:12px;line-height:18px;border-radius:6px}
@@ -167,8 +178,9 @@ if (location.search.includes("reset=1")) {
   .list{font-size:12.5px}
   .list .row{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid #151b23}
   .list .row .badge{flex:0 0 auto}
-  .who{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:2px}
-  .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px}
+  .who{display:flex;flex-wrap:wrap;gap:8px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#11161d}
+  .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid #232a33;border-radius:8px;background:#151b23}
+  .whoItem input{width:auto;height:15px;min-height:0;margin:0;flex:0 0 auto}
   .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(5,1fr)}
   .stat{background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px}
   .stat .k{color:var(--dim);font-size:11px;letter-spacing:.02em}
@@ -331,35 +343,37 @@ if (location.search.includes("reset=1")) {
     </table>
   </div>
   <div class="card">
-    <h2>定向指令 <span class="muted" id="sndHint"></span></h2>
-    <div class="quick">
-      <select id="qCmd" title="常用指令">
-        <option value="sync">同步代码：拉取最新并回执 HEAD</option>
-        <option value="status">汇报状态：进度 + 磁盘 + 负载</option>
-        <option value="pause">暂停任务：停下等我新指令</option>
-        <option value="restart">重启心跳：重新拉起 agent</option>
-        <option value="clean">清缓存：清构建缓存并报释放空间</option>
-        <option value="wrap">收工：交付完待命</option>
-      </select>
-      <select id="qTo" title="发给谁">
-        <option value="online">只发在线</option>
-        <option value="all">全部（含失联）</option>
-        <option value="offline">只发失联</option>
-        <option value="busy">只发正在忙的</option>
-        <option value="idle">只发空闲的</option>
-      </select>
-      <button class="primary" id="btnQuick">执行</button>
-    </div>
-    <div class="muted" style="margin:10px 0 6px">或手动选人（可多选；不选=整项目广播）</div>
-    <div id="sndWho" class="who"></div>
-    <div class="row2" style="margin-top:8px">
-      <input id="sndTitle" placeholder="标题，如：main 已到 077644c4">
-      <select id="sndAck"><option value="1">需要回执</option><option value="0">仅通知</option></select>
-    </div>
-    <textarea id="sndBody" rows="3" placeholder="正文：要它做什么、验收标准"></textarea>
-    <div class="row2" style="margin-top:8px">
-      <button class="primary" id="btnSend">发送</button>
-      <span class="muted">按 agent 的 poll 周期（默认 8~60s）送达</span>
+    <h2>定向指令</h2>
+    <div class="sndForm">
+      <div class="sndTop">
+        <select id="qCmd" title="常用指令">
+          <option value="sync">同步代码：拉取最新并回执 HEAD</option>
+          <option value="status">汇报状态：进度 + 磁盘 + 负载</option>
+          <option value="pause">暂停任务：停下等我新指令</option>
+          <option value="restart">重启心跳：重新拉起 agent</option>
+          <option value="clean">清缓存：清构建缓存并报释放空间</option>
+          <option value="wrap">收工：交付完待命</option>
+        </select>
+        <select id="qTo" title="发给谁">
+          <option value="online">只发在线</option>
+          <option value="all">全部（含失联）</option>
+          <option value="offline">只发失联</option>
+          <option value="busy">只发正在忙的</option>
+          <option value="idle">只发空闲的</option>
+        </select>
+        <button class="primary" id="btnQuick">执行</button>
+      </div>
+      <div class="sndLabel">指定 agent <span>可多选；不选 = 整项目广播</span></div>
+      <div id="sndWho" class="who"></div>
+      <div class="sndFields">
+        <input id="sndTitle" placeholder="标题（可选），如：main 已到 077644c4">
+        <select id="sndAck"><option value="1">需要回执</option><option value="0">仅通知</option></select>
+      </div>
+      <textarea id="sndBody" rows="4" placeholder="正文：要它做什么、验收标准"></textarea>
+      <div class="sndActions">
+        <button class="primary" id="btnSend">发送</button>
+        <span class="muted" id="sndHint">按 agent 的 poll 周期（默认 8~60s）送达</span>
+      </div>
     </div>
   </div>
   <div class="card">
@@ -846,10 +860,11 @@ async function loadEnr() {
 }
 
 function renderSndWho(rows) {
-  $("sndWho").innerHTML = rows.map((a) => `
+  $("sndWho").innerHTML = rows.length ? rows.map((a) => `
     <label class="whoItem"><input type="checkbox" value="${a.agent_id}">
       <span class="dot ${a.alive === "alive" ? "alive" : "offline"}"></span>${a.agent_id}
-      <span class="muted">${a.alive === "alive" ? "在线" : "失联"}</span></label>`).join("");
+      <span class="muted">${a.alive === "alive" ? "在线" : "失联"}</span></label>`).join("")
+    : '<span class="muted">当前项目还没有 agent</span>';
 }
 
 const QUICK = {
@@ -1524,7 +1539,11 @@ function setProjectPanels(enabled) {
     if (el) el.disabled = !enabled;
   }
   if (enabled) {
-    $("sndHint").textContent = "";
+    // 发送结果要留在卡片底部，不能被每次自动刷新抹掉
+    const hint = $("sndHint");
+    if (!hint.textContent || hint.textContent.startsWith("全部项目")) {
+      hint.textContent = "按 agent 的 poll 周期（默认 8~60s）送达";
+    }
     $("bHint").textContent = "";
     return;
   }
