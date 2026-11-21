@@ -10,6 +10,13 @@ ureq = { version = "2", features = ["json"] }
 tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 sha2 = "0.10"   # artifact 上传：本地计算内容寻址 SHA256（对齐 Python hashlib）
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+] }
+
 [[bin]]
 name = "synapse-agent"
 path = "src/main.rs"

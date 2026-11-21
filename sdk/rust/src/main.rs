@@ -36,6 +36,8 @@ struct Cfg {
     exec_cmd: Option<String>,
     /// 默认窗口目标（应用名，如「豆包」），由 win-config 写入 config.json。
     window_app: String,
+    /// `run --window 1` / config.json 的 window_forward：把收件消息真正注入窗口后才 ACK。
+    window_forward: bool,
 }
 
 /// 解析窗口命令的目标：命令行 --app/--title 优先，否则用 config.json 的默认值，再退环境变量。
@@ -60,7 +62,7 @@ impl Cfg {
             cmd: self.cmd.clone(), endpoint: self.endpoint.clone(), project: self.project.clone(),
             token: self.token.clone(), agent_id: self.agent_id.clone(), dir: self.dir.clone(),
             heartbeat_s: self.heartbeat_s, exec_cmd: self.exec_cmd.clone(),
-            window_app: self.window_app.clone(),
+            window_app: self.window_app.clone(), window_forward: self.window_forward,
         }
     }
 
@@ -94,7 +96,15 @@ impl Cfg {
         let window_app = map.get("app").cloned()
             .or_else(|| saved["window_app"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app }
+        // 窗口转发必须显式开启：避免普通 win-config 用户跑 run 时意外把消息打进窗口。
+        // 命令行 --window 1 优先，其次 config.json，最后环境变量。
+        let window_forward = map.get("window")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .or_else(|| saved["window_forward"].as_bool())
+            .or_else(|| std::env::var("SYNAPSE_WINDOW_FORWARD").ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true")))
+            .unwrap_or(false);
+        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_forward }
     }
 }
 
@@ -259,10 +269,208 @@ fn reset_room_state(cfg: &Cfg, epoch: &str, journal: Option<&Arc<Mutex<Vec<Value
 }
 
 /// 回声/噪音过滤：ack 事件、自己发出的消息（含广播）都不进队列。
+/// `SYNAPSE_INCLUDE_SELF=1` 只给端到端自测用：用本 agent token 向自己 publish
+/// 一条真实 Hub 消息，验证服务端 → WebSocket → 窗口这条链路；生产不要设置。
 fn is_noise(cfg: &Cfg, m: &Value) -> bool {
     if m["topic"].as_str() == Some("ack") { return true; }
-    if m["sender"].as_str() == Some(cfg.agent_id.as_str()) { return true; }
+    if m["sender"].as_str() == Some(cfg.agent_id.as_str())
+        && std::env::var("SYNAPSE_INCLUDE_SELF").ok().as_deref() != Some("1")
+    {
+        return true;
+    }
     false
+}
+
+/// 只处理发给本 agent、或项目广播的消息；与 for_me 保持同一语义。
+fn addressed_to_me(cfg: &Cfg, m: &Value) -> bool {
+    for_me(cfg, m)
+}
+
+/// 任务板内部通知不进窗口；普通 task（管理员下发的正文）仍然要进。
+fn is_task_notice(m: &Value) -> bool {
+    matches!(m["kind"].as_str(), Some("task_notice")) ||
+        matches!(m["topic"].as_str(), Some("task_notice"))
+}
+
+/// 把 Hub 消息压成适合粘贴进聊天框的正文：优先 payload.title/body，
+/// 兼容 task.create 的 payload.task_id/title/body 和 report 的 detail.note。
+fn format_hub_message(m: &Value) -> Option<String> {
+    let p = &m["payload"];
+    let task = &p["task"];
+    let detail = &p["detail"];
+    let title = p["title"].as_str()
+        .or_else(|| task["title"].as_str())
+        .unwrap_or("");
+    let body = p["body"].as_str()
+        .or_else(|| task["body"].as_str())
+        .or_else(|| p["text"].as_str())
+        .or_else(|| detail["note"].as_str())
+        .unwrap_or("");
+    if title.trim().is_empty() && body.trim().is_empty() {
+        return None;
+    }
+    let seq = seq_of(m).map(|s| format!("#{s} ")).unwrap_or_default();
+    let mut text = String::new();
+    if !title.trim().is_empty() {
+        text.push_str(title.trim());
+        if !body.trim().is_empty() { text.push('\n'); }
+    }
+    text.push_str(body.trim());
+    Some(format!("{seq}{text}"))
+}
+
+/// 窗口注入是全局鼠标/键盘操作，同一时刻只能有一个线程在点/粘贴。
+static WINDOW_SEND_LOCK: Mutex<()> = Mutex::new(());
+
+fn window_was_delivered(m: &Value) -> bool {
+    m["_window_delivered"].as_bool().unwrap_or(false)
+}
+
+/// 只有真正开了窗口转发，ACK 备注才写“窗口已投递”；普通 run 仍保持旧的 receipt 语义。
+fn ack_note(cfg: &Cfg, delivered: &'static str, receipt: &'static str) -> &'static str {
+    if cfg.window_forward { delivered } else { receipt }
+}
+
+/// 在 WAL 里给消息打“窗口已投递”标记；进程崩溃后重放时不会重复往窗口发。
+fn mark_window_delivered(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) {
+    let mut items = journal.lock().unwrap();
+    for x in items.iter_mut() {
+        if same_message(x, m) {
+            x["_window_delivered"] = json!(true);
+            break;
+        }
+    }
+    journal_save(dir, &items);
+}
+
+fn window_targets(raw: &str) -> Vec<String> {
+    let env = std::env::var("SYNAPSE_WINDOW_APP").unwrap_or_default();
+    let source = if raw.trim().is_empty() { env } else { raw.to_string() };
+    source.split(|c| c == ',' || c == ';' || c == '|')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// WorkBuddy 的 Chromium 没向 UIA 暴露编辑控件（只暴露 Chrome Legacy Window），
+/// 只能按窗口布局点击。欢迎页 composer 在约 (0.75,0.65)；任务会话页在底部，
+/// 用 (0.75,0.88) 兜底。每次点击后仍会用 Ctrl+A/C 读 composer 验证，点错不会 ACK。
+fn fallback_clicks(app: &str) -> &'static [(f64, f64)] {
+    if app.to_lowercase().contains("workbuddy") {
+        &[(0.75, 0.65), (0.75, 0.88), (0.53, 0.83)]
+    } else {
+        &[(0.53, 0.83)]
+    }
+}
+
+/// `run --window 1` 的投递端：定向消息注入窗口并自动回车。
+/// 返回 false 表示窗口不可用/没有真正上屏；调用方必须保留 WAL、不得 ACK，
+/// 否则服务端会认为已送达，用户窗口却永远看不到。
+fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
+    if window_was_delivered(m) {
+        return true;
+    }
+    if !cfg.window_forward || !addressed_to_me(cfg, m) || is_noise(cfg, m) || is_task_notice(m) {
+        return true;
+    }
+    let Some(text) = format_hub_message(m) else { return true; };
+    let seq = seq_of(m).unwrap_or(0);
+    let apps = window_targets(&cfg.window_app);
+    if apps.is_empty() {
+        eprintln!("[window] seq={seq} 未配置 window_app，保留 WAL 且不 ACK");
+        return false;
+    }
+    let mut last_err = String::new();
+    let mut resolved: Vec<(String, usize, String)> = Vec::new();
+    for app in &apps {
+        match resolve_target("", "", app) {
+            Ok(w) => resolved.push((app.clone(), w.hwnd, w.title)),
+            Err(e) => {
+                last_err = format!("找不到目标窗口（window_app={app:?}）：{e}");
+            }
+        }
+    }
+    // 同一套 binary 同时支持豆包和 WorkBuddy：配置可写 "豆包,WorkBuddy"。
+    // 用户当前正在哪个窗口里工作，就把消息投到哪个；都不在前台时按配置顺序。
+    let foreground = winmsg::foreground_hwnd();
+    if foreground != 0 {
+        if let Some(pos) = resolved.iter().position(|(_, hwnd, _)| *hwnd == foreground) {
+            let active = resolved.remove(pos);
+            resolved.insert(0, active);
+            eprintln!("[window] seq={seq} 前台窗口是 {}，优先投递", resolved[0].2);
+        }
+    }
+    if resolved.is_empty() {
+        eprintln!("[window] seq={seq} 没有可用窗口，保留 WAL 且不 ACK：{last_err}");
+        return false;
+    }
+    for attempt in 1..=3u32 {
+        for (app, hwnd, title) in &resolved {
+            for &(cx, cy) in fallback_clicks(app) {
+                match winmsg::send_text_click_paste_checked(*hwnd, &text, true, cx, cy) {
+                    Ok(verified) => {
+                        if verified {
+                            eprintln!("[window] seq={seq} 已注入 {title:?}（{app}）并自动回车（UIA 已验证）");
+                        } else {
+                            eprintln!("[window] seq={seq} 已粘贴 {title:?}（{app}）并自动回车（按 {cx}/{cy} 点击，Ctrl+A/C 已复核）");
+                        }
+                        return true;
+                    }
+                    Err(e) => {
+                        last_err = format!("{app}@{cx}/{cy}: {e}");
+                    }
+                }
+            }
+        }
+        if attempt < 3 { std::thread::sleep(std::time::Duration::from_secs(2)); }
+    }
+    eprintln!("[window] seq={seq} 投递失败，保留 WAL 且不 ACK：{last_err}");
+    false
+}
+
+fn forward_to_window(cfg: &Cfg, m: &Value) -> bool {
+    let _gate = WINDOW_SEND_LOCK.lock().unwrap();
+    forward_to_window_impl(cfg, m)
+}
+
+/// WS 收件线程投递失败后，消息留在 WAL 且没有 ACK。主线程空闲时每 5 秒重试一次，
+/// 成功才 ACK + 执行 + 出队。这样窗口晚开、应用切走、composer 暂时隐藏都能自动补发。
+fn retry_pending_windows(cfg: &Cfg, agent: &Agent, base: &str,
+                         journal: &Arc<Mutex<Vec<Value>>>, last_msg: &AtomicU64) -> usize {
+    if !cfg.window_forward { return 0; }
+    let pending: Vec<Value> = { journal.lock().unwrap().clone() };
+    let mut sent = 0usize;
+    for m in pending {
+        if window_was_delivered(&m) || !addressed_to_me(cfg, &m)
+            || is_noise(cfg, &m) || is_task_notice(&m) {
+            continue;
+        }
+        let delivered = {
+            let _gate = WINDOW_SEND_LOCK.lock().unwrap();
+            // pending 是在拿锁前克隆的；deliver_ws 可能已经在这段时间里把这条消息
+            // 投进窗口并打上 _window_delivered。拿到锁后必须重新查当前 WAL，
+            // 不能再信任旧快照，否则同一条消息会被重试线程再粘贴一遍。
+            let already_marked = journal.lock().unwrap().iter()
+                .any(|x| same_message(x, &m) && window_was_delivered(x));
+            if already_marked {
+                false
+            } else {
+                let ok = forward_to_window_impl(cfg, &m);
+                if ok { mark_window_delivered(&cfg.dir, journal, &m); }
+                ok
+            }
+        };
+        if !delivered { continue; }
+        let seq = seq_of(&m).unwrap_or(0);
+        let _ = ack_message(cfg, agent, base, seq, "done",
+                            &json!({"note": "run 重试后窗口已投递"}), ack_required(&m));
+        let text = serde_json::to_string(&m).unwrap_or_default();
+        if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
+        dequeue_message(&cfg.dir, journal, &m);
+        last_msg.store(now_ms() as u64, Ordering::Relaxed);
+        sent += 1;
+    }
+    sent
 }
 
 fn for_me(cfg: &Cfg, m: &Value) -> bool {
@@ -403,7 +611,7 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--proxy <url>|off]\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
+        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1] [--proxy <url>|off]\n        --window 1：收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -818,6 +1026,18 @@ fn main() {
             }
             return;
         }
+        "uia-dump" => {
+            let app = args_map.get("app").cloned().unwrap_or_default();
+            let title = args_map.get("title").cloned().unwrap_or_default();
+            let w = match resolve_target(&app, &title, &cfg.window_app) {
+                Ok(w) => w, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            };
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "hwnd": w.hwnd, "title": w.title,
+                "elements": winmsg::dump_uia(w.hwnd)
+            })).unwrap_or_default());
+            return;
+        }
         "win-send" => {
             let app = args_map.get("app").cloned().unwrap_or_default();
             let title = args_map.get("title").cloned().unwrap_or_default();
@@ -830,6 +1050,7 @@ fn main() {
             }
             let enter = args_map.get("enter").map(|v| v == "1" || v == "true").unwrap_or(true);
             let method = args_map.get("method").cloned().unwrap_or_else(|| "click".into());
+            let verify = args_map.get("verify").map(|v| v == "1" || v == "true").unwrap_or(false);
             let click_x = args_map.get("click-x").and_then(|s| s.parse().ok()).unwrap_or(0.53);
             let click_y = args_map.get("click-y").and_then(|s| s.parse().ok()).unwrap_or(0.83);
             let w = match resolve_target(&app, &title, &cfg.window_app) {
@@ -837,7 +1058,12 @@ fn main() {
             };
             let mut results = json!({});
             let mut any_ok = false;
-            if method == "click" || method.is_empty() || method == "both" {
+            if verify {
+                match winmsg::send_text_click_paste_checked(w.hwnd, &text, enter, click_x, click_y) {
+                    Ok(v) => { results["checked"] = json!({"ok": true, "verified": v}); any_ok = true; }
+                    Err(e) => results["checked"] = json!({"ok": false, "error": e}),
+                }
+            } else if method == "click" || method.is_empty() || method == "both" {
                 match winmsg::send_text_click_paste(w.hwnd, &text, enter, click_x, click_y) {
                     Ok(_) => { results["click-paste"] = json!({"ok": true}); any_ok = true; }
                     Err(e) => results["click-paste"] = json!({"ok": false, "error": e}),
@@ -1474,9 +1700,24 @@ fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
               tx: &mpsc::Sender<(String, bool)>, queue: &AtomicUsize, last_msg: &AtomicU64) {
     if is_noise(cfg, m) || !for_me(cfg, m) { return; }
     if !enqueue_message(cfg, journal, m) { return; }
+    // 关键顺序：先真的把消息送进窗口，再 ACK。以前这里先 ACK，窗口投递失败时
+    // 服务端仍显示已送达，用户只看到 ACK、看不到消息。
+    let delivered = {
+        let _gate = WINDOW_SEND_LOCK.lock().unwrap();
+        let ok = forward_to_window_impl(cfg, m);
+        if ok && cfg.window_forward && addressed_to_me(cfg, m) {
+            mark_window_delivered(&cfg.dir, journal, m);
+        }
+        ok
+    };
+    if !delivered {
+        eprintln!("[ws] seq={} 窗口投递未确认，保留 WAL、不 ACK；等待重投/重连重放",
+                  seq_of(m).unwrap_or(0));
+        return;
+    }
     let seq = seq_of(m).unwrap_or(0);
     let _ = ack_message(cfg, agent, base, seq, "done",
-                        &json!({"note": "run 收到（receipt）"}), ack_required(m));
+                        &json!({"note": ack_note(cfg, "run 收到（窗口已投递）", "run 收到（receipt）")}), ack_required(m));
     let text = serde_json::to_string(m).unwrap_or_default();
     // 先加计数再入队：主线程可能在 send 返回前就取走并减计数，顺序反了会把 queue 卡在虚高值
     queue.fetch_add(1, Ordering::Relaxed);
@@ -1534,9 +1775,18 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
     // 先启动心跳，再重放 WAL：重放里的 exec 任务再慢，也不会让心跳停摆。
     let replay: Vec<Value> = if hb_only_poll { Vec::new() } else { journal.lock().unwrap().clone() };
     for m in replay {
+        // 窗口投递成功之前绝不 ACK；失败就继续留在 WAL，下一轮重试。
+        if !forward_to_window(cfg, &m) {
+            eprintln!("[poll] seq={} 重放投递失败，保留 WAL、不 ACK",
+                      seq_of(&m).unwrap_or(0));
+            continue;
+        }
+        if cfg.window_forward && addressed_to_me(cfg, &m) {
+            mark_window_delivered(&cfg.dir, &journal, &m);
+        }
         if let Some(seq) = seq_of(&m) {
             let _ = ack_message(cfg, agent, base, seq, "done",
-                                &json!({"note": "poll 启动重放（receipt）"}), ack_required(&m));
+                                &json!({"note": ack_note(cfg, "poll 启动重放（窗口已投递）", "poll 启动重放（receipt）")}), ack_required(&m));
         }
         let text = serde_json::to_string(&m).unwrap_or_default();
         if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
@@ -1555,13 +1805,22 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
         if let Some(limit) = max_duration {
             if started.elapsed() >= limit { break; }
         }
+        let retried = retry_pending_windows(cfg, agent, base, &journal, &last_msg);
+        if retried > 0 { eprintln!("[poll] 重试补发 {retried} 条窗口消息"); }
         if let Some(msgs) = fetch_inbox(&cfg, &agent, &base, cursor_get(&cfg.dir), 5, Some(&journal), true) {
             for m in msgs {
                 if is_noise(&cfg, &m) || !for_me(&cfg, &m) { continue; }
                 if !enqueue_message(&cfg, &journal, &m) { continue; }
                 let seq = seq_of(&m).unwrap_or(0);
+                if !forward_to_window(cfg, &m) {
+                    eprintln!("[poll] seq={seq} 窗口投递失败，保留 WAL、不 ACK");
+                    continue;
+                }
+                if cfg.window_forward && addressed_to_me(cfg, &m) {
+                    mark_window_delivered(&cfg.dir, &journal, &m);
+                }
                 let _ = ack_message(&cfg, &agent, &base, seq, "done",
-                                    &json!({"note": "poll 收到（receipt）"}), ack_required(&m));
+                                    &json!({"note": ack_note(cfg, "poll 收到（窗口已投递）", "poll 收到（receipt）")}), ack_required(&m));
                 let text = serde_json::to_string(&m).unwrap_or_default();
                 if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
                 dequeue_message(&cfg.dir, &journal, &m);
@@ -1789,28 +2048,45 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
     }
 
     // 主线程：取任务 → 执行（inflight 已在启动时先入队，保留 seq 顺序）
-    while let Ok((task, replay)) = rx.recv() {
+    loop {
+        let (task, replay) = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(x) => x,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let n = retry_pending_windows(cfg, agent, base, &journal, &last_msg);
+                if n > 0 { eprintln!("[ws] 空闲重试补发 {n} 条窗口消息"); }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let parsed = serde_json::from_str::<Value>(&task).ok();
         let title = parsed.as_ref()
             .and_then(|v| v["payload"]["title"].as_str().map(|x| x.to_string()))
             .unwrap_or_default();
         { let mut g = state.lock().unwrap(); g.0 = "busy".into(); g.1 = title.clone(); }
+        let mut delivered = true;
         if replay {
-            // 上次可能刚写 WAL 就崩了、receipt 还没发出去：重放时补一次（已回过会 409，视为成功）
+            // 重放消息尚未经过 deliver_ws 的窗口投递；先投窗口，再补 ACK。
             if let Some(v) = &parsed {
-                if let Some(seq) = seq_of(v) {
-                    let _ = ack_message(cfg, agent, base, seq, "done",
-                                        &json!({"note": "run 启动重放（receipt）"}), ack_required(v));
+                if !forward_to_window(cfg, v) { delivered = false; }
+                else if cfg.window_forward && addressed_to_me(cfg, v) {
+                    mark_window_delivered(&cfg.dir, &journal, v);
+                }
+            }
+            if delivered {
+                if let Some(v) = &parsed {
+                    if let Some(seq) = seq_of(v) {
+                        let _ = ack_message(cfg, agent, base, seq, "done",
+                                            &json!({"note": ack_note(cfg, "run 启动重放（窗口已投递）", "run 启动重放（receipt）")}), ack_required(v));
+                    }
                 }
             }
         }
-        if let Some(cmd) = &cfg.exec_cmd {
-            exec_task(cmd, &task);
-        } else {
-            println!("{task}");
-        }
-        if let Some(v) = &parsed {
-            dequeue_message(&cfg.dir, &journal, v);
+        if delivered {
+            if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &task); } else { println!("{task}"); }
+            if let Some(v) = &parsed { dequeue_message(&cfg.dir, &journal, v); }
+        } else if let Some(v) = &parsed {
+            eprintln!("[ws] seq={} 重放投递失败，保留 WAL、不 ACK",
+                      seq_of(v).unwrap_or(0));
         }
         let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
                                  |x| Some(x.saturating_sub(1)));
@@ -1844,6 +2120,7 @@ mod tests {
             heartbeat_s: 30,
             exec_cmd: None,
             window_app: String::new(),
+            window_forward: false,
         }
     }
 
@@ -1921,5 +2198,16 @@ mod tests {
         assert!(!for_me(&cfg, &json!({"topic": "task", "to": "b2"})));
         assert!(for_me(&cfg, &json!({"topic": "task", "to": ["b2", "a1"]})));
         assert!(!for_me(&cfg, &json!({"topic": "task", "to": ["b2", "c3"]})));
+    }
+
+    #[test]
+    fn hub_message_formats_for_composer() {
+        let m = json!({"seq": 12, "payload": {"title": "定向", "body": "git pull"}});
+        assert_eq!(format_hub_message(&m).as_deref(), Some("#12 定向\ngit pull"));
+        let task = json!({"seq": 3, "payload": {"task": {"title": "t", "body": "b"}}});
+        assert_eq!(format_hub_message(&task).as_deref(), Some("#3 t\nb"));
+        assert_eq!(format_hub_message(&json!({"payload": {}})), None);
+        assert!(is_task_notice(&json!({"kind": "task_notice"})));
+        assert!(!is_task_notice(&json!({"kind": "task", "payload": {"title": "x"}})));
     }
 }

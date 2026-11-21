@@ -112,6 +112,19 @@ synapse-agent.exe bridge --hub 1 --poll 3              # 默认桥接豆包
 > 想临时发给别的程序又不想改配置：`win-send --app 记事本 --text "..."`，
 > 或在任务里设 `SYNAPSE_WINDOW_APP=记事本`。
 
+## 2.2 `run` 自动投递到窗口
+
+`run` 默认只把消息打印/交给 `--exec`；要让它把定向消息直接注入当前聊天窗口，必须显式开启：
+
+```powershell
+# 先设目标（可写多个，前台窗口优先）
+synapse-agent.exe win-config --app "豆包,WorkBuddy"
+# --window 1 = 先投窗口，UIA/剪贴板验证成功才 ACK
+synapse-agent.exe run --window 1
+```
+
+也可以不写命令行，在 `config.json` 里设 `"window_forward": true`。窗口投递失败时消息会留在本地 WAL、不会 ACK；窗口晚开、切走或暂时找不到输入框时，主线程会每 5 秒重试，成功后再 ACK + 执行。`win-send --verify 1` 可单独验证一次 UIA/剪贴板投递；`uia-dump --app 豆包` 输出 UIA 控件树，用来排查输入框定位。
+
 ---
 
 ## 3. 消息协议（JSON Lines）

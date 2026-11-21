@@ -146,8 +146,231 @@ mod sys {
     }
 }
 
-/// 顶层窗口信息。
-#[derive(Debug, Clone)]
+#[cfg(windows)]
+mod uia {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
+        TreeScope_Descendants, UIA_EditControlTypeId, UIA_DocumentControlTypeId,
+        UIA_GroupControlTypeId, UIA_PaneControlTypeId, UIA_TextControlTypeId, UIA_TextPatternId,
+        UIA_ValuePatternId, IUIAutomationTextPattern,
+    };
+
+    /// 找 composer 控件本身，供“取矩形”和“读输入框内容”共用同一套评分，
+    /// 避免两次查找选中不同控件（一次点击搜索框、一次读正文）。
+    fn find_composer(hwnd: usize) -> Option<(IUIAutomationElement, (i32, i32, i32, i32))> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)).ok()?;
+            let condition = automation.CreateTrueCondition().ok()?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition).ok()?;
+            let count = elements.Length().ok()?;
+
+            let mut wr = super::sys::RECT::default();
+            super::sys::GetWindowRect(hwnd as super::sys::HWND, &mut wr);
+            let win_w = (wr.right - wr.left) as i32;
+            let win_h = (wr.bottom - wr.top) as i32;
+
+            let mut best: Option<(i32, IUIAutomationElement, (i32, i32, i32, i32))> = None;
+            for i in 0..count {
+                let Ok(el) = elements.GetElement(i) else { continue };
+                let Ok(ct) = el.CurrentControlType() else { continue };
+                let class_name = el.CurrentClassName().map(|s| s.to_string()).unwrap_or_default();
+                let lower_class = class_name.to_lowercase();
+                // 豆包的 composer 不是 Edit/Document，而是一个 Group：
+                // name=doc_editor，class 含 input-content-container，位于窗口底部。
+                // WorkBuddy 等 Electron 应用也常把 contenteditable 暴露成 Group/Pane，
+                // 所以对这类“输入容器”单独识别，不能只认 Edit。
+                let is_input_container = ct == UIA_GroupControlTypeId || ct == UIA_PaneControlTypeId;
+                let class_looks_like_composer = [
+                    "input-content", "composer", "chat-input", "chatinput",
+                    "message-input", "prompt-input", "editor-input", "input-container",
+                    "tiptap", "prosemirror", "contenteditable", "text-input",
+                ].iter().any(|x| lower_class.contains(x));
+                if ct != UIA_EditControlTypeId && ct != UIA_DocumentControlTypeId
+                    && !(is_input_container && class_looks_like_composer) {
+                    continue;
+                }
+                if let Ok(off) = el.CurrentIsOffscreen() {
+                    if off.as_bool() { continue; }
+                }
+                if let Ok(enabled) = el.CurrentIsEnabled() {
+                    if !enabled.as_bool() { continue; }
+                }
+                let Ok(r) = el.CurrentBoundingRectangle() else { continue };
+                let w = r.right - r.left;
+                let h = r.bottom - r.top;
+                // tiptap/ProseMirror 的编辑区常常只有一行 24px 高，不能按 36px 一刀切；
+                // 但必须仍然有足够宽度，避免把工具栏小按钮当成输入框。
+                let min_h = if class_looks_like_composer { 18 } else { 36 };
+                if w < 160 || h < min_h {
+                    continue;
+                }
+                let focusable = el.CurrentIsKeyboardFocusable().map(|b| b.as_bool()).unwrap_or(false);
+                // 聊天正文是 Document，通常占满大半窗口；composer 一般不超过 320px。
+                // 但记事本等原生 Edit 会占满窗口，不能一刀切排除，否则连普通 Edit 都找不到。
+                if ct == UIA_DocumentControlTypeId && h > 320 && !class_looks_like_composer {
+                    continue;
+                }
+                // 整个网页根 Document：宽高接近窗口，不能当输入框。
+                if w >= win_w.saturating_mul(9) / 10 && h >= win_h.saturating_mul(2) / 3 {
+                    continue;
+                }
+                let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+                let lower = name.to_lowercase();
+                let mut score = if ct == UIA_EditControlTypeId { 8 } else { 2 };
+                if class_looks_like_composer { score += 16; }
+                // 深层的 tiptap/ProseMirror 才是真正接收键盘的编辑区；外层只是带边框的容器。
+                if ["tiptap", "prosemirror", "contenteditable"].iter()
+                    .any(|x| lower_class.contains(x)) { score += 10; }
+                if lower.contains("doc_editor") { score += 6; }
+                if focusable { score += 6; }
+                if h >= 60 { score += 4; } else if h >= 40 { score += 1; }
+                if w >= 300 { score += 2; }
+                if h >= 18 && r.bottom >= wr.bottom - 160 { score += 6; }
+                if r.top >= wr.top + 30 { score += 1; }
+                if ["输入", "发送", "消息", "message", "composer", "chat", "ask"]
+                    .iter().any(|x| lower.contains(x)) { score += 2; }
+                if ["搜索", "search"].iter().any(|x| lower.contains(x)) { score -= 20; }
+                if score <= 0 { continue; }
+                if best.as_ref().map(|(s, _, _)| score > *s).unwrap_or(true) {
+                    eprintln!(
+                        "[uia] candidate score={score} type={ct:?} name={name:?} class={:?} rect=({},{},{},{}) focus={focusable}",
+                        class_name.chars().take(100).collect::<String>(),
+                        r.left, r.top, r.right, r.bottom
+                    );
+                    best = Some((score, el, (r.left, r.top, r.right, r.bottom)));
+                }
+            }
+            best.map(|(_, el, rect)| (el, rect))
+        }
+    }
+
+    /// 用 UI Automation 找“聊天输入框”的屏幕矩形。
+    /// 不绑定豆包/WorkBuddy 的标题或固定比例：优先 Edit，其次 Document，
+    /// 排除全窗口根 Document、搜索框和不可见控件。
+    pub fn find_input_rect(hwnd: usize) -> Option<(i32, i32, i32, i32)> {
+        find_composer(hwnd).map(|(_, rect)| rect)
+    }
+
+    /// 读当前 composer 里的值。ValuePattern 是判断“文字真的进输入框”的最可靠证据；
+    /// 不支持 ValuePattern 的 Electron 控件返回 None，由调用方明确标记为“未验证”，
+    /// 不能假装成功。
+    pub fn input_value(hwnd: usize) -> Option<String> {
+        unsafe {
+            let (el, _) = find_composer(hwnd)?;
+            let pattern: IUIAutomationValuePattern =
+                el.GetCurrentPatternAs(UIA_ValuePatternId).ok()?;
+            pattern.CurrentValue().ok().map(|v| v.to_string())
+        }
+    }
+
+    /// 只读 composer 内部的文字节点，不按 Ctrl+A/C 读整个页面。
+    /// 豆包在回车后会收起 composer，此时 Ctrl+A/C 会选中整段对话并包含刚发的
+    /// 标记文本，造成“仍留在输入框”的假阴性；tiptap/ProseMirror 的 Text 子节点
+    /// 才是真实输入内容。WorkBuddy 的 Edit 没有 Text 子节点，返回 None 由调用方回退。
+    pub fn composer_text(hwnd: usize) -> Option<String> {
+        unsafe {
+            let (el, _) = find_composer(hwnd)?;
+            // 优先用 TextPattern：Chromium 的 contenteditable 即使没有 Text 子节点，
+            // TextPattern 也能直接读出输入区文字，WorkBuddy 的匿名 Edit 就靠它。
+            if let Ok(pattern) = el.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) {
+                if let Ok(range) = pattern.DocumentRange() {
+                    if let Ok(text) = range.GetText(-1) {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            let class = el.CurrentClassName().map(|s| s.to_string()).unwrap_or_default();
+            let lower = class.to_lowercase();
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let condition = automation.CreateTrueCondition().ok()?;
+            let children = el.FindAll(TreeScope_Descendants, &condition).ok()?;
+            let count = children.Length().ok()?;
+            let mut text = String::new();
+            let mut found = false;
+            for i in 0..count {
+                let Ok(child) = children.GetElement(i) else { continue };
+                if child.CurrentControlType().ok() != Some(UIA_TextControlTypeId) {
+                    continue;
+                }
+                found = true;
+                if let Ok(name) = child.CurrentName() {
+                    text.push_str(&name.to_string());
+                }
+            }
+            if found {
+                Some(text)
+            } else if lower.contains("tiptap") || lower.contains("prosemirror") {
+                // tiptap 为空时没有 Text 子节点；它本身就是输入区，空即空。
+                Some(String::new())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// 诊断用：列出所有 Edit/Document/Group/Pane 的 UIA 属性。
+    /// WorkBuddy 的编辑控件可能没有 Name/ClassName，必须看实际矩形和焦点才能定位。
+    pub fn dump(hwnd: usize) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let Ok(automation): Result<IUIAutomation, _> =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) else { return out };
+            let Ok(root) = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)) else { return out };
+            let Ok(condition) = automation.CreateTrueCondition() else { return out };
+            let Ok(elements) = root.FindAll(TreeScope_Descendants, &condition) else { return out };
+            let Ok(count) = elements.Length() else { return out };
+            for i in 0..count {
+                let Ok(el) = elements.GetElement(i) else { continue };
+                let Ok(ct) = el.CurrentControlType() else { continue };
+                if ct != UIA_EditControlTypeId && ct != UIA_DocumentControlTypeId
+                    && ct != UIA_GroupControlTypeId && ct != UIA_PaneControlTypeId {
+                    continue;
+                }
+                let Ok(r) = el.CurrentBoundingRectangle() else { continue };
+                if r.right - r.left < 80 || r.bottom - r.top < 10 { continue; }
+                let clickable = {
+                    let mut p = windows::Win32::Foundation::POINT::default();
+                    el.GetClickablePoint(&mut p).ok().map(|_| [p.x, p.y])
+                };
+                out.push(serde_json::json!({
+                    "type": format!("{ct:?}"),
+                    "name": el.CurrentName().map(|s| s.to_string()).unwrap_or_default(),
+                    "class": el.CurrentClassName().map(|s| s.to_string()).unwrap_or_default(),
+                    "rect": [r.left, r.top, r.right, r.bottom],
+                    "clickable": clickable,
+                    "focus": el.CurrentIsKeyboardFocusable().map(|b| b.as_bool()).unwrap_or(false),
+                    "has_focus": el.CurrentHasKeyboardFocus().map(|b| b.as_bool()).unwrap_or(false),
+                    "offscreen": el.CurrentIsOffscreen().map(|b| b.as_bool()).unwrap_or(false),
+                }));
+            }
+        }
+        out
+    }
+
+    /// 当前键盘焦点是否已经在 composer 上。Electron 应用（WorkBuddy）打开欢迎页时
+    /// 会自动聚焦输入框，此时再按 UIA 矩形点一次反而可能点到建议按钮，必须先读焦点。
+    pub(super) fn input_has_focus(hwnd: usize) -> bool {
+        let Some((el, _)) = find_composer(hwnd) else { return false };
+        unsafe { el.CurrentHasKeyboardFocus().map(|b| b.as_bool()).unwrap_or(false) }
+    }
+}
+
+
+#[cfg(not(windows))]
+mod uia {
+    pub fn find_input_rect(_hwnd: usize) -> Option<(i32, i32, i32, i32)> { None }
+    pub fn input_value(_hwnd: usize) -> Option<String> { None }
+}
+
 pub struct WindowInfo {
     pub hwnd: usize,
     pub title: String,
@@ -250,8 +473,9 @@ pub fn find_app_window(app: &str) -> Result<WindowInfo, String> {
         return Err(format!("未找到名为「{app}」的进程，请确认应用已启动"));
     }
 
-    // 2) 枚举顶层窗口，取属于这些 PID 的可见窗口（优先标题非空的）
-    struct Ctx { pids: std::collections::HashSet<u32>, found: Vec<WindowInfo> }
+    // 2) 枚举顶层窗口，取属于这些 PID 的可见窗口，并优先最大的主窗口。
+    //    豆包/输入法会额外创建 CandidateWindow、IME 等小窗口；按“第一个匹配”会点错。
+    struct Ctx { pids: std::collections::HashSet<u32>, found: Vec<(i64, WindowInfo)> }
     extern "system" fn cb(hwnd: sys::HWND, lparam: sys::LPARAM) -> sys::BOOL {
         unsafe {
             let ctx = &mut *(lparam as *mut Ctx);
@@ -265,14 +489,26 @@ pub fn find_app_window(app: &str) -> Result<WindowInfo, String> {
             let n = sys::GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
             if n <= 0 { return 1; }
             let title = String::from_utf16_lossy(&buf[..n as usize]);
-            ctx.found.push(WindowInfo { hwnd: hwnd as usize, title, visible: true });
+            let lower = title.to_lowercase();
+            if ["candidatewindow", "msctfime ui", "default ime", "gdi+ window"]
+                .iter().any(|x| lower.contains(x)) {
+                return 1;
+            }
+            let mut r: sys::RECT = std::mem::zeroed();
+            sys::GetWindowRect(hwnd, &mut r);
+            let w = (r.right - r.left).max(0) as i64;
+            let h = (r.bottom - r.top).max(0) as i64;
+            // 输入法候选框/托盘提示通常只有几十像素；主聊天窗口至少 300x200。
+            if w < 300 || h < 200 { return 1; }
+            ctx.found.push((w * h, WindowInfo { hwnd: hwnd as usize, title, visible: true }));
         }
         1
     }
     let mut ctx = Ctx { pids, found: Vec::new() };
     unsafe { sys::EnumWindows(Some(cb), &mut ctx as *mut Ctx as sys::LPARAM); }
-    ctx.found.into_iter().next()
-        .ok_or_else(|| format!("找到「{app}」进程，但没有可用的可见窗口（可能已最小化到托盘）"))
+    ctx.found.sort_by_key(|(area, _)| -*area);
+    ctx.found.into_iter().map(|(_, w)| w).next()
+        .ok_or_else(|| format!("找到「{app}」进程，但没有可用的可见主窗口（可能已最小化到托盘）"))
 }
 
 #[cfg(not(windows))]
@@ -416,11 +652,16 @@ unsafe fn paste_and_maybe_enter(press_enter: bool) {
     key(sys::VK_CONTROL, true);
     sys::Sleep(250); // 等 Electron 渲染层处理粘贴
     if press_enter {
-        // 聊天窗口：Shift+Enter 有时是换行，这里用纯 Enter 发送
-        key(sys::VK_RETURN, false);
-        key(sys::VK_RETURN, true);
-        sys::Sleep(150);
+        enter_key();
     }
+}
+
+#[cfg(windows)]
+unsafe fn enter_key() {
+    // 聊天窗口：Shift+Enter 有时是换行，这里用纯 Enter 发送
+    key(sys::VK_RETURN, false);
+    key(sys::VK_RETURN, true);
+    sys::Sleep(150);
 }
 
 /// 方式一（推荐，通用）：把文字写入剪贴板并粘贴到目标窗口输入框，可选回车发送。
@@ -455,6 +696,57 @@ pub fn send_text_paste(_hwnd: usize, _text: &str, _press_enter: bool) -> Result<
     Err("窗口桥仅在 Windows 上可用".into())
 }
 
+/// 公开的 UIA 输入框探测，供 run 日志/诊断使用。
+#[cfg(windows)]
+pub fn find_input_rect(hwnd: usize) -> Option<(i32, i32, i32, i32)> {
+    uia::find_input_rect(hwnd)
+}
+
+#[cfg(windows)]
+pub fn composer_text(hwnd: usize) -> Option<String> {
+    uia::composer_text(hwnd)
+}
+
+#[cfg(not(windows))]
+pub fn composer_text(_hwnd: usize) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+pub fn input_has_focus(hwnd: usize) -> bool {
+    uia::input_has_focus(hwnd)
+}
+
+#[cfg(not(windows))]
+pub fn input_has_focus(_hwnd: usize) -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub fn foreground_hwnd() -> usize {
+    unsafe { sys::GetForegroundWindow() as usize }
+}
+
+#[cfg(not(windows))]
+pub fn foreground_hwnd() -> usize {
+    0
+}
+
+#[cfg(windows)]
+pub fn dump_uia(hwnd: usize) -> Vec<Value> {
+    uia::dump(hwnd)
+}
+
+#[cfg(not(windows))]
+pub fn dump_uia(_hwnd: usize) -> Vec<Value> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn find_input_rect(_hwnd: usize) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
 /// 增强发送：激活 → 点击窗口底部输入框区域取得键盘焦点 → 剪贴板粘贴 → 可选回车。
 /// 对豆包等 Electron 聊天窗口最稳：先点击确保焦点落在输入框，再粘贴。
 #[cfg(windows)]
@@ -475,11 +767,21 @@ pub fn send_text_click_paste(
         if w <= 0.0 || hgt <= 0.0 {
             return Err("窗口矩形无效".into());
         }
-        // 点击窗口指定比例处取得输入框焦点。
-        // 豆包桌面版(1679x845)聊天输入框中心约 (897,703)，即 x≈0.53、y≈0.83。
-        // 注意：y 别超过 0.88，否则会点到「创建项目」等入口弹出模态框。
-        let cx = rect.left + (w * click_x_ratio) as c_long;
-        let cy = rect.top + (hgt * click_y_ratio) as c_long;
+        // 优先用 UI Automation 找真正的输入控件；豆包、WorkBuddy 等 Electron
+        // 窗口尺寸/滚动一变化，固定比例就会点到正文，所以比例只做兜底。
+        let (cx, cy) = match uia::find_input_rect(hwnd) {
+            Some((l, t, r, b)) if r > l && b > t => {
+                eprintln!("[winmsg] UIA 输入框 rect=({l},{t},{r},{b})");
+                (((l + r) / 2) as c_long, ((t + b) / 2) as c_long)
+            }
+            _ => {
+                eprintln!("[winmsg] UIA 未找到输入框，回退固定比例 {click_x_ratio}/{click_y_ratio}");
+                (
+                    rect.left + (w * click_x_ratio) as c_long,
+                    rect.top + (hgt * click_y_ratio) as c_long,
+                )
+            }
+        };
         // 关键：鼠标是全局的。如果目标窗口被终端等窗口挡住，单纯 SetCursorPos
         // 会把点击送给挡住它的窗口。点击前必须确认该坐标所属顶层窗口就是目标。
         let hit = sys::WindowFromPoint(sys::POINT { x: cx, y: cy });
@@ -517,6 +819,109 @@ pub fn send_text_click_paste(
 pub fn send_text_click_paste(
     _hwnd: usize, _text: &str, _press_enter: bool, _click_x_ratio: f64, _click_y_ratio: f64,
 ) -> Result<(), String> {
+    Err("窗口桥仅在 Windows 上可用".into())
+}
+
+/// 发送并验证：先粘贴不回车，读 composer 的 ValuePattern，确认文本真的进了输入框，
+/// 再按回车，并确认输入框被清空。返回 `true` 表示 ValuePattern 验证通过；
+/// `false` 表示控件不支持 ValuePattern、只能确认粘贴动作已执行（日志会明确写“未验证”），
+/// 不会把“只点了鼠标”冒充成已送达。
+#[cfg(windows)]
+pub fn send_text_click_paste_checked(
+    hwnd: usize, text: &str, press_enter: bool, click_x_ratio: f64, click_y_ratio: f64,
+) -> Result<bool, String> {
+    let had_value = uia::input_value(hwnd);
+    // 豆包/tiptap 这类没有 ValuePattern 的 composer，改用 UIA Text 子节点读输入区；
+    // 不能用 Ctrl+A/C 读整页（回车后会把已发送的对话正文也选中，误判为没发出去）。
+    let direct_text = uia::composer_text(hwnd).is_some();
+    let already_focused = uia::input_has_focus(hwnd);
+    eprintln!("[winmsg] composer 读取方式：value_pattern={} uia_text={} focused={}",
+              had_value.is_some(), direct_text, already_focused);
+    if already_focused {
+        // WorkBuddy 欢迎页会自己把光标放进 composer；UIA 的矩形在部分 Electron
+        // 页面是旧布局坐标，再点一次可能点到上方建议按钮，所以有焦点就直接粘贴。
+        eprintln!("[winmsg] composer 已有键盘焦点，跳过点击，直接粘贴");
+        send_text_paste(hwnd, text, false)?;
+    } else {
+        send_text_click_paste(hwnd, text, false, click_x_ratio, click_y_ratio)?;
+    }
+    let marker: String = text.trim().chars().take(24).collect();
+    if marker.is_empty() {
+        return Err("待发送文本为空".into());
+    }
+    let mut entered = false;
+    if had_value.is_some() {
+        for _ in 0..20 {
+            if uia::input_value(hwnd).map(|v| v.contains(&marker)).unwrap_or(false) {
+                entered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    } else if direct_text {
+        for _ in 0..10 {
+            if uia::composer_text(hwnd).map(|t| t.contains(&marker)).unwrap_or(false) {
+                entered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    } else {
+        // 豆包 composer 是 Group，没有 ValuePattern；用“点击后 Ctrl+A/C”读 composer。
+        // 如果点击落到了聊天正文，读到的正文不含本条 seq 标记，验证会失败，
+        // 不会再把“只点了鼠标”当成已投递。
+        for _ in 0..10 {
+            if read_window_text(hwnd, true).map(|t| t.contains(&marker)).unwrap_or(false) {
+                entered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
+    if !entered {
+        return Err("粘贴后输入框没有出现预期文本：点击没有把焦点送进 composer".into());
+    }
+    if !press_enter {
+        return Ok(had_value.is_some() || direct_text);
+    }
+    unsafe { enter_key(); }
+    if had_value.is_some() {
+        for _ in 0..20 {
+            match uia::input_value(hwnd) {
+                Some(v) if v.contains(&marker) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                _ => return Ok(true),
+            }
+        }
+        return Err("文字已进入输入框，但回车后输入框仍未清空，可能没有真正发送".into());
+    }
+    if direct_text {
+        // 回车后 composer 可能被收起；此时 UIA 读不到输入区就是已提交。
+        for _ in 0..10 {
+            match uia::composer_text(hwnd) {
+                Some(t) if t.contains(&marker) => {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                _ => return Ok(true),
+            }
+        }
+        return Err("文字已进入输入框，但回车后 composer 仍保留文本，可能没有真正发送".into());
+    }
+    // 没有 ValuePattern 的 Electron composer：回车后用同样的 Ctrl+A/C 复核输入框已清空。
+    for _ in 0..10 {
+        if read_window_text(hwnd, true).map(|t| !t.contains(&marker)).unwrap_or(false) {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    Err("文字已进入输入框，但回车后输入框仍保留文本，可能没有真正发送".into())
+}
+
+#[cfg(not(windows))]
+pub fn send_text_click_paste_checked(
+    _hwnd: usize, _text: &str, _press_enter: bool, _click_x_ratio: f64, _click_y_ratio: f64,
+) -> Result<bool, String> {
     Err("窗口桥仅在 Windows 上可用".into())
 }
 
