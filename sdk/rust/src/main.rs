@@ -289,7 +289,33 @@ fn addressed_to_me(cfg: &Cfg, m: &Value) -> bool {
 /// 任务板内部通知不进窗口；普通 task（管理员下发的正文）仍然要进。
 fn is_task_notice(m: &Value) -> bool {
     matches!(m["kind"].as_str(), Some("task_notice")) ||
-        matches!(m["topic"].as_str(), Some("task_notice"))
+        matches!(m["topic"].as_str(), Some("task_notice")) ||
+        // claimed/released/done/reclaimed 是任务板生命周期事件，无正文；
+        // 只有 kind=task 的消息才是管理员下发的任务正文。
+        (m["topic"].as_str() == Some("task") && m["kind"].as_str() != Some("task"))
+}
+
+/// 窗口只接“点名给本 agent 的消息”和“管理端广播”，不接项目事件流。
+///
+/// 服务端为了管理台能看到完整台账，会把其他 agent 的 artifact 建单、任务
+/// claimed/released/done 以及部分 report 都写成 `to=null` 的项目广播；这些在
+/// `for_me` 里会被当成“广播”放行。artifact 的 payload 带 title，format_hub_message
+/// 会把它压成正文，于是别人的交付汇报就进了窗口。这里按发送者/话题再做一次窗口侧过滤：
+/// - artifact：交付箱事件，属于管理台，不是聊天指令；
+/// - task 生命周期：不是任务正文；
+/// - 其他 agent 发出的无收件人广播（report/status/announce 等）：不是给本窗口的指令。
+/// 定向消息（to 指向本 agent）仍然放行，管理员广播仍然放行。
+fn is_window_noise(cfg: &Cfg, m: &Value) -> bool {
+    if is_noise(cfg, m) || is_task_notice(m) || !addressed_to_me(cfg, m) {
+        return true;
+    }
+    if m["topic"].as_str() == Some("artifact") {
+        return true;
+    }
+    if m["to"].is_null() && m["sender"].as_str() != Some("admin") {
+        return true;
+    }
+    false
 }
 
 /// 把 Hub 消息压成适合粘贴进聊天框的正文：优先 payload.title/body，
@@ -371,7 +397,7 @@ fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
     if window_was_delivered(m) {
         return true;
     }
-    if !cfg.window_forward || !addressed_to_me(cfg, m) || is_noise(cfg, m) || is_task_notice(m) {
+    if !cfg.window_forward || is_window_noise(cfg, m) {
         return true;
     }
     let Some(text) = format_hub_message(m) else { return true; };
@@ -445,8 +471,16 @@ fn retry_pending_windows(cfg: &Cfg, agent: &Agent, base: &str,
     let pending: Vec<Value> = { journal.lock().unwrap().clone() };
     let mut sent = 0usize;
     for m in pending {
-        if window_was_delivered(&m) || !addressed_to_me(cfg, &m)
-            || is_noise(cfg, &m) || is_task_notice(&m) {
+        if window_was_delivered(&m) {
+            continue;
+        }
+        // 旧 WAL 里可能残留被窗口过滤的消息；不要只 continue，否则会永远卡住。
+        // 这类消息不投窗口、不执行 exec，但要补 ACK 并出队。
+        if is_window_noise(cfg, &m) {
+            let seq = seq_of(&m).unwrap_or(0);
+            let _ = ack_message(cfg, agent, base, seq, "done",
+                                &json!({"note": "run 窗口过滤（非本窗口消息）"}), ack_required(&m));
+            dequeue_message(&cfg.dir, journal, &m);
             continue;
         }
         let delivered = {
@@ -2227,6 +2261,50 @@ mod tests {
     }
 
     #[test]
+    fn window_filter_skips_project_events() {
+        let dir = scratch("window-filter");
+        let cfg = test_cfg(dir);
+
+        // 其他 agent 的交付单：payload 有 title，但属于交付箱事件，不进窗口
+        let artifact = json!({
+            "seq": 99, "sender": "b2", "to": null, "topic": "artifact",
+            "kind": "report", "payload": {"title": "T-FIX done"}
+        });
+        assert!(is_window_noise(&cfg, &artifact));
+
+        // 其他 agent 的任务板生命周期事件，不是任务正文
+        let released = json!({
+            "seq": 100, "sender": "b2", "to": null, "topic": "task",
+            "kind": "released", "payload": {"task_id": "T-1"}
+        });
+        assert!(is_window_noise(&cfg, &released));
+
+        // 其他 agent 发出的项目广播（报告/状态），不是给本窗口的指令
+        let report = json!({
+            "sender": "b2", "to": null, "topic": "report",
+            "kind": "report", "payload": {"text": "done"}
+        });
+        assert!(is_window_noise(&cfg, &report));
+
+        // 管理端广播、管理端定向任务、其他 agent 点名的消息仍然放行
+        let admin_bc = json!({
+            "sender": "admin", "to": null, "topic": "announce",
+            "kind": "broadcast", "payload": {"title": "git pull"}
+        });
+        assert!(!is_window_noise(&cfg, &admin_bc));
+        let admin_dm = json!({
+            "sender": "admin", "to": "a1", "topic": "task",
+            "kind": "task", "payload": {"title": "do it"}
+        });
+        assert!(!is_window_noise(&cfg, &admin_dm));
+        let agent_dm = json!({
+            "sender": "b2", "to": "a1", "topic": "task",
+            "kind": "task", "payload": {"title": "review"}
+        });
+        assert!(!is_window_noise(&cfg, &agent_dm));
+    }
+
+    #[test]
     fn hub_message_formats_for_composer() {
         let m = json!({"seq": 12, "payload": {"title": "定向", "body": "git pull"}});
         assert_eq!(format_hub_message(&m).as_deref(), Some("[Synapse #12] 定向\ngit pull"));
@@ -2234,6 +2312,7 @@ mod tests {
         assert_eq!(format_hub_message(&task).as_deref(), Some("[Synapse #3] t\nb"));
         assert_eq!(format_hub_message(&json!({"payload": {}})), None);
         assert!(is_task_notice(&json!({"kind": "task_notice"})));
+        assert!(is_task_notice(&json!({"topic": "task", "kind": "released"})));
         assert!(!is_task_notice(&json!({"kind": "task", "payload": {"title": "x"}})));
     }
 }

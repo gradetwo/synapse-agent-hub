@@ -125,6 +125,9 @@ synapse-agent.exe run --window 1
 
 也可以不写命令行，在 `config.json` 里设 `"window_forward": true`。窗口投递失败时消息会留在本地 WAL、不会 ACK；窗口晚开、切走或暂时找不到输入框时，主线程会每 5 秒重试，成功后再 ACK + 执行。`win-send --verify 1` 可单独验证一次 UIA/剪贴板投递；`uia-dump --app 豆包` 输出 UIA 控件树，用来排查输入框定位。
 
+窗口只接两类消息：**管理端广播**，以及 **`to` 明确指向本 agent 的消息**。其他 agent 的 `artifact` 交付单、任务板 `claimed/released/done` 生命周期事件、以及无收件人的 `report/status/announce` 项目广播会被过滤，不再注入窗口，避免把别人的任务汇报当成指令。
+
+
 ---
 
 ## 3. 消息协议（JSON Lines）
