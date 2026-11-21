@@ -238,7 +238,8 @@ synapse-agent.exe win-send --title 豆包 --text "现在是早会时间，帮我
 
 - **窗口操作仅 Windows 有效**；非 Windows 平台相关命令返回明确错误，但其余子命令不受影响，仍可编译运行。
 - **权限一致性**：自动化进程应与豆包以同一完整性级别运行（都普通用户，或都管理员），否则 UIPI 会拦截输入。
-- **SetForegroundWindow 限制**：已用 `AttachThreadInput` 附加前台线程绕过；若仍失败（系统前台锁），稍后重试即可。
+- **SetForegroundWindow 限制**：已附加前台线程，并用短暂置顶作为回退；发送前会用 `GetForegroundWindow` 校验目标确实成为前台。
+  若校验失败，`win-send` 会返回错误并退出，不再把点击/按键送进前台终端。目标被其它窗口遮挡时，`WindowFromPoint` 也会中止点击。
 - **窗口标题随版本变化**：一律用子串匹配，不要写死完整标题。
 - **中文输入**：务必用 `paste` 方式（剪贴板），逐字符模拟会被输入法状态打乱。
 

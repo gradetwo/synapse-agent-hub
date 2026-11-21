@@ -44,6 +44,12 @@ mod sys {
     pub const VK_MENU: u8 = 0x12;
     pub const MAPVK_VK_TO_VSC: c_uint = 0;
     pub const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
+    pub const GA_ROOT: c_uint = 2;
+    pub const SWP_NOSIZE: c_uint = 0x0001;
+    pub const SWP_NOMOVE: c_uint = 0x0002;
+    pub const SWP_SHOWWINDOW: c_uint = 0x0040;
+    pub const HWND_TOPMOST: HWND = -1isize as HWND;
+    pub const HWND_NOTOPMOST: HWND = -2isize as HWND;
 
     #[repr(C)]
     pub struct PROCESSENTRY32W {
@@ -66,6 +72,12 @@ mod sys {
         pub lp_data: *mut c_void,
     }
 
+    #[repr(C)]
+    pub struct POINT {
+        pub x: c_long,
+        pub y: c_long,
+    }
+
     pub type WndEnumProc = Option<extern "system" fn(HWND, LPARAM) -> BOOL>;
 
     #[link(name = "user32")]
@@ -75,11 +87,18 @@ mod sys {
         pub fn GetWindowTextLengthW(h_wnd: HWND) -> c_int;
         pub fn GetWindowTextW(h_wnd: HWND, lp_string: *mut u16, n_max_count: c_int) -> c_int;
         pub fn IsWindowVisible(h_wnd: HWND) -> BOOL;
+        pub fn IsIconic(h_wnd: HWND) -> BOOL;
         pub fn GetForegroundWindow() -> HWND;
         pub fn SetForegroundWindow(h_wnd: HWND) -> BOOL;
         pub fn BringWindowToTop(h_wnd: HWND) -> BOOL;
         pub fn SetFocus(h_wnd: HWND) -> HWND;
         pub fn ShowWindow(h_wnd: HWND, n_cmd_show: c_int) -> BOOL;
+        pub fn SetWindowPos(
+            h_wnd: HWND, h_wnd_insert_after: HWND, x: c_int, y: c_int,
+            cx: c_int, cy: c_int, u_flags: c_uint,
+        ) -> BOOL;
+        pub fn WindowFromPoint(point: POINT) -> HWND;
+        pub fn GetAncestor(h_wnd: HWND, ga_flags: c_uint) -> HWND;
         pub fn GetWindowThreadProcessId(h_wnd: HWND, lpdw_process_id: *mut DWORD) -> DWORD;
         pub fn AttachThreadInput(id_attach: DWORD, id_attach_to: DWORD, f_attach: BOOL) -> BOOL;
         pub fn GetCurrentThreadId() -> DWORD;
@@ -96,7 +115,6 @@ mod sys {
         pub fn GetClipboardSequenceNumber() -> DWORD;
         pub fn MapVirtualKeyW(u_code: c_uint, u_map_type: c_uint) -> c_uint;
         pub fn SwitchToThisWindow(h_wnd: HWND, f_alt_tab: BOOL);
-        pub fn AllowSetForegroundWindow(dw_process_id: DWORD) -> BOOL;
         pub fn SetCursorPos(x: c_int, y: c_int) -> BOOL;
         pub fn mouse_event(dw_flags: DWORD, dx: DWORD, dy: DWORD, dw_data: usize, dw_extra: usize);
         pub fn GetWindowRect(h_wnd: HWND, lp_rect: *mut RECT);
@@ -273,7 +291,12 @@ pub fn resolve_window(app: &str, title: &str) -> Result<WindowInfo, String> {
     Err("请提供 --app（如 豆包）或 --title（窗口标题子串）".into())
 }
 
-/// 激活窗口。用 AttachThreadInput 附加前台线程，绕过 SetForegroundWindow 限制。
+/// 激活窗口，并校验它真的成为前台窗口。
+///
+/// Windows 的 `SetForegroundWindow` 受前台锁限制：后台进程调用可能返回失败，
+/// 但窗口仍留在后面。这里先附加到当前前台线程取得输入队列，再用 `SetWindowPos`
+/// 短暂置顶兜底，最后必须用 `GetForegroundWindow` 验证。验证失败时直接返回错误，
+/// 避免后续 `mouse_event`/`keybd_event` 把文字送进前台终端或其它窗口。
 #[cfg(windows)]
 pub fn activate_window(hwnd: usize) -> Result<(), String> {
     unsafe {
@@ -281,33 +304,68 @@ pub fn activate_window(hwnd: usize) -> Result<(), String> {
         if sys::IsWindowVisible(h) == 0 {
             return Err("目标窗口不可见，请先恢复/显示窗口".into());
         }
-        sys::ShowWindow(h, sys::SW_RESTORE);
-        // 先给自己一次前台权限（AllowSetForegroundWindow(当前进程) 让系统放行）
+        if sys::IsIconic(h) != 0 {
+            sys::ShowWindow(h, sys::SW_RESTORE);
+            sys::Sleep(120);
+        }
+        if sys::GetForegroundWindow() == h {
+            return Ok(());
+        }
+
         let fg = sys::GetForegroundWindow();
         let tid_fg = sys::GetWindowThreadProcessId(fg, std::ptr::null_mut());
         let tid_target = sys::GetWindowThreadProcessId(h, std::ptr::null_mut());
         let tid_cur = sys::GetCurrentThreadId();
         let attached_fg = tid_fg != tid_cur && sys::AttachThreadInput(tid_cur, tid_fg, 1) != 0;
-        let attached_target =
-            tid_target != tid_cur && sys::AttachThreadInput(tid_cur, tid_target, 1) != 0;
 
-        // 组合多种激活手段，提高成功率
+        // 先附加到前台线程，这是绕过前台锁的关键；附加目标线程只用于 SetFocus。
         sys::SwitchToThisWindow(h, 1);
         sys::BringWindowToTop(h);
         sys::SetForegroundWindow(h);
-        sys::SetFocus(h);
-        sys::Sleep(200);
-        // 若仍不是前台，再补一次（有些系统在Attach后才放行）
+        sys::Sleep(180);
         if sys::GetForegroundWindow() != h {
+            // 前台锁偶尔仍不放行：短暂置顶再撤销，通常能完成激活。
+            sys::SetWindowPos(
+                h,
+                sys::HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                sys::SWP_NOMOVE | sys::SWP_NOSIZE | sys::SWP_SHOWWINDOW,
+            );
             sys::SetForegroundWindow(h);
-            sys::Sleep(200);
+            sys::SetWindowPos(
+                h,
+                sys::HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                sys::SWP_NOMOVE | sys::SWP_NOSIZE | sys::SWP_SHOWWINDOW,
+            );
+            sys::Sleep(180);
         }
 
+        let attached_target =
+            tid_target != tid_cur && sys::AttachThreadInput(tid_cur, tid_target, 1) != 0;
+        if attached_target {
+            sys::SetFocus(h);
+        }
         if attached_target {
             sys::AttachThreadInput(tid_cur, tid_target, 0);
         }
         if attached_fg {
             sys::AttachThreadInput(tid_cur, tid_fg, 0);
+        }
+
+        if sys::GetForegroundWindow() != h {
+            let current = sys::GetForegroundWindow() as usize;
+            return Err(format!(
+                "目标窗口未能切到前台（hwnd={hwnd:#x}，当前前台 hwnd={current:#x}）。\
+                 可能被 Windows 前台锁、管理员权限差异或全屏窗口拦截；\
+                 请先手动点一下目标窗口，或在同一权限级别下运行 agent 后重试。"
+            ));
         }
     }
     Ok(())
@@ -371,6 +429,10 @@ unsafe fn paste_and_maybe_enter(press_enter: bool) {
 pub fn send_text_paste(hwnd: usize, text: &str, press_enter: bool) -> Result<(), String> {
     activate_window(hwnd)?;
     unsafe {
+        let h = hwnd as sys::HWND;
+        if sys::GetForegroundWindow() != h {
+            return Err("目标窗口不是前台窗口，已中止粘贴".into());
+        }
         sys::Sleep(150);
         if sys::OpenClipboard(std::ptr::null_mut()) == 0 {
             return Err(format!("OpenClipboard 失败: {}", sys::GetLastError()));
@@ -380,6 +442,9 @@ pub fn send_text_paste(hwnd: usize, text: &str, press_enter: bool) -> Result<(),
         sys::CloseClipboard();
         r?;
         sys::Sleep(80);
+        if sys::GetForegroundWindow() != h {
+            return Err("写入剪贴板后目标窗口失去前台，已中止粘贴".into());
+        }
         paste_and_maybe_enter(press_enter);
     }
     Ok(())
@@ -399,6 +464,10 @@ pub fn send_text_click_paste(
     activate_window(hwnd)?;
     unsafe {
         let h = hwnd as sys::HWND;
+        // 再校验一次：activate_window 返回成功后，前台窗口仍可能被系统抢走。
+        if sys::GetForegroundWindow() != h {
+            return Err("目标窗口不是前台窗口，已中止点击，避免把文字发到其它窗口".into());
+        }
         let mut rect: sys::RECT = std::mem::zeroed();
         sys::GetWindowRect(h, &mut rect);
         let w = (rect.right - rect.left) as f64;
@@ -411,12 +480,24 @@ pub fn send_text_click_paste(
         // 注意：y 别超过 0.88，否则会点到「创建项目」等入口弹出模态框。
         let cx = rect.left + (w * click_x_ratio) as c_long;
         let cy = rect.top + (hgt * click_y_ratio) as c_long;
+        // 关键：鼠标是全局的。如果目标窗口被终端等窗口挡住，单纯 SetCursorPos
+        // 会把点击送给挡住它的窗口。点击前必须确认该坐标所属顶层窗口就是目标。
+        let hit = sys::WindowFromPoint(sys::POINT { x: cx, y: cy });
+        if hit.is_null() || sys::GetAncestor(hit, sys::GA_ROOT) != h {
+            return Err(format!(
+                "点击坐标被其它窗口遮挡（hit hwnd={:#x}）。已中止发送，避免把文字送进前台终端；请先把目标窗口切到前台。",
+                hit as usize
+            ));
+        }
         sys::SetCursorPos(cx as c_int, cy as c_int);
         sys::Sleep(80);
         sys::mouse_event(sys::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
         sys::Sleep(50);
         sys::mouse_event(sys::MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         sys::Sleep(200);
+        if sys::GetForegroundWindow() != h {
+            return Err("点击后目标窗口失去前台，已中止粘贴".into());
+        }
 
         // 写剪贴板
         if sys::OpenClipboard(std::ptr::null_mut()) == 0 {
@@ -515,6 +596,10 @@ unsafe fn set_clipboard_raw_text(text: &str) {
 pub fn read_window_text(hwnd: usize, restore_clipboard: bool) -> Result<String, String> {
     activate_window(hwnd)?;
     unsafe {
+        let h = hwnd as sys::HWND;
+        if sys::GetForegroundWindow() != h {
+            return Err("目标窗口不是前台窗口，已中止读取".into());
+        }
         let seq_before = sys::GetClipboardSequenceNumber();
         let saved = get_clipboard_text();
         sys::Sleep(100);

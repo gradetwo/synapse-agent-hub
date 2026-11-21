@@ -836,28 +836,33 @@ fn main() {
                 Ok(w) => w, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             };
             let mut results = json!({});
+            let mut any_ok = false;
             if method == "click" || method.is_empty() || method == "both" {
                 match winmsg::send_text_click_paste(w.hwnd, &text, enter, click_x, click_y) {
-                    Ok(_) => results["click-paste"] = json!({"ok": true}),
+                    Ok(_) => { results["click-paste"] = json!({"ok": true}); any_ok = true; }
                     Err(e) => results["click-paste"] = json!({"ok": false, "error": e}),
                 }
             }
             if method == "paste" || method == "both" {
                 match winmsg::send_text_paste(w.hwnd, &text, enter) {
-                    Ok(_) => results["paste"] = json!({"ok": true}),
+                    Ok(_) => { results["paste"] = json!({"ok": true}); any_ok = true; }
                     Err(e) => results["paste"] = json!({"ok": false, "error": e}),
                 }
             }
             if method == "copy" || method == "both" {
                 match winmsg::send_text_copydata(w.hwnd, &text, 2000) {
-                    Ok(r) => results["copydata"] = json!({"ok": true, "result": r}),
+                    Ok(r) => { results["copydata"] = json!({"ok": true, "result": r}); any_ok = true; }
                     Err(e) => results["copydata"] = json!({"ok": false, "error": e}),
                 }
             }
             println!("{}", json!({
                 "module": "winmsg", "op": "send", "title": w.title,
-                "hwnd": w.hwnd, "method": method, "results": results
+                "hwnd": w.hwnd, "method": method, "results": results,
+                "ok": any_ok
             }));
+            if !any_ok {
+                std::process::exit(1);
+            }
             return;
         }
         "win-read" => {
