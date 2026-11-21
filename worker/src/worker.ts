@@ -344,6 +344,17 @@ async function enroll(req: Request, env: Env, url: URL, path: string) {
   if (!/^[a-f0-9]{64}$/.test(tokenSha)) return err(422, "bad_token_sha");
   const p = await env.DB.prepare("SELECT status FROM projects WHERE project = ?").bind(project).first<any>();
   if (!p) return err(404, "unknown_project");
+  // 同一个 agent 用同一个 token 重复注册时，复用已有待审申请，避免生成两条
+  // 相同 token 的 enrollment；否则审批后一条会撞 agents 的唯一键。
+  const samePending = await env.DB.prepare(
+    `SELECT id, code FROM enrollments
+      WHERE project = ? AND agent_id = ? AND token_sha = ? AND status = 'pending'
+        AND expires_at > ?
+      ORDER BY created_at DESC LIMIT 1`
+  ).bind(project, agentId, tokenSha, Date.now()).first<any>();
+  if (samePending) {
+    return json({ id: samePending.id, code: samePending.code, status: "pending", poll_after_s: 5 });
+  }
   const ip = req.headers.get("cf-connecting-ip") ?? "0.0.0.0";
   const recent = await env.DB.prepare(
     "SELECT COUNT(*) AS n FROM enrollments WHERE ip = ? AND created_at > ?"
@@ -468,6 +479,16 @@ async function activeAgentCount(env: Env, project: string) {
     `SELECT COUNT(DISTINCT agent_id) AS n FROM agents WHERE project = ? AND revoked_at IS NULL
        AND (expires_at IS NULL OR expires_at > ?)`
   ).bind(project, Date.now()).first<any>();
+  return Number(r?.n ?? 0);
+}
+
+async function activeAgentCountExcluding(env: Env, project: string, agentId: string) {
+  // 审批同一 agent 的换钥申请时，旧的同名 agent 行要被替换，不能占新配额。
+  const r = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT agent_id) AS n FROM agents
+       WHERE project = ? AND agent_id <> ? AND revoked_at IS NULL
+         AND (expires_at IS NULL OR expires_at > ?)`
+  ).bind(project, agentId, Date.now()).first<any>();
   return Number(r?.n ?? 0);
 }
 
@@ -635,19 +656,26 @@ async function admin(req: Request, env: Env, url: URL) {
       let scopes = e.scopes;
       const b: any = await req.json().catch(() => ({}));
       if (Array.isArray(b.scopes) && b.scopes.length) scopes = b.scopes.join(",");
-      // 同一 agent 重新注册：旧 token 全部作废，避免两个凭据并存
-      await env.DB.prepare(
-        "UPDATE agents SET revoked_at = ? WHERE project = ? AND agent_id = ? AND revoked_at IS NULL"
-      ).bind(now, e.project, e.agent_id).run();
+      // 先查配额；不要把旧 token 先吊销，否则后续 INSERT 失败会把现有 agent 弄成不可用。
       {
         const q = await projectQuota(env, e.project);
-        const n = await activeAgentCount(env, e.project);
+        const n = await activeAgentCountExcluding(env, e.project, e.agent_id);
         if (n >= q.maxAgents) return err(409, `agent_quota_exceeded:${n}/${q.maxAgents}`);
       }
+      // 同一个 agent 重新注册且复用了旧 token 时，agents 表里可能还留着同 token 的
+      // 已吊销行；直接 INSERT 会撞 PRIMARY KEY(project,agent_id,token_sha) 并返回 500。
+      // 用 upsert 把同 token 行恢复为 active，再吊销该 agent 的其他 token。
       await env.DB.prepare(
         `INSERT INTO agents (project, agent_id, role, scopes, token_sha, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,NULL)`
+         VALUES (?,?,?,?,?,?,NULL)
+         ON CONFLICT(project, agent_id, token_sha) DO UPDATE SET
+           role = excluded.role, scopes = excluded.scopes,
+           revoked_at = NULL, expires_at = NULL, created_at = excluded.created_at`
       ).bind(e.project, e.agent_id, "agent", scopes, e.token_sha, now).run();
+      await env.DB.prepare(
+        `UPDATE agents SET revoked_at = ?
+          WHERE project = ? AND agent_id = ? AND revoked_at IS NULL AND token_sha <> ?`
+      ).bind(now, e.project, e.agent_id, e.token_sha).run();
       await env.DB.prepare(
         "UPDATE enrollments SET status='approved', scopes=?, decided_at=?, decided_by=? WHERE id=?"
       ).bind(scopes, now, who, id).run();
