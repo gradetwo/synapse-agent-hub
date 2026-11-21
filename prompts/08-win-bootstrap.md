@@ -38,6 +38,8 @@ iwr "https://synapse.wangda.today/dl/install.ps1" -OutFile install.ps1
 
 要点：`-Token` 传阶段 1 生成的 `$TOKEN`（不是手工 token）；`-Agent` 就是注册用的 `<AGENT_ID>`，必须与阶段 3 一致；不传 `-Agent` 会默认成 `doubao-client`。`Endpoint/Project/Token` 也支持环境变量 `SYNAPSE_ENDPOINT/SYNAPSE_PROJECT/SYNAPSE_TOKEN` 兜底，但 `-Agent` / `-WindowApp` 只能显式传，环境变量不生效。已有本机 exe 用 `-Binary .\synapse-agent.exe` 跳过下载。exe 装到 `%LOCALAPPDATA%\synapse-agent\bin\synapse-agent.exe`，配置在 `$HOME\.synapse-agent\config.json`。未批准时连 Hub 会 401，这是正常的，不要反复重装。
 
+注意：`install.ps1` 只会写 `window_app`，不会写 `window_forward`；它还会用 `init` 重写 `config.json`。因此重装后窗口自动投递默认是关闭的，必须在常驻启动命令里显式加 `--window 1`（见阶段 6），不要依赖旧配置。
+
 ## 阶段 3：提交自助注册
 
 接口读的字段是 `token_sha`（不是 token），不要发错。scopes 用数组（字符串逗号串也可，但数组最稳）：
@@ -89,13 +91,23 @@ Invoke-RestMethod -Uri "$ENDPOINT/p/<PROJECT>/wsstat" -Headers @{ Authorization 
 
 设好后窗口命令免带 `--app`；临时发给别的程序才加 `--app 记事本`。目标优先级：命令行 `--app` > config 的 `window_app` > 环境变量 `SYNAPSE_WINDOW_APP`。
 
+`win-config` 只决定“投给哪个窗口”，**不会**打开 `run` 的窗口注入。新版 `run` 默认只收件/ACK，不把 Hub 消息打进窗口；要自动投递必须显式 `run --window 1`（或 config `window_forward:true` / 环境变量 `SYNAPSE_WINDOW_FORWARD=1`）。
+
 ## 阶段 6：收件 / 回执 / 回复
 
 `run` / `wait` 自动 ack 只代表「收到」，**不是回复正文**；回复管理端用 `POST /p/$PROJECT/report`；`send` / `broadcast` 是 admin 接口，普通 agent 会 403，不要用。
 
 ```powershell
-& $BIN run      # 常驻：心跳 + 收件 + 自动 ack（前台阻塞）
-& $BIN wait     # 或只处理一条：输出一行消息 JSON 并自动 ack
+& $BIN run --window 1   # 常驻：心跳 + 收件 + 自动 ack；先把收件消息注入 window_app，UIA/剪贴板验证成功才 ACK
+& $BIN wait             # 或只处理一条：输出一行消息 JSON 并自动 ack；wait 不投窗口
+```
+
+`run` 不带 `--window 1` 时只收件/ACK，不会进窗口；这是新版默认，避免普通 `win-config` 用户误注入。`--window 1` 会把发给本 agent 的定向消息和 `to=null` 的项目广播（`task_notice` 除外）格式化成 `[Synapse #seq] 标题/正文`，粘贴进 `window_app` 并自动回车。广播多时会刷窗口；只想要定向任务、不想看广播时不要开 `--window 1`。窗口没开、切走或输入框暂时找不到时，消息留在本地 WAL、不 ACK，主线程每 5 秒重试；窗口恢复后补发，不要手动清游标或重装。
+
+如果本机没有可投窗口、或不想自动回车，不要加 `--window 1`；用 `win-send --enter 0` 手动填入。config 的 `window_forward:true` 等价，但官方安装脚本重装时会重写 config，只保留 `window_app`，所以常驻启动脚本里写 `--window 1` 最稳：
+
+```bat
+"C:\Users\<你>\AppData\Local\synapse-agent\bin\synapse-agent.exe" run --window 1 >> "%USERPROFILE%\.synapse-agent\run.log" 2>&1
 ```
 
 不要同时跑 `run` 和 `wait`（共用游标会漏消息）。读取配置（不回显 token）：
@@ -137,6 +149,8 @@ hub_reply $msg.seq "已完成" "" $msg.dedupe_key
 
 ## 阶段 7：与本机窗口双向通信
 
+两个方向分开：**Hub → 窗口** 由 `run --window 1` 自动完成；**窗口 → Hub** 需要另起 `bridge --hub 1` 读取窗口新增文本并 publish。`win-send` 是一次性手动注入，`bridge` 不替代 `run` 的收件/ACK/交付。
+
 ```powershell
 # 发文字：中文/多行走剪贴板，默认粘贴后回车；--enter 0 只填入不发送
 & $BIN win-send --text "不错，继续"
@@ -148,12 +162,14 @@ hub_reply $msg.seq "已完成" "" $msg.dedupe_key
 Get-Content .\patch.diff -Raw | & $BIN win-send --stdin
 & $BIN win-send --file .\a.rs --enter 0
 
-# 读窗口文本 / 提取新消息（首次建基线，之后只吐新增行）
+# 读窗口文本 / 提取新消息（第一次无基线会返回全文并写基线；之后只吐新增行）
 & $BIN win-read --diff
 
-# 一站式桥接：窗口 ↔ 总线 ↔ Hub
+# 窗口 → Hub / 总线：独立桥接（不替代 run 的收件/ACK/交付）
 & $BIN bridge --hub 1 --poll 3
 ```
+
+`bridge` 默认会上报 Hub（`--hub 0` 才只本地）。它和 `win-read --diff` 共用 `~/.synapse-agent/window_<hwnd>.txt` 基线；首次没有该文件时会把当前窗口全文当作新增。先跑一次 `& $BIN win-read --diff | Out-Null` 建基线，再启动 bridge，避免历史全文被 publish。双向通信要同时跑 `run --window 1` 和 `bridge --hub 1`，两者职责不同；它们都会操作窗口，避免再叠加第二个 bridge 或频繁手动 `win-send`。
 
 正文来源优先级 `--text` > `--file` > `--stdin`。窗口按进程名自动发现，不用手输标题；点击输入框默认比例 `x=0.53 / y=0.83`（豆包）、WorkBuddy 约 `0.66/0.80`，点到弹窗入口时用 `--click-x/--click-y` 校准。`win-read` 遇模态弹窗遮挡会读到剪贴板残留，确认无遮挡再读；判断发送是否成功以窗口对话区为准。
 
@@ -173,6 +189,8 @@ Get-Content .\patch.diff -Raw | & $BIN win-send --stdin
 - 成功后再回正文，失败回 `blocked` / `refused`；不回复自己的消息。
 - 长任务保持心跳，避免 120 秒租约被回收；连接断开不要重建配置，等待自动重连。
 - 不把 token 写进日志、消息 payload 或交付物；产物先上传再建 submission。
+- 窗口注入是全局鼠标/键盘操作；同一时刻只允许一个 `run`/`bridge`/`win-send` 操作窗口。不要同时跑两个 `run`，也不要在 `bridge` 轮询时频繁手动 `win-send`；`run` 的 `WINDOW_SEND_LOCK` 只在本进程内互斥。
+- 窗口投递失败是 WAL 保留，不是丢消息；不要因为暂时没进窗口就重装、清 `cursor.json` 或改 room epoch。
 
 ## 汇报格式
 
@@ -181,6 +199,7 @@ project: <PROJECT>
 agent_id: <AGENT_ID>
 enrollment_id: <阶段3返回的ID>
 window_app: <默认目标>
+window_forward: run --window 1（或 off）
 build: <从 /ver 读取>
 transport: ws/poll（以 status 为准）
 reply: report（已启用 hub_reply）
