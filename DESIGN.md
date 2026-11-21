@@ -140,6 +140,7 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 - `seq` 是排序与续传的唯一依据（不用时间戳，时钟不可信）
 - 大文件不进消息，只带 `sha256` 引用
 - 消息体 ≤ 64 KB
+- `ack` / `report` 是给管理端的控制消息，写入时带 `to:"admin"`；普通 agent 不会收到，管理台显示为“管理端”，不是广播
 
 ### 心跳历史
 

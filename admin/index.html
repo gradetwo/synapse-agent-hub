@@ -978,7 +978,7 @@ function openAgent(id, project) {
         ? `已交付 · 待取 ${pl.pending_submissions ?? ""}`.trim()
         : (done && pend ? "完成待取" : (m.kind || ""));
       return `<div class="row"><span class="muted">#${m.seq}</span><span>${m.topic || ""}${kindLabel ? ` · ${kindLabel}` : ""}</span>
-        <span class="mono">${m.sender || ""}${m.to ? " → " + m.to : ""}</span>
+        <span class="mono">${m.sender || ""}${m.to ? " → " + m.to : (["ack", "report"].includes(m.topic || "") ? " → 管理端" : "")}</span>
         <span class="muted">${String(pl.title || pl.body || (pl.submission_id ? `交付 ${pl.submission_id}` : "")
           || (pl.task_id ? `任务 ${pl.task_id}` : "")).slice(0, 46)}${pend
           ? ` <span class="warnv">· 交付待取 ${pend}</span>` : ""}</span>
@@ -1474,7 +1474,7 @@ async function loadMsgs() {
       <td class="num muted">${m.seq}</td>
       <td>${m.topic || "—"}${kindLabel ? ` · ${kindLabel}` : ""}</td>
       <td class="mono">${m.sender || "—"}</td>
-      <td class="muted">${m.to ? `<b>${m.to}</b>` : "广播"}</td>
+      <td class="muted">${m.to ? `<b>${m.to}</b>` : (["ack", "report"].includes(m.topic || "") ? "管理端" : "广播")}</td>
       <td class="muted">${String(txt).slice(0, 60)}${pending
         ? ` <span class="warnv">· 该 agent 还有 ${pending} 份交付待取</span>` : ""}</td>
       <td class="muted">${(m.ts || m.at) ? new Date(m.ts || m.at).toLocaleTimeString() : "—"}</td>

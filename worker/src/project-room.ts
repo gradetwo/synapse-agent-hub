@@ -332,6 +332,7 @@ export class ProjectRoom implements DurableObject {
     if (target.to && !this.isToMe(target.to, b.agent_id)) return json({ error: "not_your_message" }, 403);
     // 先落回执消息再更新回执表：限流/大小校验失败时不会留下“表已写、消息没发”的脏状态
     const ackSeq = await this.append({ project: b.project, sender: b.agent_id, topic: "ack", kind: b.status,
+                                       to: "admin",
                                        payload: { seq: b.seq, detail: b.detail ?? {} },
                                        ...(b.max_per_min ? { max_per_min: b.max_per_min } : {}),
                                        dedupe_key: `ack:${b.seq}:${b.agent_id}` });
@@ -350,6 +351,7 @@ export class ProjectRoom implements DurableObject {
     // role/max_per_min 一起写进消息，否则会随 inbox/WS 暴露内部字段。
     const seq = await this.append({ project: b.project, sender: b.agent_id, topic: "report",
                                     kind: b.report_id ?? "report",
+                                    to: "admin",
                                     payload: { report_id: b.report_id, task: b.task,
                                                resources: b.resources ?? {}, env: b.env ?? {} },
                                     ...(b.max_per_min ? { max_per_min: b.max_per_min } : {}),
