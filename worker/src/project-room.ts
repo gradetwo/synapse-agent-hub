@@ -211,8 +211,14 @@ export class ProjectRoom implements DurableObject {
     limit = Math.max(1, Math.min(500, Number.isFinite(limit) ? limit : 100));
     // 历史键 `msg:87` 是字符串，字典序里 msg:100 < msg:99，since 游标会失效。
     // 新键统一零填充；读取时两段都扫，按 seq 去重合并，老数据不丢。
-    const padded = await this.st.list<Msg>({ start: msgKey(since + 1), end: "msg:9999999999", limit: 300 });
-    const legacy = await this.st.list<Msg>({ start: `msg:${since + 1}`, end: "msg:\uffff", limit: 300 });
+    // desc 是「只要最新 N 条」：必须从键尾反向取，否则 limit 300 会先取到最老的 300 条，
+    // seq 超过 300 后管理台永远看不到新消息（定向消息看起来像没发出去）。
+    const padded = await this.st.list<Msg>({
+      start: msgKey(since + 1), end: "msg:9999999999", limit: 300, reverse: desc,
+    });
+    const legacy = await this.st.list<Msg>({
+      start: `msg:${since + 1}`, end: "msg:\uffff", limit: 300, reverse: desc,
+    });
     const seen = new Set<number>();
     const total = (await this.st.get<number>("seq")) ?? 0;
     // F2：游标落在热窗口之前时，把 D1 归档里的段补进来（否则永久丢失）
