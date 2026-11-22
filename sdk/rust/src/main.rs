@@ -1151,8 +1151,17 @@ fn main() {
         }
         "deliver" => {
             // 一条龙：上传 → 建交付，专为回合制 agent 一次工具调用完成交付。
-            let file = args_map.get("file").cloned().unwrap_or_default();
-            if file.is_empty() { eprintln!("deliver 需要 --file <path>"); std::process::exit(2); }
+            // S3：支持重复 --file，代码类可一次带补丁 + 回执；旧的单 --file 仍兼容。
+            let mut files: Vec<String> = toks.windows(2)
+                .filter(|w| w[0] == "--file")
+                .map(|w| w[1].clone())
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if files.is_empty() {
+                let file = args_map.get("file").cloned().unwrap_or_default();
+                if !file.is_empty() { files.push(file); }
+            }
+            if files.is_empty() { eprintln!("deliver 需要 --file <path>（可重复传多个）"); std::process::exit(2); }
             let kind = args_map.get("kind").cloned().unwrap_or_else(|| "patch".into());
             let title = args_map.get("title").cloned().unwrap_or_default();
             let base_sha = args_map.get("base-sha").cloned();
@@ -1161,19 +1170,30 @@ fn main() {
             let task = args_map.get("task").or_else(|| args_map.get("task-id")).cloned();
             let checks: Value = args_map.get("checks")
                 .and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}));
-            let up = match artifact_upload(&cfg, &agent, &base, &file) {
-                Ok(v) => v,
-                Err(e) => { eprintln!("deliver/upload 失败：{e}"); std::process::exit(1); }
-            };
-            let refs = vec![up["ref"].clone()];
+            let mut refs = Vec::new();
+            let mut uploaded = Vec::new();
+            for file in files {
+                let up = match artifact_upload(&cfg, &agent, &base, &file) {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("deliver/upload 失败（{file}）：{e}"); std::process::exit(1); }
+                };
+                refs.push(up["ref"].clone());
+                uploaded.push(json!({
+                    "file": file, "sha256": up["sha256"], "bytes": up["bytes"],
+                    "name": up["ref"]["name"].clone()
+                }));
+            }
             let sub = match artifact_submit(&cfg, &agent, &base, &kind, &title, refs,
                                             base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref()) {
                 Ok(v) => v,
-                Err(e) => { eprintln!("deliver/submit 失败（文件已上传，ref={}）：{e}", up["sha256"]); std::process::exit(1); }
+                Err(e) => { eprintln!("deliver/submit 失败（文件已上传）：{e}"); std::process::exit(1); }
             };
+            let first = uploaded.get(0).cloned().unwrap_or_else(|| json!({}));
             println!("{}", serde_json::to_string(&json!({
-                "ok": true, "sha256": up["sha256"], "bytes": up["bytes"],
-                "submission_id": sub["submission_id"], "state": sub["state"], "seq": sub["seq"]
+                "ok": true, "files": uploaded,
+                "sha256": first["sha256"].clone(), "bytes": first["bytes"].clone(),
+                "submission_id": sub["submission_id"], "task_id": sub["task_id"],
+                "state": sub["state"], "seq": sub["seq"]
             })).unwrap_or_default());
             return;
         }

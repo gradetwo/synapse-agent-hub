@@ -1,6 +1,6 @@
 # 派单系统 Phase 1：任务台账与四个出口
 
-> 基线：`a7e37bd`。范围：Rust/Python/TS 客户端不变；只补中枢任务模型、管理端任务 API 与管理台「任务」tab。
+> 基线：`385b4bd`（2026-11-22）。范围：Rust/Python/TS 客户端不变；只补中枢任务模型、管理端任务 API 与管理台「任务」tab。
 > 目标：把「claim 之后去哪儿」变成中枢可查询、可操作的状态机，不再只存在于聊天正文里。
 
 ## 1. 现状与问题
@@ -161,29 +161,32 @@ UI 不直接改任务状态；所有动作都走上面的 API，页面刷新以�
 9. 全部项目视图不显示可写任务表单，提示切换到具体项目。
 10. `cargo test` 与 `npm`/`tsc` 不因本次改动破坏；Worker 部署前 dry-run 通过。
 
-## 8. Phase 2（不在本期实现）
+## 8. 2026-11-22 实证补充实现（S1–S6）
 
-- 优先级/依赖/队列位置与按节点队列视图；
-- 交付格式门（回执、checks 必填、task 存在性/归属校验）；
-- 仓库绑定、CI/合入结果回写；
-- 交付/任务变更的主动推送；
-- arm64-gnu 发布矩阵与 `/ver` 版本标。
+S1–S6 来自 `docs/REQUIREMENTS-20261122.md` 的当日实证补充，已在本轮落地：
+
+- **S1 交付绑定**：数据平面缺省 `task_id` 时，若 agent 名下恰好一件 claimed 任务则自动绑定；多件要求显式 `task_id`。响应回显 `task_id` / `task_assignee` / `auto_bound`。`collect` 后由 DO 重算，claimed/released 且待取归零、无待批报告即 `done`。
+- **S2 越单拦截**：数据平面要求 `state=claimed && owner=agent`；管理侧代建默认校验 owner/被指派者，确需越单时显式 `allow_overtake=true` 且必须写 `overtake_reason`，落库 `overtake=1` 并进交付台账。
+- **S3 格式门**：`patch`/`bundle` 必须有补丁与回执，`report` 必须有正文；代码类还必须带结构化 `checks.tests{passed,failed}` 或 `suites[]`。缺项返回 422 `delivery_format_incomplete` 并列出 `missing`，不写库、不推进任务。
+- **S4 裁决中间态**：`submissions.review_state` 取 `pending/accepted/approved/rejected`；`collect` 置 `accepted`，管理台“批准/拒收”走 `submissions/{id}/result`。`report` 未 approved 不关单；`rejected` 会把已 done 任务重新打开。
+- **S5 派单唤醒**：定向任务创建时已写入定向 inbox 消息，节点 `wait`/`run` 下一次拉取即唤醒；`tasks/create` 返回 `wake{channel,target,online,alive}`，任务台账对 open 定向任务显示 `to_online` / `to_alive`，离线目标显式标红。
+- **S6 定向消息**：`POST /admin/p/{project}/messages` 作为 `/send` 的同义入口，消息进节点收件箱，上线即达；管理台原有“定向指令”卡继续可用。
 
 ## 9. 上游十项需求映射（2026-11-22）
 
-Muse 管理侧提交的 `docs/REQUIREMENTS-20261122.md` 按 ROI 列了 R1–R10。本期只落地与「任务出口/管理台台账」直接相关的部分，其余排期如下：
+Muse 管理侧提交的 `docs/REQUIREMENTS-20261122.md` 按 ROI 列了 R1–R10。本轮状态：
 
-| 需求 | 本期状态 | 说明 |
+| 需求 | 状态 | 说明 |
 |---|---|---|
-| R1 交付与任务绑定 | 后端字段已支持，客户端待补 | `submissions` 已有可选 `task_id`；Rust/Python/TS 客户端尚未暴露，下一期补协议与校验 |
-| R2 交付格式门 | 未开始 | 需要定义代码类交付的回执/checks 结构，避免误伤文档类交付 |
-| R3 管理员关单与状态纠错 | **本期已实现** | `tasks/close`、`tasks/reclaim`、`tasks/reassign`，写任务事件审计 |
+| R1 交付与任务绑定 | **已实现** | 客户端可带 `task_id`；缺省自动绑定唯一 claimed 任务；collect 联动任务终态 |
+| R2 交付格式门 | **已实现（文件+checks）** | 补丁/回执/报告正文 + 结构化自测计数；缺项 422 并写 `missing` |
+| R3 管理员关单与状态纠错 | **已实现** | `tasks/close`、`tasks/reclaim`、`tasks/reassign`，写任务事件审计 |
 | R4 队列顺序/优先级/按节点视图 | 未开始 | 需要 `priority`、`after`、`repo` 字段与领取约束 |
-| R5 租约与在岗状态 | **本期部分实现** | 租约 10 分钟 + heartbeat 续租；台账显示剩余租约与 owner 在线状态；`running/stale` 细分留到下一期 |
-| R6 派单唤醒 | 未开始 | 本期只做「目标离线」可视化，不做 webhook/长轮询 |
+| R5 租约与在岗状态 | **部分实现** | 租约 10 分钟 + heartbeat 续租；台账显示剩余租约与 owner/定向目标在线状态 |
+| R6 派单唤醒 | **已实现 inbox 通道** | 定向任务消息即唤醒；离线目标在台账标红；webhook/推送留作可选增强 |
 | R7 任务与仓库绑定 | 未开始 | 依赖 R4 的 `repo` 字段 |
 | R8 合入/CI 回写 | 未开始 | 需要新增 task 下游状态字段与详情页 |
-| R9 管理侧事件推送 | 未开始 | 与 R6 共用通道 |
-| R10 arm64-gnu / 动态版本标 | 未开始 | 本期只把 `BUILD_TAG` 更新为当前部署标 |
+| R9 管理侧事件推送 | 未开始 | 与 R6 共用通道；当前只有管理台拉取 |
+| R10 arm64-gnu / 动态版本标 | 未开始 | 本轮不扩发布矩阵 |
 
-本期交付标准以第 7 节验收为准；R1/R2/R4–R10 不会因为文档存在而被误标为已完成。
+本轮交付标准以第 7 节验收为准；R4、R7–R10 不会因为文档存在而被误标为已完成。

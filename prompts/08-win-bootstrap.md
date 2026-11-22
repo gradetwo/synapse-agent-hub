@@ -177,11 +177,12 @@ Get-Content .\patch.diff -Raw | & $BIN win-send --stdin
 ## 阶段 8：交付产物
 
 ```powershell
-& $BIN deliver --file .\out\result.patch --kind patch --title "<标题>" --base-sha <7-64位hex> --checks '{\"built\":true}'
-# → {"ok":true,"sha256":"...","submission_id":"...","state":"delivered"}
+"task=$TASK_ID`nbase=<7-64位hex>`nbuilt=ok" | Set-Content .\out\RECEIPT.md
+& $BIN deliver --file .\out\result.patch --file .\out\RECEIPT.md --task $TASK_ID --kind patch --title "<标题>" --base-sha <7-64位hex> --checks '{\"built\":true,\"tests\":{\"passed\":0,\"failed\":0}}'
+# → {"ok":true,"files":[...],"submission_id":"...","task_id":"...","state":"delivered"}
 ```
 
-`base_sha` 必须 7-64 位合法 hex；token 不进产物。
+`base_sha` 必须 7-64 位合法 hex；代码类交付必须同时带补丁与回执，否则服务端 422；token 不进产物。
 
 ## 处理纪律
 

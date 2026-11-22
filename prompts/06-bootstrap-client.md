@@ -321,8 +321,10 @@ while :; do
   SUB_ID=""
   if [ -f out/result.patch ]; then
     BASE_SHA="${BASE_SHA:-$(git rev-parse --short HEAD 2>/dev/null || true)}"
-    DELIVER_ARGS=(--file out/result.patch --kind patch --title "任务 ${TASK_ID:-$SEQ} 交付" \
-      --checks '{"built":true}')
+    # S3 格式门：代码交付必须同时有补丁与回执；缺回执会被 422 拒绝
+    printf 'task=%s\nbase=%s\nbuilt=ok\n' "${TASK_ID:-$SEQ}" "$BASE_SHA" > out/RECEIPT.md
+    DELIVER_ARGS=(--file out/result.patch --file out/RECEIPT.md --kind patch --title "任务 ${TASK_ID:-$SEQ} 交付" \
+      --checks '{"built":true,"tests":{"passed":0,"failed":0}}')
     [ -n "$TASK_ID" ] && DELIVER_ARGS+=(--task "$TASK_ID")
     [ -n "$BASE_SHA" ] && DELIVER_ARGS+=(--base-sha "$BASE_SHA")
     if ! DELIVERY="$("$BIN" deliver "${DELIVER_ARGS[@]}")"; then
@@ -388,6 +390,8 @@ done
 - 长任务保持心跳；`task-claim` 租约 10 分钟，心跳会自动续租，但不要停掉后台 `run`。
 - 不把 token 写进日志、消息 payload 或交付物。
 - 产物先 upload 再建 submission；`deliver` 已封装这两步；`base_sha` 必须是 7-64 位合法 hex。
+- 代码类交付必须同时带补丁（`*.patch`/`*.diff`）与回执（`RECEIPT.md`/`*-receipt.*`），
+  报告类必须带正文（`*.md`/`*.txt`/`*.pdf`）；缺文件会被服务端 422 拒绝并列出 missing。
 - 连接断开时不要重建配置，等待后台 `run` 自动重连（或按 `ensure_run` 重新拉起）。
 - 只有人类明确要求停/汇报、管理员下发停止指令、平台强制交还，才允许停止；停止时按下面格式汇报。
 

@@ -10,7 +10,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "task-scope-20261122";
+const BUILD_TAG = "dispatch-s1s6-20261122";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.1";
 
@@ -924,22 +924,74 @@ async function admin(req: Request, env: Env, url: URL) {
     if (action === "tasks" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
       const quota = await projectQuota(env, project);
-      return stub.fetch(new Request("https://do/tasks/create", {
+      const r = await stub.fetch(new Request("https://do/tasks/create", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...b, project, sender: "admin", max_per_min: quota.maxMsgsPerMin }),
       }));
+      const d: any = await r.json().catch(() => ({}));
+      // S5：旧 DO 实例不带 wake 时由 Worker 补齐；定向消息本身已经落库。
+      if (r.ok && d?.task_id && b.to) {
+        const ar = await stub.fetch(new Request("https://do/agent/list"));
+        const ad: any = await ar.json().catch(() => ({ agents: [] }));
+        const hb = (ad.agents ?? []).find((a: any) => a.agent_id === b.to);
+        const age = hb?.last_hb_ms ? Date.now() - Number(hb.last_hb_ms) : Infinity;
+        d.wake = d.wake ?? { channel: "inbox", target: b.to, online: age <= 300_000,
+                             alive: age <= 120_000 ? "alive" : age <= 300_000 ? "late" : "offline" };
+      }
+      return Response.json(d, { status: r.status });
     }
-    if (action === "tasks" && req.method === "GET") return stub.fetch(new Request("https://do/tasks/list"));
+    if (action === "tasks" && req.method === "GET") {
+      const r = await stub.fetch(new Request("https://do/tasks/list"));
+      if (!r.ok) return r;
+      const data: any = await r.json().catch(() => ({ tasks: [] }));
+      // S4：任务台账直接显示待裁决数；旧 task 对象没有该字段，按 D1 实时补齐。
+      const counts = await env.DB.prepare(
+        `SELECT task_id, COUNT(*) AS n FROM submissions
+          WHERE project = ? AND task_id IS NOT NULL AND state != 'archived'
+            AND review_state IN ('pending', 'accepted')
+          GROUP BY task_id`
+      ).bind(project).all<any>().catch(() => ({ results: [] }));
+      const byTask = new Map((counts.results ?? []).map((x: any) => [x.task_id, Number(x.n ?? 0)]));
+      // S5：旧 DO 实例只给 claimed 的 owner_online；open 定向任务的 to_online 由 Worker 补齐。
+      const ar = await stub.fetch(new Request("https://do/agent/list"));
+      const ad: any = await ar.json().catch(() => ({ agents: [] }));
+      const hbBy = new Map((ad.agents ?? []).map((a: any) => [a.agent_id, Number(a.last_hb_ms ?? 0)]));
+      data.tasks = (data.tasks ?? []).map((t: any) => {
+        const target = t.owner ?? t.to;
+        const age = target ? Date.now() - Number(hbBy.get(target) ?? 0) : Infinity;
+        return {
+          ...t,
+          pending_review: byTask.get(t.task_id ?? t.id) ?? 0,
+          to_online: !t.owner && t.to ? (t.to_online ?? age <= 300_000) : null,
+          to_alive: !t.owner && t.to
+            ? (t.to_alive ?? (age <= 120_000 ? "alive" : age <= 300_000 ? "late" : "offline")) : null,
+        };
+      });
+      return Response.json(data);
+    }
     // 任务四个出口里的管理侧动作：关单、取回、转派。sender 固定 admin，不接受客户端伪造。
     if (["tasks/close", "tasks/reclaim", "tasks/reassign"].includes(action) && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
       if (!String(b.task_id ?? "").trim()) return err(422, "task_id_required");
       const doAction = action === "tasks/close" ? "tasks/admin-close"
         : action === "tasks/reclaim" ? "tasks/admin-reclaim" : "tasks/admin-reassign";
-      return stub.fetch(new Request("https://do/" + doAction, {
+      const dr = await stub.fetch(new Request("https://do/" + doAction, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ ...b, project, sender: "admin" }),
       }));
+      const d: any = await dr.json().catch(() => ({}));
+      // S2/S5：旧 DO 的 reassigned 消息缺 title/body，转派成功后补一条定向任务简报。
+      let brief: any = null;
+      if (action === "tasks/reassign" && dr.ok && b.to) {
+        try {
+          brief = await publishTaskBrief(env, project, String(b.task_id), String(b.to),
+                                         String(b.reason ?? "").slice(0, 240));
+        } catch (e: any) {
+          brief = { error: "brief_failed", detail: String(e?.message ?? e) };
+        }
+        d.brief = brief;
+      }
+      return Response.json(d, { status: dr.status });
     }
     if (action === "snapshot") return stub.fetch(new Request("https://do/snapshot"));
 
@@ -985,8 +1037,9 @@ async function admin(req: Request, env: Env, url: URL) {
       return json({ agent: ag, hb: hb.results ?? [], submissions: subs.results ?? [], messages: msgs });
     }
 
-    // 定向指令：发给一个或多个 agent（不是广播）
-    if (action === "send" && req.method === "POST") {
+    // 定向指令：发给一个或多个 agent（不是广播）。
+    // S6 兼容入口：POST /messages 与 /send 等价，旧管理脚本不用改路径。
+    if ((action === "send" || action === "messages") && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
       const targets: string[] = Array.isArray(b.to) ? b.to.filter(Boolean) : b.to ? [String(b.to)] : [];
       if (!targets.length) return err(422, "target_required");
@@ -1006,7 +1059,7 @@ async function admin(req: Request, env: Env, url: URL) {
         }));
         out.push({ to: t, ...(await r.json<any>().catch(() => ({}))) });
       }
-      return json({ ok: true, sent: out });
+      return json({ ok: true, sent: out, channel: "inbox" });
     }
 
     // 消息历史：管理员看全量（含定向私信），不分页滚动，取最近 N 条
@@ -1048,34 +1101,45 @@ async function admin(req: Request, env: Env, url: URL) {
         const obj = await env.BLOBS.head(`p/${project}/artifacts/${r.sha256}`);
         if (!obj) return err(422, `blob_missing:${r.sha256}`);
       }
-      const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id).trim();
-      if (taskId !== null) {
-        if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
-        const t = await taskMeta(env, project, taskId);
-        if (!t) return err(422, `task_not_found:${taskId}`);
-        if (t.state === "done") return err(409, `task_done:${taskId}`);
-      }
+      const kind = String(b.kind ?? "patch");
+      const allowOvertake = b.allow_overtake === true;
+      const overtakeReason = String(b.overtake_reason ?? "").trim().slice(0, 240);
+      if (allowOvertake && !overtakeReason) return err(422, "overtake_reason_required");
+      const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, allowOvertake, false);
+      if (bind.error) return bind.error;
+      const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
+      if (missing.length) return deliveryFormatError(kind, missing);
+      const taskId = bind.taskId;
       const sid = String(b.submission_id).trim();
       const now = Date.now();
       const res = await env.DB.prepare(
         `INSERT OR IGNORE INTO submissions
-         (project, submission_id, agent_id, task_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
-      ).bind(project, sid, agentId, taskId, b.base_sha, b.kind ?? "patch", b.title ?? "",
+         (project, submission_id, agent_id, task_id, task_assignee, overtake, overtake_reason,
+          base_sha, kind, title, refs_json, checks_json, state, review_state, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'delivered', 'pending', ?, ?)`
+      ).bind(project, sid, agentId, taskId, bind.assigneeAtSubmit, bind.overtake ? 1 : 0,
+             bind.overtake ? overtakeReason : null,
+             b.base_sha, kind, b.title ?? "",
              JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
       if (res.meta.changes === 0) {
         const old = await env.DB.prepare(
           "SELECT agent_id FROM submissions WHERE project = ? AND submission_id = ?"
         ).bind(project, sid).first<any>();
         if (old?.agent_id !== agentId) return err(409, "submission_id_conflict");
-        return json({ submission_id: sid, state: "delivered", deduped: true, seq: null });
+        return json({ submission_id: sid, state: "delivered", deduped: true, seq: null,
+                      task_id: taskId, task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound });
       }
       const seq = await stub.fetch(new Request("https://do/publish", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind: b.kind ?? "patch",
-                               payload: { submission_id: sid, task_id: taskId }, dedupe_key: `sub:${sid}` }),
+        body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind,
+                               payload: { submission_id: sid, task_id: taskId,
+                                          task_assignee: bind.assigneeAtSubmit,
+                                          overtake: bind.overtake, overtake_reason: bind.overtake ? overtakeReason : null },
+                               dedupe_key: `sub:${sid}` }),
       }));
-      return Response.json({ submission_id: sid, state: "delivered", seq: await seq.json() });
+      return Response.json({ submission_id: sid, state: "delivered", task_id: taskId,
+                             task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                             overtake: bind.overtake, seq: await seq.json() });
     }
 
     const bun = action.match(/^submissions\/([^/]+)\/bundle$/);
@@ -1083,14 +1147,18 @@ async function admin(req: Request, env: Env, url: URL) {
 
     if (action === "submissions" && req.method === "GET") {
       const state = url.searchParams.get("state") ?? "";
+      const taskId = url.searchParams.get("task_id") ?? "";
+      const review = url.searchParams.get("review_state") ?? "";
       const valid = ["delivered", "collected", "archived"].includes(state);
-      const sql = valid
-        ? `SELECT * FROM submissions WHERE project = ? AND state = ? ORDER BY created_at DESC LIMIT 100`
-        : `SELECT * FROM submissions WHERE project = ? ORDER BY created_at DESC LIMIT 100`;
-      const stmt = valid
-        ? env.DB.prepare(sql).bind(project, state)
-        : env.DB.prepare(sql).bind(project);
-      const rows = await stmt.all();
+      const validReview = ["pending", "accepted", "approved", "rejected"].includes(review);
+      const cond = ["project = ?"];
+      const vals: any[] = [project];
+      if (valid) { cond.push("state = ?"); vals.push(state); }
+      if (taskId && /^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) { cond.push("task_id = ?"); vals.push(taskId); }
+      if (validReview) { cond.push("review_state = ?"); vals.push(review); }
+      const rows = await env.DB.prepare(
+        `SELECT * FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
+      ).bind(...vals).all();
       return Response.json(rows.results);
     }
 
@@ -1098,32 +1166,57 @@ async function admin(req: Request, env: Env, url: URL) {
     if (col && req.method === "POST") {
       const [, id, op] = col;
       const row = await env.DB.prepare(
-        "SELECT submission_id, task_id FROM submissions WHERE project = ? AND submission_id = ?"
+        "SELECT submission_id, task_id, kind, state, review_state FROM submissions WHERE project = ? AND submission_id = ?"
       ).bind(project, id).first<any>();
       if (!row) return err(404, "submission_not_found");
       if (op === "result") {
         const b: any = await req.json().catch(() => ({}));
-        await env.DB.prepare(`UPDATE submissions SET result = ?, updated_at = ? WHERE project = ? AND submission_id = ?`)
-          .bind(b.result, Date.now(), project, id).run();
-        return Response.json({ ok: true });
+        const raw = String(b.result ?? "").trim();
+        const verdict = raw.toLowerCase();
+        const allowed = ["pending", "accepted", "approved", "rejected"];
+        if (!allowed.includes(verdict)) {
+          // 兼容旧客户端：非枚举文本只当人工评语，不动裁决态。
+          await env.DB.prepare(`UPDATE submissions SET result = ?, updated_at = ? WHERE project = ? AND submission_id = ?`)
+            .bind(raw, Date.now(), project, id).run();
+          return json({ ok: true, review_state: row.review_state ?? "pending", legacy: true });
+        }
+        const note = String(b.note ?? "").trim().slice(0, 4000);
+        const now = Date.now();
+        await env.DB.prepare(
+          `UPDATE submissions
+              SET review_state = ?, result = ?, reviewed_at = ?, reviewed_by = 'admin', updated_at = ?
+            WHERE project = ? AND submission_id = ?`
+        ).bind(verdict, note || raw, now, now, project, id).run();
+        // approved 可能在 collect 之后才到；这里立即按 D1 状态结算。
+        let taskLink: any = null;
+        if (verdict === "approved" && row.task_id) {
+          try { taskLink = await settleTaskAfterSubmission(env, project, row.task_id, "approval"); }
+          catch (e: any) { taskLink = { error: "settle_unreachable", detail: String(e?.message ?? e) }; }
+        }
+        return json({ ok: true, review_state: verdict, task_id: row.task_id ?? null, task_link: taskLink });
       }
       const state = op === "collect" ? "collected" : "archived";
-      await env.DB.prepare(`UPDATE submissions SET state = ?, updated_at = ? WHERE project = ? AND submission_id = ?`)
-        .bind(state, Date.now(), project, id).run();
-      // 联动：这件交付挂在某个任务上时，通知 DO 重算该任务的待取数；
-      // 任务处于 released 且待取归零，DO 会把它收成 done。
-      // 通知失败不回滚已落库的取走状态，但必须在响应里响亮标出，不许静默脱钩。
+      const wasPending = row.review_state === "pending" || row.review_state === null;
+      // 代码类取走即视为验收通过（S1 的自动 done 语义）；报告类只进入 accepted 待裁决（S4）。
+      const review = op === "collect" && wasPending
+        ? (String(row.kind) === "report" ? "accepted" : "approved")
+        : row.review_state;
+      const now = Date.now();
+      await env.DB.prepare(
+        `UPDATE submissions SET state = ?, review_state = COALESCE(?, review_state),
+           reviewed_at = CASE WHEN ? = 'approved' AND reviewed_at IS NULL THEN ? ELSE reviewed_at END,
+           reviewed_by = CASE WHEN ? = 'approved' AND reviewed_by IS NULL THEN 'collection' ELSE reviewed_by END,
+           updated_at = ?
+          WHERE project = ? AND submission_id = ?`
+      ).bind(state, review, review, now, review, now, project, id).run();
+      // 联动：这件交付挂在某个任务上时，由 Worker 按 D1 的待取/待批状态结算。
+      // 结算失败不回滚已落库的取走状态，但必须在响应里响亮标出，不许静默脱钩。
       let taskLink: any = null;
       if (row.task_id) {
         try {
-          const dr = await stub.fetch(new Request("https://do/tasks/submission-settled", {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ project, task_id: row.task_id, submission_id: id, sender: "admin" }),
-          }));
-          taskLink = await dr.json().catch(() => null);
-          if (!dr.ok) taskLink = { error: "do_http_" + dr.status, detail: taskLink };
+          taskLink = await settleTaskAfterSubmission(env, project, row.task_id, "collection");
         } catch (e: any) {
-          taskLink = { error: "do_unreachable", detail: String(e?.message ?? e) };
+          taskLink = { error: "settle_unreachable", detail: String(e?.message ?? e) };
         }
       }
       return Response.json({ ok: true, task_link: taskLink });
@@ -1389,6 +1482,8 @@ async function bundleSubmission(env: Env, project: string, id: string) {
   try { checks = JSON.parse(row.checks_json ?? "{}"); } catch { checks = {}; }
   const prov = {
     project, submission_id: row.submission_id, agent_id: row.agent_id, base_sha: row.base_sha,
+    task_id: row.task_id ?? null, task_assignee: row.task_assignee ?? null,
+    review_state: row.review_state ?? "pending", overtake: !!row.overtake,
     kind: row.kind, title: row.title, state: row.state, checks,
     created_at: row.created_at, updated_at: row.updated_at,
     refs: normalized.map((r) => ({ sha256: r?.sha256, name: r?.name, bytes: r?.bytes })),
@@ -1433,6 +1528,131 @@ function normalizeRefs(raw: unknown): { refs: NormalizedRef[]; error?: string } 
   return { refs };
 }
 
+/** 任务板快照：只在交付缺省 task_id 时用一次，避免 agent 名下多任务时猜错单。 */
+async function projectTasks(env: Env, project: string): Promise<any[]> {
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  const r = await stub.fetch(new Request("https://do/tasks/list"));
+  if (!r.ok) return [];
+  const data = await r.json<any>().catch(() => ({ tasks: [] }));
+  return Array.isArray(data?.tasks) ? data.tasks : [];
+}
+
+type TaskBinding = {
+  taskId: string | null;
+  task: any | null;
+  autoBound: boolean;
+  overtake: boolean;
+  assigneeAtSubmit: string | null;
+  error?: Response;
+};
+
+/**
+ * S1/S2：交付绑定与越单校验。
+ * - 显式 task_id：校验存在、非 done、提交者是 owner 或被指派者；
+ * - 缺省 task_id：该 agent 名下恰好一件 claimed 任务时自动绑定，多件则要求显式指定；
+ * - 管理侧代建可显式 allowOvertake，落库标记「越单」并留理由。
+ */
+async function resolveSubmissionTask(
+  env: Env, project: string, agentId: string, rawTaskId: unknown,
+  allowOvertake = false, requireClaimed = true
+): Promise<TaskBinding> {
+  let taskId = rawTaskId === undefined || rawTaskId === null || String(rawTaskId).trim() === ""
+    ? null : String(rawTaskId).trim();
+  let autoBound = false;
+  if (taskId === null) {
+    const mine = (await projectTasks(env, project))
+      .filter((t: any) => t.state === "claimed" && t.owner === agentId);
+    if (mine.length === 1) {
+      taskId = String(mine[0].task_id ?? mine[0].id ?? "").trim() || null;
+      autoBound = taskId !== null;
+    } else if (mine.length > 1) {
+      return { taskId: null, task: null, autoBound: false, overtake: false, assigneeAtSubmit: null,
+        error: json({ error: "task_id_required", reason: "当前有多件 claimed 任务，必须显式带 task_id",
+                      candidates: mine.map((t: any) => t.task_id ?? t.id).slice(0, 20) }, 409) };
+    }
+  }
+  if (taskId === null)
+    return { taskId: null, task: null, autoBound: false, overtake: false, assigneeAtSubmit: null };
+
+  if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId))
+    return { taskId: null, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
+             error: err(422, "bad_task_id") };
+  const t = await taskMeta(env, project, taskId);
+  if (!t)
+    return { taskId, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
+             error: err(422, `task_not_found:${taskId}`) };
+  if (t.state === "done")
+    return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: null,
+             error: err(409, `task_done:${taskId}`) };
+
+  const isOwner = t.state === "claimed" && t.owner === agentId;
+  const isAssigned = t.to === agentId && t.state !== "done";
+  const assigned = requireClaimed ? isOwner : (isOwner || isAssigned);
+  if (!assigned && !allowOvertake) {
+    return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
+      error: json({ error: requireClaimed && isAssigned ? "task_not_claimed" : "task_not_assignee",
+                    task_id: taskId, task_state: t.state,
+                    task_owner: t.owner ?? null, task_to: t.to ?? null,
+                    hint: requireClaimed
+                      ? "交付前先 task-claim，且只能交自己 claim 的任务"
+                      : "只能交付自己 owner 或被指派的任务；管理侧代建可用 allow_overtake 留痕" }, 409) };
+  }
+  return { taskId, task: t, autoBound, overtake: !assigned,
+           assigneeAtSubmit: t.owner ?? t.to ?? null };
+}
+
+/**
+ * S3：交付格式门。代码类必须同时有补丁与回执，报告类必须有正文；
+ * 只按文件名判断，不读内容，避免 Worker 为校验再下载一遍大文件。
+ */
+function deliveryFormatMissing(kindRaw: unknown, refs: NormalizedRef[]): string[] {
+  const kind = String(kindRaw ?? "patch").trim().toLowerCase();
+  const base = (r: NormalizedRef) =>
+    String(r.name ?? "").replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  const names = refs.map(base).filter(Boolean);
+  const has = (re: RegExp) => names.some((n) => re.test(n));
+
+  if (kind === "report") {
+    const body = has(/\.(md|markdown|txt|pdf|html|docx)$/i)
+      || names.some((n) => /report|报告/.test(n));
+    return body ? [] : ["report_body"];
+  }
+  if (kind === "patch" || kind === "bundle") {
+    const missing: string[] = [];
+    if (!has(/\.(patch|diff)$/i) && !names.some((n) => /patch|diff/.test(n))) missing.push("patch_file");
+    if (!has(/(^|[-_.])(receipt|回执)([-_.]|$)/i) && !names.some((n) => n.startsWith("receipt") || n.startsWith("回执")))
+      missing.push("receipt_file");
+    return missing;
+  }
+  return [];
+}
+
+/** R2：代码类交付的自测计数必须结构化，不能只写 built=true。 */
+function deliveryChecksMissing(kindRaw: unknown, checksRaw: unknown): string[] {
+  const kind = String(kindRaw ?? "patch").trim().toLowerCase();
+  if (kind !== "patch" && kind !== "bundle") return [];
+  const c: any = checksRaw && typeof checksRaw === "object" ? checksRaw : {};
+  const nums = (o: any) => Number.isFinite(Number(o?.passed)) && Number.isFinite(Number(o?.failed));
+  if (nums(c.tests) || nums(c)) return [];
+  const suites = c.suites;
+  if (Array.isArray(suites) && suites.length > 0
+      && suites.every((s: any) => String(s?.name ?? "").trim() && nums(s))) return [];
+  return ["checks_tests"];
+}
+
+/** 交付格式门的统一错误体：缺什么、期望什么，一次说清，避免 agent 反复猜。 */
+function deliveryFormatError(kind: string, missing: string[]) {
+  const expected: Record<string, string> = {
+    patch_file: "*.patch 或 *.diff（代码补丁）",
+    receipt_file: "RECEIPT.md 或 *-receipt.*（执行回执）",
+    report_body: "*.md / *.txt / *.pdf（报告正文）",
+    checks_tests: 'checks 里带 {"tests":{"passed":N,"failed":M}} 或 suites[]',
+  };
+  return json({ error: "delivery_format_incomplete", kind,
+                missing, required: missing.map((m) => expected[m] ?? m),
+                hint: "代码类交付必须含补丁、回执与结构化自测计数；报告类必须含正文。补齐后重新提交。" }, 422);
+}
+
 /** 读一个任务的元数据；只走 DO 的内部接口，不把任务正文暴露给普通 agent。 */
 async function taskMeta(env: Env, project: string, taskId: string): Promise<any | null> {
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
@@ -1442,6 +1662,77 @@ async function taskMeta(env: Env, project: string, taskId: string): Promise<any 
   }));
   if (!r.ok) return null;
   return r.json<any>().catch(() => null);
+}
+
+/** 旧 DO 的 reassigned 生命周期消息只带 prev/reason，不带正文；Worker 在转派后补一条任务简报。 */
+async function publishTaskBrief(
+  env: Env, project: string, taskId: string, to: string, reason: string
+): Promise<any | null> {
+  const t = (await projectTasks(env, project)).find((x: any) => (x.task_id ?? x.id) === taskId);
+  if (!t || !to) return null;
+  const quota = await projectQuota(env, project);
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  const r = await stub.fetch(new Request("https://do/publish", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ project, sender: "admin", topic: "task", kind: "task", to,
+                           payload: { task_id: taskId, title: t.title ?? "", body: t.body ?? "",
+                                      reassigned: true, reason },
+                           max_per_min: quota.maxMsgsPerMin,
+                           dedupe_key: `task-brief:${taskId}:${to}:${Date.now()}` }),
+  }));
+  return r.json<any>().catch(() => null);
+}
+
+/**
+ * S1/S4：Worker 侧兜底结算。旧 DO 实例只会在 released 时收单，
+ * 这里按 D1 的取走/裁决状态决定是否用 admin-close 收尾，避免升级期空窗。
+ */
+async function settleTaskAfterSubmission(
+  env: Env, project: string, taskId: string, closedBy: "collection" | "approval" = "collection"
+): Promise<any | null> {
+  const t = await taskMeta(env, project, taskId);
+  if (!t) return null;
+  const pendingRow = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM submissions WHERE project = ? AND task_id = ? AND state = 'delivered'"
+  ).bind(project, taskId).first<any>().catch(() => ({ n: 0 }));
+  const reviewRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM submissions
+      WHERE project = ? AND task_id = ? AND state != 'archived'
+        AND review_state IN ('pending', 'accepted')`
+  ).bind(project, taskId).first<any>().catch(() => ({ n: 0 }));
+  const reportRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM submissions
+      WHERE project = ? AND task_id = ? AND kind = 'report'
+        AND state != 'archived' AND review_state != 'approved'`
+  ).bind(project, taskId).first<any>().catch(() => ({ n: 0 }));
+  const pending = Number(pendingRow?.n ?? 0);
+  const pendingReview = Number(reviewRow?.n ?? 0);
+  const unapproved = Number(reportRow?.n ?? 0);
+  if (t.state === "done") return { ok: true, task_id: taskId, state: "done",
+                                   pending_submissions: 0, pending_review: pendingReview, already: true };
+  const canClose = pending === 0 && unapproved === 0
+    && (t.state === "claimed" || t.state === "released");
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  if (canClose) {
+    const dr = await stub.fetch(new Request("https://do/tasks/admin-close", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, task_id: taskId, sender: "admin",
+                             reason: closedBy === "approval" ? "交付 approved，自动关单" : "最后一件交付已取走，自动关单",
+                             closed_by: closedBy }),
+    }));
+    const d = await dr.json<any>().catch(() => ({}));
+    if (!dr.ok) return { error: "do_http_" + dr.status, detail: d };
+    return { ok: true, task_id: taskId, state: "done", pending_submissions: 0,
+             pending_review: pendingReview, unapproved_reports: unapproved,
+             closed_by: closedBy };
+  }
+  const dr = await stub.fetch(new Request("https://do/tasks/submission-settled", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ project, task_id: taskId, sender: "admin", closed_by: closedBy }),
+  }));
+  const d = await dr.json<any>().catch(() => ({}));
+  if (!dr.ok) return { error: "do_http_" + dr.status, detail: d };
+  return { ...d, pending_review: pendingReview, unapproved_reports: unapproved };
 }
 
 async function createSubmission(req: Request, env: Env, project: string, agentId: string) {
@@ -1460,20 +1751,20 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
     const head = await env.BLOBS.head(`p/${project}/artifacts/${r.sha256}`);
     if (!head) return err(422, `blob_missing:${r.sha256}`);
   }
-  const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id).trim();
-  if (taskId !== null) {
-    if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
-    const t = await taskMeta(env, project, taskId);
-    if (!t) return err(422, `task_not_found:${taskId}`);
-    if (t.state === "done") return err(409, `task_done:${taskId}`);
-    if (t.state !== "claimed" || t.owner !== agentId) return err(409, `task_not_claimed:${taskId}`);
-  }
+  const kind = String(b.kind ?? "patch");
+  const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, false, true);
+  if (bind.error) return bind.error;
+  const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
+  if (missing.length) return deliveryFormatError(kind, missing);
+  const taskId = bind.taskId;
   const now = Date.now();
   const res = await env.DB.prepare(
     `INSERT OR IGNORE INTO submissions
-     (project, submission_id, agent_id, task_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
-  ).bind(project, sid, agentId, taskId, b.base_sha, b.kind ?? "patch", b.title ?? "",
+     (project, submission_id, agent_id, task_id, task_assignee, overtake, overtake_reason,
+      base_sha, kind, title, refs_json, checks_json, state, review_state, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'delivered', 'pending', ?, ?)`
+  ).bind(project, sid, agentId, taskId, bind.assigneeAtSubmit, bind.overtake ? 1 : 0, null,
+         b.base_sha, kind, b.title ?? "",
          JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
   if (res.meta.changes === 0) {
     // 幂等只对“同一个 agent 的同一份交付”成立；别的 agent 抢了 ID 必须拒绝。
@@ -1481,19 +1772,23 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
       "SELECT agent_id FROM submissions WHERE project = ? AND submission_id = ?"
     ).bind(project, sid).first<any>();
     if (old?.agent_id !== agentId) return err(409, "submission_id_conflict");
-    return json({ submission_id: sid, state: "delivered", deduped: true, seq: null });
+    return json({ submission_id: sid, state: "delivered", deduped: true, seq: null,
+                  task_id: taskId, task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound });
   }
 
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
   const seqRes = await stub.fetch(new Request("https://do/publish", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind: b.kind ?? "patch",
-                           payload: { submission_id: sid, task_id: taskId, base_sha: b.base_sha,
-                                      title: b.title ?? "", agent_id: agentId },
+    body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind,
+                           payload: { submission_id: sid, task_id: taskId,
+                                      task_assignee: bind.assigneeAtSubmit,
+                                      base_sha: b.base_sha, title: b.title ?? "", agent_id: agentId },
                            dedupe_key: `sub:${sid}` }),
   }));
   const seq = await seqRes.json<any>().catch(() => ({}));
-  return json({ submission_id: sid, state: "delivered", seq: seq.seq ?? null });
+  return json({ submission_id: sid, state: "delivered", task_id: taskId,
+                task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                seq: seq.seq ?? null });
 }
 
 // ── 会话（HttpOnly cookie + HMAC 签名）─────────────────────

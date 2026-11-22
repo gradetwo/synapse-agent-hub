@@ -81,33 +81,34 @@ $BIN upload $COMMON --file out/0049.patch
 $BIN submit $COMMON --kind patch --title "UI: 折叠态记忆" \
   --ref "85ce...:0049.patch" \
   --base-sha e5a17c93 \
-  --checks '{"built":true,"tests":"15/15"}'
+  --checks '{"built":true,"tests":{"passed":15,"failed":0}}'
 # {"submission_id":"sub-my-agent-...","state":"delivered","seq":N}
 ```
 
 ### 4.2 一条龙（推荐给回合制 agent）
 
 ```bash
-$BIN deliver $COMMON --file out/0049.patch \
+printf 'task=<task_id>\nbase=e5a17c93\nbuilt=ok\n' > out/RECEIPT.md
+$BIN deliver $COMMON --file out/0049.patch --file out/RECEIPT.md \
   --kind patch --title "UI: 折叠态记忆" --base-sha e5a17c93 \
-  --checks '{"built":true}'
-# {"ok":true,"sha256":"...","bytes":39,
-#  "submission_id":"sub-...","state":"delivered","seq":N}
+  --checks '{"built":true,"tests":{"passed":15,"failed":0}}'
+# {"ok":true,"files":[...],"submission_id":"sub-...","task_id":"...","state":"delivered","seq":N}
 ```
 
 `deliver` 一次工具调用完成「上传 + 建单」，特别适合「回合内处理完任务、当场交付」的场景。
+代码类交付必须同时带补丁（`*.patch`/`*.diff`）与回执（`RECEIPT.md`/`*-receipt.*`），否则服务端 422。
 若 submit 失败，错误信息会带上已上传的 sha256，方便用 `submit --ref` 单独重试（幂等）。
 
 ### 4.3 参数与校验
 
 | 参数 | 说明 |
 |---|---|
-| `--file` | upload/deliver 必填，本地文件路径 |
+| `--file` | upload/deliver 必填；deliver 可重复传多个（补丁 + 回执） |
 | `--kind` | 交付类型，默认 `patch` |
 | `--title` | 交付标题 |
 | `--base-sha` | 7-64 位小写 hex；省略时取 `git rev-parse --short HEAD`；非 git 环境必须显式给 |
 | `--ref <sha>[:<name>]` | submit 必填，可重复；sha 是 upload 返回的 64 位 hex |
-| `--checks` | JSON 字符串，如 `'{"built":true}'` |
+| `--checks` | JSON 字符串；代码类必须带 `{"tests":{"passed":N,"failed":M}}` 或 `suites[]` |
 | `--notes` | 备注 |
 | `--sid` | 自定义 submission_id（默认 `sub-{agent}-{ms hex}`） |
 

@@ -71,6 +71,11 @@ if (location.search.includes("reset=1")) {
   .badge.released{color:#ffd58a;border-color:#674b18;background:#241b0e}
   .badge.blocked{color:#ff9b9b;border-color:#5b2626;background:#211012}
   .badge.done{color:#86d99e;border-color:#1d3a25;background:#101b13}
+  .badge.pending{color:#ffd58a;border-color:#674b18;background:#241b0e}
+  .badge.accepted{color:#8fb8ff;border-color:#24406e;background:#101a2a}
+  .badge.approved{color:#86d99e;border-color:#1d3a25;background:#101b13}
+  .badge.rejected{color:#ff9b9b;border-color:#5b2626;background:#211012}
+  .badge.overtake{color:#ffb86b;border-color:#6b4218;background:#24180e}
   .taskForm .row{grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr)}
   .taskForm .row3{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:10px;align-items:center}
   .taskForm .row3 > .muted{grid-column:1/-1;font-size:11px;line-height:1.5}
@@ -457,9 +462,9 @@ if (location.search.includes("reset=1")) {
     </div>
     <table>
       <thead><tr>
-        <th>任务</th><th>状态</th><th>执行节点</th><th>租约</th><th class="num">待取</th><th>更新</th><th>操作</th>
+        <th>任务</th><th>状态</th><th>执行节点</th><th>租约</th><th class="num">待取</th><th class="num">裁决</th><th>更新</th><th>操作</th>
       </tr></thead>
-      <tbody id="tasks"><tr><td colspan="7" class="empty">选择具体项目查看任务</td></tr></tbody>
+      <tbody id="tasks"><tr><td colspan="8" class="empty">选择具体项目查看任务</td></tr></tbody>
     </table>
   </div>
 
@@ -467,9 +472,9 @@ if (location.search.includes("reset=1")) {
     <h2>交付箱 <span class="muted" id="subStat"></span></h2>
     <table>
       <thead><tr>
-        <th>提交</th><th>来源</th><th>基线</th><th>类型</th><th>状态</th><th>时间</th><th></th>
+        <th>提交</th><th>任务</th><th>来源</th><th>类型</th><th>状态</th><th>裁决</th><th>时间</th><th>操作</th>
       </tr></thead>
-      <tbody id="subs"><tr><td colspan="7" class="empty">暂无交付</td></tr></tbody>
+      <tbody id="subs"><tr><td colspan="8" class="empty">暂无交付</td></tr></tbody>
     </table>
   </div>
 
@@ -935,9 +940,12 @@ async function loadTasks() {
   $("tasks").innerHTML = rows.length ? rows.map((t) => {
     const id = t.task_id || t.id || "";
     const st = t.state || "open";
-    const owner = t.owner ? `<span class="mono">${t.owner}</span>` :
-      (t.to ? `<span class="muted">→ <span class="mono">${t.to}</span></span>` : "—");
+    const offline = `<span class="warnv" title="节点最近心跳超过 5 分钟或从未上线">离线</span>`;
+    const owner = t.owner
+      ? `<span class="mono">${t.owner}</span>${t.owner_online === false ? ` ${offline}` : ""}`
+      : (t.to ? `<span class="muted">→ <span class="mono">${t.to}</span></span>${t.to_online === false ? ` ${offline}` : ""}` : "—");
     const pending = Number(t.pending_submissions ?? 0);
+    const pendingReview = Number(t.pending_review ?? 0);
     const assigned = t.to || t.owner || "";
     const stale = taskIsStale(t);
     const projectTag = isAll ? `<span class="muted" style="font-size:10px">${t.project || "—"}</span><br>` : "";
@@ -948,16 +956,20 @@ async function loadTasks() {
       <button class="ghost mini" data-task-reassign="${id}">转派</button>`);
     const pendingCell = pending > 0
       ? (isAll ? `<span class="warnv">${pending}</span>` : `<button class="ghost mini" data-goto-delivery="1" title="去交付箱取走">${pending}</button>`) : "—";
-    return `<tr data-task-id="${id}" data-state="${st}" data-stale="${stale ? 1 : 0}" data-project="${t.project || current}">
+    const reviewCell = pendingReview > 0
+      ? `<button class="ghost mini" data-goto-delivery="1" title="交付箱里还有待裁决交付">${pendingReview}</button>`
+      : `<span class="muted">—</span>`;
+    return `<tr data-task-id="${id}" data-state="${st}" data-stale="${stale ? 1 : 0}" data-review="${pendingReview}" data-project="${t.project || current}">
       <td>${projectTag}<span class="mono">${id}</span><div class="muted" style="white-space:normal;max-width:240px">${t.title || ""}</div></td>
       <td><span class="badge ${st}">${taskStateLabel(st)}</span></td>
       <td>${owner}</td>
       <td>${taskLease(t)}</td>
       <td class="num">${pendingCell}</td>
+      <td class="num">${reviewCell}</td>
       <td class="muted">${t.updated_at ? ago((Date.now() - t.updated_at) / 1000) + "前" : "—"}</td>
       <td style="white-space:nowrap">${acts}</td>
     </tr>`;
-  }).join("") : `<tr><td colspan="7" class="empty">${isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件"}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">${isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件"}</td></tr>`;
   reapplyFilters();
   renderDashboard();
   syncBulkAvailability();
@@ -973,7 +985,9 @@ async function loadSubs() {
   SUB_STATE = new Map(d.map((s) => [s.submission_id, s.state]));
   const pendingRows = d.filter((s) => s.state === "delivered");
   const pending = pendingRows.length;
-  $("subStat").textContent = `${pending} 待取 / 共 ${d.length}`;
+  const pendingReview = d.filter((s) => ["pending", "accepted"].includes(s.review_state || "pending")
+    && s.state !== "archived").length;
+  $("subStat").textContent = `${pending} 待取 · ${pendingReview} 待裁决 / 共 ${d.length}`;
   BADGES.deli = pending;
   updateBadges();
   renderDeliveryAlert(pendingRows);
@@ -983,20 +997,31 @@ async function loadSubs() {
     showToast(`新增 ${add} 份交付待取；下载会自动标记为已取`, 8000);
   }
   lastPending = pending;
-  $("subs").innerHTML = d.length ? d.slice(0, 40).map(s => `
-    <tr data-state="${s.state}">
+  const revLabel = { pending: "待裁决", accepted: "已收待批", approved: "已批准", rejected: "已拒收" };
+  $("subs").innerHTML = d.length ? d.slice(0, 40).map(s => {
+    const review = s.review_state || "pending";
+    const taskCell = s.task_id
+      ? `<span class="mono">${s.task_id}</span>${s.task_assignee ? `<div class="muted" style="font-size:10px">指派 ${s.task_assignee}</div>` : ""}`
+      : `<span class="warnv">未绑定</span>`;
+    const source = `${s.agent_id}${Number(s.overtake) ? ` <span class="badge overtake" title="${esc(s.overtake_reason || "越单交付")}">越单</span>` : ""}`;
+    const actions = [
+      s.state === "delivered"
+        ? `<button class="ghost" data-collect="${s.submission_id}">下载并取走</button>`
+        : `<button class="ghost" data-dl="${s.submission_id}">下载</button>`,
+      review !== "approved" ? `<button class="ghost mini" data-sub-approve="${s.submission_id}">批准</button>` : "",
+      review !== "rejected" ? `<button class="ghost mini" data-sub-reject="${s.submission_id}">拒收</button>` : "",
+    ].filter(Boolean).join(" ");
+    return `<tr data-state="${s.state}" data-review="${review}" data-task="${s.task_id || ""}" title="base ${s.base_sha || "—"}">
       <td class="mono">${s.submission_id}</td>
-      <td>${s.agent_id}</td>
-      <td class="mono">${s.base_sha || "—"}</td>
+      <td>${taskCell}</td>
+      <td>${source}</td>
       <td>${s.kind}</td>
       <td><span class="badge ${s.state}">${{delivered:"待取",collected:"已取",archived:"归档"}[s.state]}</span></td>
+      <td><span class="badge ${review}">${revLabel[review] || review}</span></td>
       <td class="muted">${new Date(s.created_at).toLocaleString()}</td>
-      <td>
-        ${s.state === "delivered"
-          ? `<button class="ghost" data-collect="${s.submission_id}">下载并取走</button>`
-          : `<button class="ghost" data-dl="${s.submission_id}">下载</button>`}
-      </td>
-    </tr>`).join("") : `<tr><td colspan="7" class="empty">暂无交付</td></tr>`;
+      <td style="white-space:nowrap">${actions}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">暂无交付</td></tr>`;
   reapplyFilters();
   renderDashboard();
 }
@@ -1045,6 +1070,7 @@ async function downloadBundle(id, projectArg) {
       showToast(`已取走 ${id}`);
       if (project === current) {
         await loadSubs();
+        if (current !== "*") await loadTasks();
         if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);
       }
     } catch (e) {
@@ -1069,8 +1095,25 @@ async function collectAll() {
   for (const s of pending) {
     if (await downloadBundle(s.submission_id, project)) ok++;
   }
-  if (project === current) await loadSubs();
+  if (project === current) {
+    await loadSubs();
+    if (current !== "*") await loadTasks();
+  }
   showToast(`已处理 ${ok}/${pending.length} 份；未成功的仍会留在待取列表`);
+}
+
+async function reviewSub(id, verdict) {
+  if (!current || current === "*") return showToast("请先选择具体项目");
+  const row = SUB_ROWS.find((s) => s.submission_id === id);
+  const label = verdict === "approved" ? "批准" : "拒收";
+  const note = prompt(`${label} ${id} 的裁决备注`, verdict === "approved" ? "管理员确认完成" : "管理员拒收，请修正后重交");
+  if (note === null) return;
+  if (verdict === "rejected" && !note.trim()) return alert("拒收必须写理由，便于节点修正");
+  await api(`/admin/p/${current}/submissions/${id}/result`, "POST", { result: verdict, note: note.trim() });
+  showToast(verdict === "approved" ? `已批准 ${id}` : `已拒收 ${id}`, 5000);
+  await loadSubs();
+  await loadTasks();
+  if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);
 }
 
 async function broadcast() {
@@ -1539,7 +1582,8 @@ function openAgent(id, project) {
     $("dSubs").innerHTML = (d.submissions || []).map((x) => `
       <div class="row subrow"><span class="mono subid">${x.submission_id}</span><span>${x.kind}</span>
         <span class="badge ${x.state}">${x.state}</span>
-        <span class="muted mono subsha">${x.base_sha || ""}</span>
+        <span class="badge ${x.review_state || "pending"}">${{pending:"待裁决",accepted:"已收待批",approved:"已批准",rejected:"已拒收"}[x.review_state || "pending"] || "待裁决"}</span>
+        ${x.task_id ? `<span class="muted mono">${x.task_id}</span>` : `<span class="warnv">未绑定任务</span>`}
         ${x.state === "delivered"
           ? `<button class="ghost" data-collect="${x.submission_id}">下载并取走</button>`
           : `<button class="ghost" data-dl="${x.submission_id}">下载</button>`}
@@ -1884,14 +1928,18 @@ function bindFilters() {
         return (row.dataset[k] || "") === want;
       },
     });
-    else if (/^交付箱/.test(t)) addFilter(c, "搜 提交号 / agent", {
+    else if (/^交付箱/.test(t)) addFilter(c, "搜 提交号 / agent / task", {
       items: [
         { v: "all", label: "全部" },
         { v: "delivered", label: "待取" },
         { v: "collected", label: "已取" },
         { v: "archived", label: "归档" },
+        { v: "review:pending", label: "待裁决" },
+        { v: "review:approved", label: "已批准" },
+        { v: "review:rejected", label: "已拒收" },
       ],
-      test: (row, v) => v === "all" || (row.dataset.state || "") === v,
+      test: (row, v) => v === "all"
+        || (v.startsWith("review:") ? (row.dataset.review || "") === v.slice(7) : (row.dataset.state || "") === v),
     });
     else if (/^任务/.test(t)) addFilter(c, "搜任务号 / 标题 / 节点", {
       items: [
@@ -1902,9 +1950,11 @@ function bindFilters() {
         { v: "released", label: "已交付待取" },
         { v: "blocked", label: "已阻塞" },
         { v: "done", label: "已完成" },
+        { v: "review:pending", label: "待裁决" },
       ],
       test: (row, v) => v === "all"
-        || (v === "stale" ? row.dataset.stale === "1" : (row.dataset.state || "") === v),
+        || (v === "review:pending" ? Number(row.dataset.review || 0) > 0
+          : (v === "stale" ? row.dataset.stale === "1" : (row.dataset.state || "") === v)),
     });
   });
 }
@@ -2424,7 +2474,7 @@ document.addEventListener("click", async (e) => {
     const agentState = dash.getAttribute("data-dash-agent");
     if (agentState) return showCardFilter("名册", "overview", agentState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const gp = btn.getAttribute("data-goto-project");
@@ -2448,6 +2498,10 @@ document.addEventListener("click", async (e) => {
     if (dl) return downloadBundle(dl);
     const co = btn.getAttribute("data-collect");
     if (co) return collect(co);
+    const sap = btn.getAttribute("data-sub-approve");
+    if (sap) return reviewSub(sap, "approved");
+    const srj = btn.getAttribute("data-sub-reject");
+    if (srj) return reviewSub(srj, "rejected");
     const ub = btn.getAttribute("data-unblock");
     if (ub) { if (!confirm(`解除 ${ub} 的封禁？`)) return; await api("/admin/security/unblock", "POST", { ip: ub }); return loadSec(); }
     const tc = btn.getAttribute("data-task-close");

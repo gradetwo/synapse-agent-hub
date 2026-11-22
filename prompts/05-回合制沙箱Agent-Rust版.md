@@ -51,21 +51,23 @@ YANSHI_WAIT=30 HOME=$STATE "$BIN" wait &
 
 【交付 — 一条命令到位（本环境推荐）】
 # 处理完有产物要交付时，用 deliver（上传+建单一次完成）：
-HOME=$STATE "$BIN" deliver --file out/result.patch \
-  --kind patch --title "<交付标题>" --base-sha <7-64位hex> \
-  --checks '{"built":true,"tests":"15/15"}'
-# 返回 {"ok":true,"sha256":"...","submission_id":"...","state":"delivered","seq":N}
+printf 'task=<task_id>\nbase=<7-64位hex>\nbuilt=ok\n' > out/RECEIPT.md
+HOME=$STATE "$BIN" deliver --file out/result.patch --file out/RECEIPT.md \
+  --task "$TASK_ID" --kind patch --title "<交付标题>" --base-sha <7-64位hex> \
+  --checks '{"built":true,"tests":{"passed":15,"failed":0}}'
+# 返回 {"ok":true,"files":[...],"submission_id":"...","task_id":"...","state":"delivered","seq":N}
 
 # 若已单独 upload 过、只需建单，或 deliver 的 submit 失败要重试：
 HOME=$STATE "$BIN" submit --kind patch --title "<标题>" \
-  --ref "<sha256>[:<name>]" --base-sha <hex> --checks '{"built":true}'
+  --ref "<sha256>[:<name>]" --base-sha <hex> --checks '{"tests":{"passed":0,"failed":0}}'
 # 若还没上传：先 upload --file <path> 拿 ref（返回里的 ref 字段）
 
 【交付注意】
 - base_sha 必须是 7-64 位小写 hex；非 git 环境必须显式 --base-sha（不会自动取 HEAD）。
 - --ref 必须引用已上传的 blob，否则 422 blob_missing；sha 与内容不符会 422 hash_mismatch。
 - 交付物不得含密钥（AKIA/BEGIN PRIVATE KEY/ghp_/xox*），服务端会拒。
-- 多个文件：先逐个 upload，再 submit 时用多个 --ref。
+- 多个文件：`deliver` 可重复 `--file`，也可先逐个 upload 再用多个 `--ref` submit。
+- 代码类交付必须带补丁 + 回执 + 结构化 checks（`tests.passed/failed` 或 `suites[]`），缺一 422。
 
 【汇报格式 — 每轮结束输出】
 project: <PROJECT>
@@ -86,7 +88,7 @@ error: <仅失败时填写>
 - `deliver` 是本次为回合制场景新增的一体化命令；若出错会保留已上传的 sha256，
   用 `submit --ref <sha>` 单独重试即可（服务端 INSERT OR REPLACE 幂等）。
 - `--checks` 传 JSON 字符串时注意 shell 引号：外层单引号、内部双引号，
-  例如 `'{"built":true}'`；在 zsh 里引用变量拼接值请用 `${VAR}` 花括号，
+  例如 `'{"tests":{"passed":0,"failed":0}}'`；在 zsh 里引用变量拼接值请用 `${VAR}` 花括号，
   避免 `$VAR:suffix` 被错误展开。
 - `HOME=$STATE` 用于把 `~/.synapse-agent` 状态目录重定向到持久区；
   多 agent 实例各用不同 STATE 目录，不要共用同一份 config.json。

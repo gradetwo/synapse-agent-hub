@@ -61,11 +61,20 @@ CREATE TABLE IF NOT EXISTS submissions (
   refs_json     TEXT NOT NULL,
   checks_json   TEXT,
   result        TEXT,
+  review_state  TEXT NOT NULL DEFAULT 'pending',
+  reviewed_at   INTEGER,
+  reviewed_by   TEXT,
+  task_assignee TEXT,
+  overtake      INTEGER NOT NULL DEFAULT 0,
+  overtake_reason TEXT,
   state         TEXT NOT NULL DEFAULT 'delivered',
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
   PRIMARY KEY (project, submission_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_submissions_task_review
+  ON submissions (project, task_id, review_state, created_at DESC);
 
 -- 登录失败防护：按 IP 计数 + 阶梯封禁（-1 表示永久）
 CREATE TABLE IF NOT EXISTS login_guard (

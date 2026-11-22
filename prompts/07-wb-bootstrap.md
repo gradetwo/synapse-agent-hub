@@ -339,7 +339,7 @@ while :; do
   if [ -f out/result.patch ]; then
     BASE_SHA="${BASE_SHA:-$(git rev-parse --short HEAD 2>/dev/null || true)}"
     DELIVER_ARGS=(--file out/result.patch --kind patch --title "任务 ${TASK_ID:-$SEQ} 交付" \
-      --checks '{"built":true}')
+      --checks '{"built":true,"tests":{"passed":0,"failed":0}}')
     [ -n "$TASK_ID" ] && DELIVER_ARGS+=(--task "$TASK_ID")
     [ -n "$BASE_SHA" ] && DELIVER_ARGS+=(--base-sha "$BASE_SHA")
     if ! DELIVERY="$(HOME="$STATE" "$BIN" deliver "${DELIVER_ARGS[@]}")"; then
@@ -379,16 +379,17 @@ Rust 版已补齐 upload/submit/deliver，无需 Python 补位：
 
 ```bash
 # 非 git 环境先设 BASE_SHA=<7-64位hex>；git 仓库可省略 --base-sha
-HOME="$STATE" "$BIN" deliver --file out/result.patch --task "$TASK_ID" \
+printf 'task=%s\nbase=%s\nbuilt=ok\n' "$TASK_ID" "${BASE_SHA:-<7-64位hex>}" > out/RECEIPT.md
+HOME="$STATE" "$BIN" deliver --file out/result.patch --file out/RECEIPT.md --task "$TASK_ID" \
   --kind patch --title "<标题>" --base-sha "${BASE_SHA:-<7-64位hex>}" \
-  --checks '{"built":true}'
-# → {"ok":true,"sha256":"...","submission_id":"...","state":"delivered"}
+  --checks '{"built":true,"tests":{"passed":0,"failed":0}}'
+# → {"ok":true,"files":[...],"submission_id":"...","task_id":"...","state":"delivered"}
 ```
 
 - `--task` 必须是当前 agent 已 claim 的 `task_id`，否则服务端会拒；
 - `base_sha` 必须 7-64 位小写 hex；非 git 环境显式 `--base-sha`；
 - `--checks` 是 JSON 字符串，zsh 里引用变量拼值用 `${VAR}` 花括号（避免 `$VAR:suffix` 被错误展开）；
-- 多文件：先逐个 `upload`，再 `submit` 用多个 `--ref`。
+- 多文件：`deliver` 可重复 `--file`；代码类必须同时带补丁与回执，否则服务端 422。
 
 ## 阶段 7：处理纪律
 

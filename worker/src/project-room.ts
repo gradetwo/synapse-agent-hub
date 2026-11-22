@@ -344,10 +344,17 @@ export class ProjectRoom implements DurableObject {
                      created_by: b.sender ?? "admin", to };
     await this.st.put(`task:${id}`, t);
     const seq = await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task",
-                                   kind: "task", to: b.to ?? undefined,
+                                   kind: "task", to: to ?? undefined,
                                    payload: { task_id: id, title, body: t.body },
                                    dedupe_key: `task:${id}` });
-    return json({ task_id: id, state: "open", seq });
+    // S5：指派事件至少落一条定向消息（节点 wait/run 下一次拉取即被唤醒）。
+    // 离线节点仍收不到，管理台账用 to_online 明确标出，避免“已派单”造成在线错觉。
+    const hb: any = to ? await this.st.get(`agent:${to}`).catch(() => null) : null;
+    const targetAge = hb?.last_hb_ms ? now - Number(hb.last_hb_ms) : Infinity;
+    return json({ task_id: id, state: "open", seq,
+                  wake: to ? { channel: "inbox", target: to,
+                               online: targetAge <= 300_000,
+                               alive: targetAge <= 120_000 ? "alive" : targetAge <= 300_000 ? "late" : "offline" } : null });
   }
 
   private async ack(b: any) {
@@ -405,7 +412,8 @@ export class ProjectRoom implements DurableObject {
     await this.st.put(`task:${b.task_id}`, { ...t, state: "claimed", owner: b.agent_id,
                                              lease_until: lease, updated_at: now });
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "claimed",
-                        payload: { task_id: b.task_id, lease_until: lease },
+                        payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
+                                   lease_until: lease },
                         dedupe_key: `claim:${b.task_id}:${b.agent_id}:${now}` });
     return json({ ok: true, lease_until: lease });
   }
@@ -416,6 +424,28 @@ export class ProjectRoom implements DurableObject {
     const row = await this.env.DB.prepare(
       "SELECT COUNT(*) AS n FROM submissions WHERE project = ? AND task_id = ? AND state = 'delivered'"
     ).bind(project, taskId).first<any>();
+    return Number(row?.n ?? 0);
+  }
+
+  /** S4：待裁决 = 已收下但尚未 approved 的交付；rejected 不再等待。 */
+  private async pendingReview(project: string, taskId: string): Promise<number> {
+    if (!project) return 0;
+    const row = await this.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM submissions
+        WHERE project = ? AND task_id = ? AND state != 'archived'
+          AND review_state IN ('pending', 'accepted')`
+    ).bind(project, taskId).first<any>().catch(() => ({ n: 0 }));
+    return Number(row?.n ?? 0);
+  }
+
+  /** 报告类没有 approved 不许关单；代码类取走后可按已验收处理。 */
+  private async unapprovedReports(project: string, taskId: string): Promise<number> {
+    if (!project) return 0;
+    const row = await this.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM submissions
+        WHERE project = ? AND task_id = ? AND kind = 'report'
+          AND state != 'archived' AND review_state != 'approved'`
+    ).bind(project, taskId).first<any>().catch(() => ({ n: 0 }));
     return Number(row?.n ?? 0);
   }
 
@@ -431,40 +461,72 @@ export class ProjectRoom implements DurableObject {
     let state = want;
     // 所有出口都重算待取数；state=open/blocked 也要保留真实 pending，
     // 否则 agent 放弃/阻塞后管理台会把“还有交付待取”误显示成 0。
-    const pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
+    const project = b.project ?? t.project ?? "";
+    const pending = await this.pendingDeliveries(project, b.task_id);
+    const pendingReview = await this.pendingReview(project, b.task_id);
     // 联动：目标是 done 时先看交付——还有没取走的，任务只进 released（已交付待取），
     // 不许直接 done。最后一件被取走时由 submissionSettled 收成 done。
     if (want === "done" && pending > 0) state = "released";
     const now = Date.now();
     const patch: any = { state, owner: null, lease_until: 0, pending_submissions: pending,
+                         pending_review: pendingReview,
                          updated_at: now, released_by: b.agent_id };
     if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
     if (state === "blocked") { patch.blocked_at = now; }
     await this.st.put(`task:${b.task_id}`, { ...t, ...patch });
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: state,
-                        payload: { task_id: b.task_id, pending_submissions: pending,
+                        payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
+                                   pending_submissions: pending,
                                    ...(state === "open" ? { abandoned_by: b.agent_id } : {}) },
                         dedupe_key: `release:${b.task_id}:${Date.now()}` });
     return json({ ok: true, state, pending_submissions: pending });
   }
 
-  /** 管理侧取走/归档一件交付后由 Worker 回调：重算待取数；released 且归零 → 收成 done。 */
+  /**
+   * 管理侧取走/归档一件交付后由 Worker 回调：重算待取数。
+   * S1：claimed/released 且最后一件取走、无待批报告 → 直接 done；
+   * S4：report 必须 approved 才允许关单；accepted 只是“收走待裁决”。
+   */
   private async submissionSettled(b: any) {
     const t: any = await this.st.get(`task:${b.task_id}`);
     if (!t) return json({ error: "not_found" }, 404);
-    const pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
+    const project = b.project ?? t.project ?? "";
+    const pending = await this.pendingDeliveries(project, b.task_id);
+    const pendingReview = await this.pendingReview(project, b.task_id);
+    const unapproved = await this.unapprovedReports(project, b.task_id);
     let state = t.state;
-    if (t.state === "released" && pending === 0) {
+    // 已结任务被明确 rejected：重新打开，绝不让拒收留在 done。
+    if (b.reopen_on_reject === true && t.state === "done") {
+      state = "open";
+      await this.st.put(`task:${b.task_id}`, { ...t, state, owner: null, lease_until: 0,
+        pending_submissions: pending, pending_review: pendingReview, updated_at: Date.now(),
+        closed_at: null, closed_by: null, reopened_at: Date.now(), reopened_by: "review" });
+      await this.append({ project, sender: b.sender ?? "admin", topic: "task", kind: "open",
+                          payload: { task_id: b.task_id, reopened_by: "review", reason: "delivery_rejected" },
+                          dedupe_key: `reopen:${b.task_id}:${Date.now()}` });
+      return json({ ok: true, task_id: b.task_id, state, pending_submissions: pending,
+                    pending_review: pendingReview, unapproved_reports: unapproved });
+    }
+    const canClose = pending === 0 && unapproved === 0
+      && (t.state === "claimed" || t.state === "released");
+    if (canClose) {
       state = "done";
       const now = Date.now();
-      await this.st.put(`task:${b.task_id}`, { ...t, state, pending_submissions: 0,
-                                               updated_at: now, closed_at: now, closed_by: "collection" });
-      await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task", kind: "done",
-                          payload: { task_id: b.task_id, closed_by: "collection" }, dedupe_key: `close:${b.task_id}` });
+      await this.st.put(`task:${b.task_id}`, { ...t, state, owner: null, lease_until: 0,
+                                               pending_submissions: 0, pending_review: pendingReview,
+                                               updated_at: now, closed_at: now,
+                                               closed_by: b.closed_by === "approval" ? "approval" : "collection" });
+      await this.append({ project, sender: b.sender ?? "admin", topic: "task", kind: "done",
+                          payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
+                                     closed_by: b.closed_by === "approval" ? "approval" : "collection",
+                                     pending_review: pendingReview },
+                          dedupe_key: `close:${b.task_id}` });
     } else {
-      await this.st.put(`task:${b.task_id}`, { ...t, pending_submissions: pending, updated_at: Date.now() });
+      await this.st.put(`task:${b.task_id}`, { ...t, pending_submissions: pending,
+                                               pending_review: pendingReview, updated_at: Date.now() });
     }
-    return json({ ok: true, task_id: b.task_id, state, pending_submissions: pending });
+    return json({ ok: true, task_id: b.task_id, state, pending_submissions: pending,
+                  pending_review: pendingReview, unapproved_reports: unapproved });
   }
 
   // 单任务元数据：只给交付校验用，不返回正文，避免普通 agent 拉取任务内容。
@@ -489,11 +551,16 @@ export class ProjectRoom implements DurableObject {
     for (const a of (await this.st.list<any>({ prefix: "agent:" })).values()) agents.set(a.agent_id, a);
     const tasks = [...r.values()].map((t: any) => {
       const ownerAge = t.owner ? now - Number(agents.get(t.owner)?.last_hb_ms ?? 0) : Infinity;
+      const toAge = t.to ? now - Number(agents.get(t.to)?.last_hb_ms ?? 0) : Infinity;
       return {
         ...t,
         lease_left_ms: Math.max(0, Number(t.lease_until ?? 0) - now),
         owner_online: t.owner ? ownerAge <= 300_000 : null,
         owner_alive: t.owner ? (ownerAge <= 120_000 ? "alive" : ownerAge <= 300_000 ? "late" : "offline") : null,
+        // S5：定向任务在 claim 之前也要看见目标节点在线状态，否则只能等它出现。
+        to_online: !t.owner && t.to ? toAge <= 300_000 : null,
+        to_alive: !t.owner && t.to ? (toAge <= 120_000 ? "alive" : toAge <= 300_000 ? "late" : "offline") : null,
+        pending_review: Number(t.pending_review ?? 0),
       };
     });
     const rank = (s: string) => s === "claimed" ? 0 : s === "open" ? 1 : s === "released" ? 2 : s === "blocked" ? 3 : 4;
@@ -533,8 +600,9 @@ export class ProjectRoom implements DurableObject {
                    closed_at: now, closed_by: "admin" };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     await this.append({ project, sender: "admin", topic: "task", kind: "done",
-                        payload: { task_id: t.task_id ?? t.id, closed_by: "admin",
-                                   pending_submissions: pending, prev_state: t.state, reason },
+                        payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
+                                   closed_by: "admin", pending_submissions: pending,
+                                   prev_state: t.state, reason },
                         dedupe_key: `admin-close:${t.task_id ?? t.id}:${now}` });
     return json({ ok: true, task });
   }
@@ -552,8 +620,9 @@ export class ProjectRoom implements DurableObject {
                    reclaimed_from: t.owner ?? null };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     await this.append({ project, sender: "admin", topic: "task", kind: "reclaimed",
-                        payload: { task_id: t.task_id ?? t.id, prev_state: t.state,
-                                   prev_owner: t.owner ?? null, prev_to: t.to ?? null, reason },
+                        payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
+                                   prev_state: t.state, prev_owner: t.owner ?? null,
+                                   prev_to: t.to ?? null, reason },
                         dedupe_key: `admin-reclaim:${t.task_id ?? t.id}:${now}` });
     return json({ ok: true, task });
   }
@@ -578,8 +647,9 @@ export class ProjectRoom implements DurableObject {
                    reassigned_at: now, reassigned_from: t.owner ?? t.to ?? null };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     await this.append({ project, sender: "admin", topic: "task", kind: "reassigned", to,
-                        payload: { task_id: t.task_id ?? t.id, to, prev_state: t.state,
-                                   prev_owner: t.owner ?? null, prev_to: t.to ?? null, reason },
+                        payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
+                                   to, prev_state: t.state, prev_owner: t.owner ?? null,
+                                   prev_to: t.to ?? null, reason },
                         dedupe_key: `admin-reassign:${t.task_id ?? t.id}:${now}` });
     return json({ ok: true, task });
   }
