@@ -651,7 +651,7 @@ export class ProjectRoom implements DurableObject {
                                    to, prev_state: t.state, prev_owner: t.owner ?? null,
                                    prev_to: t.to ?? null, reason },
                         dedupe_key: `admin-reassign:${t.task_id ?? t.id}:${now}` });
-    return json({ ok: true, task });
+    return json({ ok: true, task, brief_embedded: true });
   }
 
   // ── 广播：一条消息 + 待确认名单 + supersedes 失效 ─────────

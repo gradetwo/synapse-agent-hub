@@ -785,11 +785,12 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
+        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get
+  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
-        println!("0.5.1");
+        println!("{}", env!("CARGO_PKG_VERSION"));
         return;
     }
     let cfg = Cfg::from_args();
@@ -812,7 +813,7 @@ fn main() {
     init_proxy();
     let mut agent_builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(40))
-        .user_agent("synapse-agent/0.5.1 (rust)");
+        .user_agent(concat!("synapse-agent/", env!("CARGO_PKG_VERSION"), " (rust)"));
     if let Some(p) = proxy_for(&host_of(&cfg.endpoint)) {
         match ureq::Proxy::new(&p.url) {
             Ok(up) => agent_builder = agent_builder.proxy(up),
@@ -976,6 +977,13 @@ fn main() {
             // 之前误读成 --check，导致 --apply 1 永远走 check-only（H2 的另一半）
             let apply = args_map.get("apply").map(|v| v == "1").unwrap_or(false);
             let check_only = !apply;
+            let platform_override = args_map.get("platform").cloned().unwrap_or_default();
+            let tags = upgrade_platform_tags(&platform_override);
+            if tags.is_empty() {
+                eprintln!("当前平台不支持客户端自升级（{} / {}）；请用安装脚本重装。",
+                          std::env::consts::OS, std::env::consts::ARCH);
+                std::process::exit(7);
+            }
             let m = admin_get_public(&agent, &base, "/sdk/manifest");
             match m {
                 Ok(man) => {
@@ -983,41 +991,80 @@ fn main() {
                     let mine = env!("CARGO_PKG_VERSION").to_string();
                     let upd = latest != mine;
                     if !upd {
-                        println!("{}", json!({"current": mine, "latest": latest, "update": false}));
+                        println!("{}", json!({"current": mine, "latest": latest, "update": false,
+                                              "platforms": tags}));
                         return;
                     }
-                    if check_only {
-                        println!("{}", json!({"current": mine, "latest": latest, "update": true,
-                                              "hint": "加 --apply 1 才会真正替换二进制"}));
-                        return;
-                    }
-                    let url = man["binaries"][0]["url"].as_str().unwrap_or("/dl/synapse-agent-x86_64-linux-musl");
+                    // 旧实现直接取 binaries[0]，Windows/macOS/arm64 会拿到 Linux x64 包。
+                    // 这里按当前 OS/ARCH（以及 Linux libc）选，找不到就不升级。
+                    let chosen = find_manifest_binary(&man, &tags);
+                    let chosen = match chosen {
+                        Some(b) => b,
+                        None => {
+                            let avail: Vec<&str> = man["binaries"].as_array().map(|bs| {
+                                bs.iter().filter_map(|b| b["platform"].as_str()).collect()
+                            }).unwrap_or_default();
+                            eprintln!("manifest 没有当前平台的 binary（需要 {}；可用：{}）；拒绝升级",
+                                      tags.join(" / "), avail.join(", "));
+                            std::process::exit(2);
+                        }
+                    };
+                    let platform = chosen["platform"].as_str().unwrap_or("").to_string();
+                    let url = chosen["url"].as_str().unwrap_or("").to_string();
                     // 只允许从本站 /dl/ 下载，避免 manifest 被篡改后变成任意 URL
                     if !url.starts_with("/dl/") {
                         eprintln!("manifest 的下载地址不是本站 /dl/：{url}；拒绝升级");
                         std::process::exit(2);
                     }
-                    let sha = man["binaries"][0]["sha256"].as_str().unwrap_or("").to_string();
+                    let sha = chosen["sha256"].as_str().unwrap_or("").to_string();
                     // H2 fail-closed：sha 缺失/长度不对/非 hex 一律不替换
                     if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
                         eprintln!("manifest 缺少有效 sha256（长度须 64 且为 hex）；拒绝升级");
                         std::process::exit(3);
                     }
-                    let tmp = format!("{}.new", std::env::current_exe().unwrap().display());
-                    match admin_bytes_public(&agent, &base, url) {
+                    if check_only {
+                        println!("{}", json!({"current": mine, "latest": latest, "update": true,
+                                              "platform": platform, "url": url, "sha256": sha,
+                                              "hint": "加 --apply 1 才会真正替换二进制"}));
+                        return;
+                    }
+                    let current = match std::env::current_exe() {
+                        Ok(p) => p,
+                        Err(e) => { eprintln!("取当前可执行文件路径失败：{e}"); std::process::exit(1); }
+                    };
+                    let tmp = format!("{}.new", current.display());
+                    match admin_bytes_public(&agent, &base, &url) {
                         Ok(b) => {
                             if let Err(e) = fs::write(&tmp, &b) { eprintln!("写临时文件失败：{e}"); std::process::exit(1); }
-                            let out = std::process::Command::new("sha256sum").arg(&tmp).output();
-                            let got = out.ok().map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_string()).unwrap_or_default();
+                            // 不再依赖外部 sha256sum（Windows 默认没有）；直接用已依赖的 sha2。
+                            let got = match sha256_file(&tmp) {
+                                Ok((h, _)) => h,
+                                Err(e) => {
+                                    eprintln!("读临时文件失败：{e}");
+                                    let _ = fs::remove_file(&tmp);
+                                    std::process::exit(4);
+                                }
+                            };
                             if got.to_lowercase() != sha.to_lowercase() {
                                 eprintln!("sha256 不匹配：期望 {sha}，实际 {got}；已放弃替换");
                                 let _ = fs::remove_file(&tmp);
                                 std::process::exit(4);
                             }
-                            // 同机 rename 覆盖正在运行的可执行文件是安全的（inode 保留）
-                            match fs::rename(&tmp, std::env::current_exe().unwrap()) {
-                                Ok(_) => println!("{}", json!({"ok": true, "from": mine, "to": latest, "bytes": b.len()})),
-                                Err(e) => { eprintln!("替换失败：{e}（可能需要写权限，或系统限制）"); std::process::exit(5); }
+                            // Unix/macOS：同机 rename 覆盖正在运行的可执行文件是安全的（inode 保留）。
+                            // Windows：运行中的 exe 被锁，保留 .new 让用户停进程后手动替换。
+                            #[cfg(windows)]
+                            {
+                                eprintln!("Windows 不能覆盖运行中的 exe；新版本已下载到：{tmp}");
+                                eprintln!("请先停止所有 synapse-agent 进程，再用 install.ps1 覆盖安装，或手动替换该文件。");
+                                std::process::exit(6);
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                match fs::rename(&tmp, &current) {
+                                    Ok(_) => println!("{}", json!({"ok": true, "from": mine, "to": latest,
+                                                                  "platform": platform, "bytes": b.len()})),
+                                    Err(e) => { eprintln!("替换失败：{e}（可能需要写权限，或系统限制）"); std::process::exit(5); }
+                                }
                             }
                         }
                         Err(e) => { eprintln!("下载失败：{e}"); std::process::exit(1); }
@@ -1643,6 +1690,42 @@ fn admin_post(cfg: &Cfg, agent: &Agent, base: &str, path: &str, body: Value) -> 
         .send_json(body)
         .map_err(|e| format!("{e}"))
         .and_then(|r| r.into_json::<Value>().map_err(|e| format!("{e}")))
+}
+
+/// 当前平台在 /sdk/manifest 里的 platform 候选。
+/// Linux 优先匹配同 libc 的包；gnu 包缺失时退回静态 musl（musl 包可在 glibc 上运行）。
+fn upgrade_platform_tags(override_tag: &str) -> Vec<String> {
+    if !override_tag.is_empty() {
+        return vec![override_tag.to_string()];
+    }
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let pair: (&str, &str) = match (os, arch) {
+        ("linux", "x86_64") => {
+            if cfg!(target_env = "gnu") { ("linux-x86_64-gnu", "linux-x86_64") }
+            else { ("linux-x86_64", "linux-x86_64-gnu") }
+        }
+        ("linux", "aarch64") => {
+            if cfg!(target_env = "gnu") { ("linux-aarch64-gnu", "linux-aarch64") }
+            else { ("linux-aarch64", "linux-aarch64-gnu") }
+        }
+        ("macos", "x86_64") => ("darwin-x86_64", ""),
+        ("macos", "aarch64") => ("darwin-aarch64", ""),
+        ("windows", "x86_64") => ("windows-x86_64", ""),
+        _ => ("", ""),
+    };
+    let mut v = Vec::new();
+    if !pair.0.is_empty() { v.push(pair.0.to_string()); }
+    if !pair.1.is_empty() { v.push(pair.1.to_string()); }
+    v
+}
+
+/// 按 platform 候选从 manifest 里选 binary；绝不回退到 binaries[0]。
+fn find_manifest_binary<'a>(man: &'a Value, tags: &[String]) -> Option<&'a Value> {
+    man["binaries"].as_array()?.iter().find(|b| {
+        let p = b["platform"].as_str().unwrap_or("");
+        tags.iter().any(|t| t == p)
+    })
 }
 
 /// 计算文件的 SHA256（hex），与 Python 的 hashlib.sha256(...).hexdigest() 对齐。
@@ -2659,5 +2742,34 @@ mod tests {
         assert!(is_task_notice(&json!({"kind": "task_notice"})));
         assert!(is_task_notice(&json!({"topic": "task", "kind": "released"})));
         assert!(!is_task_notice(&json!({"kind": "task", "payload": {"title": "x"}})));
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn selects_by_platform_not_first_entry() {
+        let man = json!({"binaries": [
+            {"platform": "linux-x86_64", "url": "/dl/linux"},
+            {"platform": "windows-x86_64", "url": "/dl/win"}
+        ]});
+        let tags = vec!["windows-x86_64".to_string()];
+        let b = find_manifest_binary(&man, &tags).unwrap();
+        assert_eq!(b["url"].as_str(), Some("/dl/win"));
+    }
+
+    #[test]
+    fn missing_platform_is_none() {
+        let man = json!({"binaries": [{"platform": "linux-x86_64"}]});
+        let tags = vec!["darwin-arm64".to_string()];
+        assert!(find_manifest_binary(&man, &tags).is_none());
+    }
+
+    #[test]
+    fn explicit_override_is_single_tag() {
+        let tags = upgrade_platform_tags("linux-x86_64-gnu");
+        assert_eq!(tags, vec!["linux-x86_64-gnu".to_string()]);
     }
 }

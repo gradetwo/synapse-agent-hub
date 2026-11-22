@@ -982,7 +982,7 @@ async function admin(req: Request, env: Env, url: URL) {
       const d: any = await dr.json().catch(() => ({}));
       // S2/S5：旧 DO 的 reassigned 消息缺 title/body，转派成功后补一条定向任务简报。
       let brief: any = null;
-      if (action === "tasks/reassign" && dr.ok && b.to) {
+      if (action === "tasks/reassign" && dr.ok && b.to && d.brief_embedded !== true) {
         try {
           brief = await publishTaskBrief(env, project, String(b.task_id), String(b.to),
                                          String(b.reason ?? "").slice(0, 240));

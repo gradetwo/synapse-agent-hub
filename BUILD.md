@@ -158,16 +158,38 @@ curl -fsSL https://synapse.wangda.today/dl/BUILD.txt
 
 ## 6. 版本号位置
 
-一次发版需要同步：
+`BUILD_TAG` 是部署批次标记，`SDK_VERSION` 是客户端发版号，两者独立升级。
+SDK 版本不要手改单点，统一用脚本：
+
+```bash
+./scripts/bump-sdk.sh 0.5.2 --dry-run   # 先看会改哪些文件
+./scripts/bump-sdk.sh 0.5.2             # 同步所有 SDK 版本字段
+```
+
+脚本会同步：
 
 | 位置 | 字段 |
 |---|---|
-| `worker/src/worker.ts` | `BUILD_TAG`、`SDK_VERSION` |
-| `sdk/python/pyproject.toml` | `version` |
-| `sdk/ts/package.json` / `package-lock.json` | `version`、包名 |
+| `VERSION` | `sdk_version`、`snapshot_date` |
+| `worker/src/worker.ts` | `SDK_VERSION`（`BUILD_TAG` 不动） |
 | `sdk/rust/Cargo.toml` / `Cargo.lock` | `version` |
-| `sdk/rust/src/main.rs` | `--help` / `--version` 输出、UA 字符串 |
-| `README.md` / `docs/SDK-接入与差异.md` | 发布快照 |
+| `sdk/python/pyproject.toml` / `synapse/client.py` | `version` / `__version__` |
+| `sdk/ts/package.json` / `package-lock.json` / `src/client.ts` | `version` / `VERSION` |
+| `spec/openapi.yaml` | `info.version` |
+| `README.md` / `DESIGN.md` / `PACKAGE-MANIFEST.txt` / `docs/SDK-接入与差异.md` | 发布快照 |
+
+Rust 的 `--help`、`--version`、User-Agent 已改为读 `CARGO_PKG_VERSION`，不再单独维护。
+
+客户端自升级是**手动**命令，不会在 `run` 里自动检查：
+
+```bash
+synapse-agent upgrade                    # 只检查，打印当前平台/目标包/sha
+synapse-agent upgrade --apply 1          # Linux/macOS 原地替换
+synapse-agent upgrade --platform linux-x86_64-gnu   # 指定 manifest platform
+```
+
+`upgrade` 按 manifest 的 `platform` 选包，不再默认取第一个 Linux 包；SHA-256 在客户端内计算。
+Windows 运行中的 exe 被系统锁定，`--apply 1` 会保留 `.new` 并提示用 `install.ps1` 覆盖，不能原地替换。
 
 ## 7. 自检清单
 
