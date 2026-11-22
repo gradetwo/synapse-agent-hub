@@ -9,7 +9,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "task-dispatch-ws-20261122";
+const BUILD_TAG = "task-dashboard-20261122";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.1";
 
@@ -55,6 +55,13 @@ export default {
     // 这样即使 Access 只覆盖 /console（不覆盖 /admin），后续 XHR 也能凭 cookie 通过。
     // 诊断：只回 header 名字与判定，不回任何值（不含敏感信息）
     if (path === "/console/debug") {
+      const via = await verifyAccessJwt(req, env);
+      const cookieId = await accessIdentityFromCookie(req);
+      const identity = via?.email ?? cookieId;
+      if (identity && !adminEmailAllowed(env, identity))
+        return new Response(JSON.stringify({ error: "admin_required" }), {
+          status: 403, headers: { "content-type": "application/json", ...SEC_HEADERS },
+        });
       const names = [...req.headers.keys()].filter((k) => k.toLowerCase().startsWith("cf-")).sort();
       const jwt = req.headers.get("cf-access-jwt-assertion") ?? "";
       const email = req.headers.get("cf-access-authenticated-user-email") ?? "";
@@ -77,8 +84,12 @@ export default {
     // 管理面板的实时通道：凭 Access 会话 cookie 升级，不用票据（浏览器带头部受限）
     if (path === "/console/ws") {
       if ((req.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") return err(426, "upgrade_required");
-      const sess = (await readSession(req, env)) ?? (await accessIdentityFromCookie(req));
-      if (!sess) return err(401, "unauthorized");
+      const via = await verifyAccessJwt(req, env);
+      const cookieId = await accessIdentityFromCookie(req);
+      const sess = await readSession(req, env);
+      if (!sess && !via && !cookieId) return err(401, "unauthorized");
+      const email = via?.email ?? cookieId ?? (sess?.includes("@") ? sess : "");
+      if (email && !adminEmailAllowed(env, email)) return err(403, "admin_required");
       const project = new URL(req.url).searchParams.get("project") ?? "";
       const row = await env.DB.prepare("SELECT status FROM projects WHERE project = ?").bind(project).first<any>();
       if (!row || row.status !== "active") return err(403, "project_unavailable");
@@ -95,6 +106,9 @@ export default {
         status: 401, headers: { "content-type": "application/json", ...SEC_HEADERS },
       });
       const who = via?.email ?? cookieId ?? "access";
+      if (!adminEmailAllowed(env, who)) return new Response(JSON.stringify({ ok: false, error: "admin_required" }), {
+        status: 403, headers: { "content-type": "application/json", ...SEC_HEADERS },
+      });
       const cookie = await makeSession(who, env.SESSION_SECRET, await sessEpoch(env));
       return new Response(JSON.stringify({ ok: true, via: "access", email: who }), {
         headers: { "content-type": "application/json", "set-cookie": cookie, ...SEC_HEADERS },
@@ -108,7 +122,12 @@ export default {
       const accessEmail = req.headers.get("cf-access-authenticated-user-email") ?? "";
       const cookieId = await accessIdentityFromCookie(req);
       const identity = viaAccess?.email ?? cookieId;   // 不再信任可伪造的邮箱头
-      const sess = identity ?? await readSession(req, env);
+      if (identity && !adminEmailAllowed(env, identity))
+        return new Response(GATE_HTML, { status: 403, headers: secHeaders("text/html; charset=utf-8") });
+      const sessionWho = identity ? "" : await readSession(req, env);
+      if (!identity && sessionWho?.includes("@") && !adminEmailAllowed(env, sessionWho))
+        return new Response(GATE_HTML, { status: 403, headers: secHeaders("text/html; charset=utf-8") });
+      const sess = identity ?? sessionWho;
       if (!sess) return new Response(GATE_HTML, { status: 401, headers: secHeaders("text/html; charset=utf-8") });
       // 关键：打开控制台这一下就把会话 cookie 种好，后续 XHR 直接凭它通过，
       // 不再需要 /console/whoami 那一趟（那趟在部分 Access 配置下拿不到令牌）。
@@ -338,6 +357,15 @@ async function accessIdentityFromCookie(req: Request): Promise<string | null> {
     const j: any = await r.json();
     return typeof j?.email === "string" && j.email ? j.email : null;
   } catch { return null; }
+}
+
+/** 管理台第二道门：Access 邮箱必须命中白名单。默认只允许仓库主，
+ *  部署到别的团队时用 ADMIN_EMAILS（逗号分隔）覆盖。 */
+function adminEmailAllowed(env: Env, email?: string | null): boolean {
+  if (!email) return false;
+  const allow = String(env.ADMIN_EMAILS ?? "gradetwo@gmail.com")
+    .split(/[,\s]+/).filter(Boolean).map((e) => e.toLowerCase());
+  return allow.includes(email.toLowerCase());
 }
 
 // ── 鉴权 ────────────────────────────────────────────────────
@@ -571,6 +599,7 @@ async function admin(req: Request, env: Env, url: URL) {
   let authorized = false;
   let identityEmail = "";
   let viaSession = false;
+  let sessionWho = "";
 
   if (bearer) {
     const sha = await sha256(bearer);
@@ -587,17 +616,18 @@ async function admin(req: Request, env: Env, url: URL) {
       const cookieEmail = await accessIdentityFromCookie(req);
       if (cookieEmail) { authorized = true; identityEmail = cookieEmail; }
     }
-    if (!authorized && await readSession(req, env)) {
-      authorized = true;
-      viaSession = true;      // 会话是 /auth/login 用管理员 token 换的，本身已验角色
+    if (!authorized) {
+      const sess = await readSession(req, env);
+      if (sess) { authorized = true; viaSession = true; sessionWho = sess; }
     }
   }
-  if (authorized && !bearer && !viaSession) {
-    // 第二道门：Access 身份还必须命中管理员邮箱白名单。
-    // 未配置时使用仓库主的默认管理员邮箱；换部署时用 ADMIN_EMAILS 覆盖。
-    const allow = String(env.ADMIN_EMAILS ?? "gradetwo@gmail.com").split(/[,\s]+/).filter(Boolean)
-      .map((e) => e.toLowerCase());
-    if (allow.length && !allow.includes(identityEmail.toLowerCase())) {
+  if (authorized && !bearer) {
+    // 第二道门：Access 身份 / 旧 Access 会话必须命中管理员邮箱白名单。
+    // sessionWho 里带 @ 的是 Access 身份换来的会话；admin token 换来的会话不是邮箱。
+    const email = viaSession ? (sessionWho.includes("@") ? sessionWho : "") : identityEmail;
+    if (viaSession && !email) {
+      // admin token 登录的会话，角色在签发时已经验过
+    } else if (!adminEmailAllowed(env, email)) {
       const r = err(403, "admin_required");
       r.headers.set("x-hub-auth", "not_admin");
       return r;
@@ -652,7 +682,67 @@ async function admin(req: Request, env: Env, url: URL) {
     });
   }
 
-  // 管理端全局名册：按可见项目聚合并保留 project，前端用于“全部项目”视图。
+  // 管理台数据看板：最近 7 天消息/交付趋势 + 当前可见项目的交付状态分布。
+  // 只查 D1 聚合，不读 DO 正文；前端把任务/节点分布和这里拼成看板。
+  if (path === "/admin/analytics" && req.method === "GET") {
+    const policy = await loadPolicy(env);
+    const allRows = (await env.DB.prepare(
+      "SELECT project FROM projects WHERE status='active' ORDER BY created_at"
+    ).all<any>()).results.map((r: any) => String(r.project));
+    let projects = policy.mode === "all" ? allRows : allRows.filter((p) => (policy.projects || []).includes(p));
+    const only = String(url.searchParams.get("project") ?? "").trim();
+    if (only) {
+      if (!/^[a-z0-9-]{2,40}$/.test(only)) return err(422, "bad_project");
+      if (!projects.includes(only)) return err(403, "project_not_visible");
+      projects = [only];
+    }
+    const now = Date.now();
+    const dayMs = 86_400_000;
+    const today = new Date();
+    const dayKeys: string[] = [];
+    for (let i = 6; i >= 0; i--) {
+      dayKeys.push(new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(),
+        today.getUTCDate()) - i * dayMs).toISOString().slice(0, 10));
+    }
+    const zeroDaily = dayKeys.map((day) => ({ day, messages: 0, submissions: 0 }));
+    if (!projects.length) {
+      return json({ at: now, scope: only || "all", projects: [], daily: zeroDaily,
+                    submission_states: {}, totals: { messages: 0, submissions: 0 } });
+    }
+    const inSql = projects.map(() => "?").join(",");
+    const sinceDay = dayKeys[0];
+    const sinceMs = Date.parse(sinceDay + "T00:00:00Z");
+    const [archive, subs, states] = await Promise.all([
+      env.DB.prepare(
+        `SELECT substr(ts,1,10) AS day, COUNT(*) AS n FROM archive
+          WHERE project IN (${inSql}) AND ts >= ? GROUP BY day`
+      ).bind(...projects, sinceDay).all<any>(),
+      env.DB.prepare(
+        `SELECT date(created_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM submissions
+          WHERE project IN (${inSql}) AND created_at >= ? GROUP BY day`
+      ).bind(...projects, sinceMs).all<any>(),
+      env.DB.prepare(
+        `SELECT state, COUNT(*) AS n FROM submissions WHERE project IN (${inSql}) GROUP BY state`
+      ).bind(...projects).all<any>(),
+    ]);
+    const msgMap = new Map<string, number>(archive.results.map((r: any) => [String(r.day), Number(r.n)]));
+    const subMap = new Map<string, number>(subs.results.map((r: any) => [String(r.day), Number(r.n)]));
+    const daily = dayKeys.map((day) => ({
+      day, messages: msgMap.get(day) ?? 0, submissions: subMap.get(day) ?? 0,
+    }));
+    return json({
+      at: now,
+      scope: only || "all",
+      projects,
+      daily,
+      submission_states: Object.fromEntries(states.results.map((r: any) => [r.state, Number(r.n)])),
+      totals: {
+        messages: daily.reduce((a, b) => a + b.messages, 0),
+        submissions: daily.reduce((a, b) => a + b.submissions, 0),
+      },
+    });
+  }
+
   if (path === "/admin/agents" && req.method === "GET") {
     const policy = await loadPolicy(env);
     const rows = (await env.DB.prepare(

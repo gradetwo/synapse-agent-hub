@@ -194,10 +194,34 @@ if (location.search.includes("reset=1")) {
   .who{display:flex;flex-wrap:wrap;gap:8px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#11161d}
   .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid #232a33;border-radius:8px;background:#151b23}
   .whoItem input{width:auto;height:15px;min-height:0;margin:0;flex:0 0 auto}
-  .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(5,1fr)}
+  .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(6,minmax(0,1fr))}
   .stat{background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px}
   .stat .k{color:var(--dim);font-size:11px;letter-spacing:.02em}
   .stat .v{font-size:19px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+  .stat .sub{display:block;font-size:10px;color:var(--dim);font-weight:400;margin-top:1px}
+  .ovBody{padding:0 14px 14px}
+  .dashGrid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr) minmax(0,1.3fr);gap:10px;margin-top:10px}
+  .dashTile{min-width:0;background:#121820;border:1px solid #1d2530;border-radius:10px;padding:10px}
+  .dashHead{display:flex;align-items:center;gap:8px;margin-bottom:7px;color:var(--dim);
+    font-size:11px;letter-spacing:.4px;text-transform:uppercase}
+  .dashHead span{margin-left:auto;text-transform:none;letter-spacing:0;font-size:11px}
+  .miniRow{display:grid;grid-template-columns:32px minmax(0,1fr) 38px;align-items:center;gap:6px}
+  .miniRow .lab{font-size:11px;color:var(--dim)}
+  .miniRow .num{font-size:11px;color:var(--fg);text-align:right;font-variant-numeric:tabular-nums}
+  .stack{display:flex;width:100%;height:12px;border-radius:999px;overflow:hidden;background:#0b0f14;border:1px solid #1d2530}
+  .stack .seg{height:100%;min-width:2px}
+  .stack .stackEmpty{display:flex;align-items:center;padding-left:7px;color:#5d6675;font-size:10px}
+  .legend{display:flex;flex-wrap:wrap;gap:5px 9px;margin-top:7px}
+  .legend button{display:inline-flex;align-items:center;gap:5px;padding:2px 6px;border:0;border-radius:6px;
+    min-height:0;background:transparent;color:#8b95a5;font-size:11px;line-height:18px;white-space:nowrap}
+  .legend button:hover{background:#19212b;color:var(--fg)}
+  .legend button.on{background:#132234;color:#eaf0f8}
+  .legend i{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+  .legend b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
+  .dashTile canvas{height:112px;border:0;background:transparent;display:block}
+  @media(max-width:900px){.dashGrid{grid-template-columns:1fr 1fr}.dashGrid .dashTile:first-child{grid-column:1/-1}}
+  @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:600px){.dashGrid{grid-template-columns:1fr}.dashGrid .dashTile:first-child{grid-column:auto}}
 
   @media (max-width:760px){
     .bar{flex-wrap:wrap;gap:8px;padding:calc(8px + env(safe-area-inset-top)) 12px 8px}
@@ -232,6 +256,7 @@ if (location.search.includes("reset=1")) {
     thead th{font-size:11px;padding:6px 6px}
     tbody td{padding:8px 6px;font-size:12.5px}
     .stats{grid-template-columns:repeat(2,1fr)!important}
+    .ovBody{padding:0 0 2px}
     .charts canvas{height:40px}
     .charts{gap:6px}
     .sheet{padding:12px}
@@ -291,7 +316,36 @@ if (location.search.includes("reset=1")) {
   </div>
   <div class="card">
     <h2>概览 <span class="muted" id="ovAt">—</span></h2>
-    <div class="stats" id="stats"><div class="stat"><div class="k">加载中</div><div class="v">—</div></div></div>
+    <div class="ovBody">
+      <div class="stats" id="stats"><div class="stat"><div class="k">加载中</div><div class="v">—</div></div></div>
+      <div class="dashGrid">
+        <div class="dashTile">
+          <div class="dashHead">状态分布 <span id="dashScope" class="muted"></span></div>
+          <div class="miniRow">
+            <span class="lab">任务</span>
+            <div class="stack" id="dashTaskBar"></div>
+            <span class="num" id="dashTaskTotal">—</span>
+          </div>
+          <div class="legend" id="dashTaskLegend"></div>
+          <div class="miniRow" style="margin-top:10px">
+            <span class="lab">交付</span>
+            <div class="stack" id="dashSubBar"></div>
+            <span class="num" id="dashSubTotal">—</span>
+          </div>
+          <div class="legend" id="dashSubLegend"></div>
+        </div>
+        <div class="dashTile">
+          <div class="dashHead">节点 <span id="dashAgentTotal" class="muted"></span></div>
+          <canvas id="dashAgentChart" aria-label="节点状态分布"></canvas>
+          <div class="legend" id="dashAgentLegend"></div>
+        </div>
+        <div class="dashTile">
+          <div class="dashHead">近 7 天 <span id="dashTrendTotal" class="muted"></span></div>
+          <canvas id="dashTrendChart" aria-label="近七天消息与交付趋势"></canvas>
+          <div class="legend" id="dashTrendLegend"></div>
+        </div>
+      </div>
+    </div>
   </div>
   <div class="card">
     <h2>注册审批 <span class="muted" id="enrStat"></span></h2>
@@ -350,7 +404,7 @@ if (location.search.includes("reset=1")) {
           <select id="taskTo"><option value="">不指派（公共池）</option></select>
         </label>
         <button class="primary" id="btnTaskCreate">派单</button>
-        <span class="muted" style="font-size:11px;line-height:1.5">不填 ID 自动生成；指派离线节点也会留在它的队列里。</span>
+        <span class="muted" style="font-size:11px;line-height:1.5">不填 ID 自动生成；只能指派在线节点，离线节点会被服务端拒绝。</span>
       </div>
       <label>正文<textarea id="taskBody" placeholder="补丁范围、验收口径、依赖任务…"></textarea></label>
     </div>
@@ -537,6 +591,7 @@ let allProjects = [];
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
 let TASK_ROWS = [];                // 最近一次任务台账快照（任务 tab 用）
+let ANALYTICS = { daily: [], submission_states: {}, totals: {} };
 let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
 let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
 let toastTimer = null;
@@ -701,6 +756,7 @@ function activateProject(project) {
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
+  ANALYTICS = { daily: [], submission_states: {}, totals: {} };
   fillDetailProjects();
   connectLive();
 }
@@ -739,6 +795,7 @@ async function loadAgents() {
   bindBulk();
   reapplyFilters();
   renderSndWho(rows);
+  renderDashboard();
 }
 
 function taskAgentOptions(selected) {
@@ -819,6 +876,7 @@ async function loadTasks() {
     </tr>`;
   }).join("") : `<tr><td colspan="7" class="empty">${isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件"}</td></tr>`;
   reapplyFilters();
+  renderDashboard();
 }
 
 async function loadSubs() {
@@ -853,6 +911,7 @@ async function loadSubs() {
       </td>
     </tr>`).join("") : `<tr><td colspan="7" class="empty">暂无交付</td></tr>`;
   reapplyFilters();
+  renderDashboard();
 }
 
 function renderDeliveryAlert(pendingRows) {
@@ -1077,6 +1136,164 @@ async function revoke(id, project) {
   await refresh();
   alert(`已吊销：${(r.revoked || []).join(", ")}`);
 }
+
+function drawDonut(cv, parts, centerText) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = cv.clientWidth || 240, h = cv.clientHeight || 112;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const total = parts.reduce((a, p) => a + Math.max(0, p.value), 0);
+  if (!total) {
+    g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
+    g.textAlign = "center"; g.fillText("暂无数据", w / 2, h / 2);
+    return;
+  }
+  const cx = w / 2, cy = h / 2, r = Math.min(w, h) * 0.36;
+  let angle = -Math.PI / 2;
+  g.lineWidth = 10; g.lineCap = "butt";
+  for (const p of parts) {
+    const a = (Math.max(0, p.value) / total) * Math.PI * 2;
+    if (a <= 0) continue;
+    g.beginPath();
+    g.strokeStyle = p.color;
+    g.arc(cx, cy, r, angle + 0.02, angle + a - 0.02);
+    g.stroke();
+    angle += a;
+  }
+  g.fillStyle = "#e6ebf2"; g.font = "600 17px -apple-system,sans-serif";
+  g.textAlign = "center"; g.fillText(String(total), cx, cy + 2);
+  g.fillStyle = "#7d8798"; g.font = "10px -apple-system,sans-serif";
+  g.fillText(centerText || "", cx, cy + 17);
+}
+
+function drawTrend(cv, daily) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = cv.clientWidth || 280, h = cv.clientHeight || 112;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const rows = (daily || []).slice(-7);
+  const max = Math.max(1, ...rows.map((x) => Math.max(Number(x.messages) || 0, Number(x.submissions) || 0)));
+  const pad = { l: 5, r: 5, t: 13, b: 17 };
+  const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
+  g.strokeStyle = "#1d2530"; g.lineWidth = 1;
+  [0, 0.5, 1].forEach((p) => {
+    const y = pad.t + ph * p;
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+  });
+  g.fillStyle = "#7d8798"; g.font = "8px ui-monospace,monospace"; g.textAlign = "right";
+  g.fillText(String(max), w - pad.r, 9);
+  if (!rows.length) {
+    g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
+    g.textAlign = "center"; g.fillText("暂无活动", w / 2, h / 2);
+    return;
+  }
+  const gw = pw / rows.length, bw = Math.max(3, gw * 0.26);
+  rows.forEach((row, i) => {
+    const x = pad.l + gw * i + gw / 2;
+    const m = Number(row.messages) || 0, s = Number(row.submissions) || 0;
+    const mh = (m / max) * ph, sh = (s / max) * ph;
+    g.fillStyle = "#6aa9ff";
+    g.fillRect(x - bw - 1, pad.t + ph - mh, bw, mh);
+    g.fillStyle = "#56d364";
+    g.fillRect(x + 1, pad.t + ph - sh, bw, sh);
+    g.fillStyle = "#7d8798"; g.font = "8px ui-monospace,monospace"; g.textAlign = "center";
+    g.fillText(String(row.day || "").slice(5), x, h - 5);
+  });
+}
+
+function renderStack(el, parts) {
+  if (!el) return;
+  const total = parts.reduce((a, p) => a + Math.max(0, p.value), 0);
+  el.innerHTML = total
+    ? parts.filter((p) => p.value > 0).map((p) =>
+        `<span class="seg" style="flex:${p.value};background:${p.color}" title="${esc(p.label)} ${p.value}"></span>`).join("")
+    : `<span class="stackEmpty">暂无</span>`;
+}
+
+function renderLegend(el, parts, kind) {
+  if (!el) return;
+  el.innerHTML = parts.map((p) =>
+    `<button type="button" data-dash-${kind}="${p.key}" title="点击筛选">
+      <i style="background:${p.color}"></i><span>${esc(p.label)}</span><b>${p.value}</b>
+    </button>`).join("");
+}
+
+function showCardFilter(cardName, tab, value) {
+  window.hubTab?.(tab);
+  const card = cardByTitle(cardName);
+  if (!card) return;
+  if (card._filterSel && value) {
+    card._filterSel.value = value;
+    card._applyFilter?.();
+  }
+  setTimeout(() => card.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
+}
+
+function renderDashboard() {
+  if (!document.getElementById("dashTaskBar")) return;
+  const scope = current === "*" ? "全部项目" : (current || "—");
+  const scopeEl = $("dashScope"); if (scopeEl) scopeEl.textContent = scope;
+  const taskParts = [
+    { key: "open", label: "待领取", color: "#7d8798", value: 0 },
+    { key: "claimed", label: "执行中", color: "#6aa9ff", value: 0 },
+    { key: "released", label: "待取", color: "#d29922", value: 0 },
+    { key: "blocked", label: "阻塞", color: "#f85149", value: 0 },
+    { key: "done", label: "完成", color: "#56d364", value: 0 },
+  ];
+  for (const t of (TASK_ROWS || [])) {
+    const p = taskParts.find((x) => x.key === t.state);
+    if (p) p.value++;
+  }
+  const taskTotal = taskParts.reduce((a, p) => a + p.value, 0);
+  $("dashTaskTotal").textContent = taskTotal ? `${taskTotal}` : "—";
+  renderStack($("dashTaskBar"), taskParts);
+  renderLegend($("dashTaskLegend"), taskParts, "task");
+
+  const subStates = ANALYTICS.submission_states || {};
+  const subParts = [
+    { key: "delivered", label: "待取", color: "#6aa9ff", value: Number(subStates.delivered) || 0 },
+    { key: "collected", label: "已取", color: "#56d364", value: Number(subStates.collected) || 0 },
+    { key: "archived", label: "归档", color: "#7d8798", value: Number(subStates.archived) || 0 },
+  ];
+  const subTotal = subParts.reduce((a, p) => a + p.value, 0);
+  $("dashSubTotal").textContent = subTotal ? `${subTotal}` : "—";
+  renderStack($("dashSubBar"), subParts);
+  renderLegend($("dashSubLegend"), subParts, "sub");
+
+  const agentParts = [
+    { key: "work:idle", label: "空闲", color: "#56d364", value: 0 },
+    { key: "work:work", label: "忙碌", color: "#6aa9ff", value: 0 },
+    { key: "work:blocked", label: "阻塞", color: "#d29922", value: 0 },
+    { key: "alive:late", label: "迟到", color: "#d29922", value: 0 },
+    { key: "alive:offline", label: "失联", color: "#f85149", value: 0 },
+  ];
+  for (const a of (window._agents || [])) {
+    const work = (a.work || {}).state || "idle";
+    const key = a.alive !== "alive" ? `alive:${a.alive || "offline"}`
+      : (work === "busy" ? "work:work" : work === "blocked" ? "work:blocked" : "work:idle");
+    const p = agentParts.find((x) => x.key === key);
+    if (p) p.value++;
+  }
+  const agentTotal = agentParts.reduce((a, p) => a + p.value, 0);
+  $("dashAgentTotal").textContent = agentTotal ? `${agentTotal} 个` : "—";
+  drawDonut($("dashAgentChart"), agentParts, "节点");
+  renderLegend($("dashAgentLegend"), agentParts, "agent");
+
+  const daily = ANALYTICS.daily || [];
+  const sums = ANALYTICS.totals || {};
+  $("dashTrendTotal").textContent = daily.length ? `${sums.messages ?? 0} 条消息 · ${sums.submissions ?? 0} 交付` : "";
+  drawTrend($("dashTrendChart"), daily);
+  const trendLegend = $("dashTrendLegend");
+  if (trendLegend) trendLegend.innerHTML =
+    `<span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#6aa9ff"></i>消息</span>
+     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#56d364"></i>交付</span>`;
+}
+
+let dashResizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(dashResizeTimer);
+  dashResizeTimer = setTimeout(renderDashboard, 120);
+});
 
 function drawLine(cv, vals, color) {
   const dpr = window.devicePixelRatio || 1;
@@ -1423,6 +1640,8 @@ function addFilter(card, placeholder, opts) {
   bar.append(inp, cnt);
   const h = card.querySelector("h2");
   h.after(bar);
+  card._filterSel = sel;
+  card._filterInput = inp;
   const apply = () => {
     const q = inp.value.trim().toLowerCase();
     const body = card.querySelector(".cardBody") || card;
@@ -1474,6 +1693,7 @@ function bindFilters() {
         { v: "alive:offline", label: "失联" },
         { v: "work:work", label: "忙" },
         { v: "work:idle", label: "闲" },
+        { v: "work:blocked", label: "阻塞" },
       ],
       test: (row, v) => {
         if (v === "all") return true;
@@ -1519,6 +1739,7 @@ function setCardOpen(title, open) {
   const col = c.querySelector(".cardTools .ghost:last-child");
   if (col) col.textContent = open ? "▾" : "▸";
   try { localStorage.setItem(`hub.fold2.${title}`, open ? "0" : "1"); } catch {}
+  if (open) setTimeout(renderDashboard, 30);
 }
 
 const BADGES = { access: 0, deli: 0, msg: 0, task: 0 };
@@ -1564,11 +1785,13 @@ function bindTabs() {
     localStorage.setItem("hub.tab", g.id);
     if (g.id === "msg") markMsgSeen();
     window.scrollTo({ top: 0 });
+    setTimeout(renderDashboard, 30);   // 切到总览时按真实宽度重画
   };
   bar.onclick = (e) => {
     const b = e.target.closest("[data-tab]");
     if (b) apply(b.dataset.tab);
   };
+  window.hubTab = (id) => apply(id);
   apply(saved);
 }
 
@@ -1683,11 +1906,25 @@ async function loadStats() {
     ["24h 有心跳", d.agents_heartbeat_24h ?? 0],
     ["待审注册", d.enrollments_pending ?? 0],
     ["项目", d.projects ?? 0],
-    ["交付", total],
+    ["交付", total, `待取 ${sub.delivered ?? 0}`],
   ];
-  $("stats").innerHTML = items.map(([k, v]) =>
-    `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+  $("stats").innerHTML = items.map(([k, v, sub]) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v">${v}${sub ? `<span class="sub">${sub}</span>` : ""}</div></div>`).join("");
   $("ovAt").textContent = new Date(d.at).toLocaleTimeString();
+}
+
+async function loadAnalytics() {
+  if (!current) return;
+  const scope = current;
+  const q = scope !== "*" ? `?project=${encodeURIComponent(scope)}` : "";
+  const d = await api("/admin/analytics" + q).catch((e) => {
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] analytics failed", e);
+    return null;
+  });
+  if (!d || scope !== current) return;
+  ANALYTICS = d;
+  renderDashboard();
 }
 
 function setProjectPanels(enabled) {
@@ -1736,7 +1973,7 @@ async function refresh() {
   if (!current) return;
   // 各面板独立容错：任一非核心接口失败不应让整页 lock()。
   // 用 allSettled 并打印失败项，界面其余部分照常渲染。
-  const parts = [loadAgents(), loadSec(), loadStats(), loadEnr()];
+  const parts = [loadAgents(), loadSec(), loadStats(), loadEnr(), loadAnalytics()];
   const results = await Promise.allSettled(parts);
   results.forEach((r, i) => {
     if (r.status === "rejected") console.warn("[hub] refresh part failed", i, r.reason);
@@ -1766,6 +2003,7 @@ $("proj").onchange = (e) => {
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
+  ANALYTICS = { daily: [], submission_states: {}, totals: {} };
   fillDetailProjects();
   refresh();
   connectLive();
@@ -1921,6 +2159,18 @@ $("btnTaskCreate").onclick = async () => {
 
 document.addEventListener("click", async (e) => {
   const el = e.target;
+  const dash = el.closest && el.closest("[data-dash-task],[data-dash-sub],[data-dash-agent]");
+  if (dash) {
+    const taskState = dash.getAttribute("data-dash-task");
+    if (taskState) return showCardFilter("任务", "task", taskState);
+    const subState = dash.getAttribute("data-dash-sub");
+    if (subState) {
+      if (current === "*") return showToast("切到具体项目后查看交付明细", 4000);
+      return showCardFilter("交付箱", "deli", subState);
+    }
+    const agentState = dash.getAttribute("data-dash-agent");
+    if (agentState) return showCardFilter("名册", "overview", agentState);
+  }
   const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery],[data-task-close],[data-task-reclaim],[data-task-reassign]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
