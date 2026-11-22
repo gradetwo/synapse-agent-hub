@@ -3,6 +3,7 @@
 import { Env, Msg, Task } from "./types";
 
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
+const TASK_LEASE_MS = 10 * 60_000; // 任务 claim 租约：心跳会续，不用 2 分钟卡死长任务
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
@@ -53,6 +54,9 @@ export class ProjectRoom implements DurableObject {
       case "tasks/submission-settled": return this.submissionSettled(body);
       case "tasks/list":   return this.listTasks();
       case "tasks/create": return this.createTask(body);
+      case "tasks/admin-close": return this.adminClose(body);
+      case "tasks/admin-reclaim": return this.adminReclaim(body);
+      case "tasks/admin-reassign": return this.adminReassign(body);
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
       case "ws":           return this.ws(req);
@@ -283,7 +287,7 @@ export class ProjectRoom implements DurableObject {
     const tasks = await this.st.list<Task>({ prefix: "task:" });
     for (const [k, t] of tasks) {
       if (t.owner === b.agent_id && t.state === "claimed") {
-        await this.st.put(k, { ...t, lease_until: now + 120_000 });
+        await this.st.put(k, { ...t, lease_until: now + TASK_LEASE_MS });
       }
     }
 
@@ -312,10 +316,12 @@ export class ProjectRoom implements DurableObject {
     if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(id)) return json({ error: "bad_task_id" }, 422);
     const old = await this.st.get(`task:${id}`);
     if (old) return json({ error: "task_exists", task_id: id }, 409);
+    const now = Date.now();
+    const to = b.to === undefined || b.to === null || String(b.to).trim() === "" ? null : String(b.to).trim();
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
                      project: b.project ?? this.projectName(),
-                     owner: null, lease_until: 0, created_at: Date.now(),
-                     created_by: b.sender ?? "admin", to: b.to ?? null };
+                     owner: null, lease_until: 0, created_at: now, updated_at: now,
+                     created_by: b.sender ?? "admin", to };
     await this.st.put(`task:${id}`, t);
     const seq = await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task",
                                    kind: "task", to: b.to ?? undefined,
@@ -373,8 +379,9 @@ export class ProjectRoom implements DurableObject {
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
     if (t.state !== "open" && !(t.state === "claimed" && t.lease_until < now))
       return json({ error: "locked", owner: t.owner, lease_until: t.lease_until }, 409);
-    const lease = now + 120_000;
-    await this.st.put(`task:${b.task_id}`, { ...t, state: "claimed", owner: b.agent_id, lease_until: lease });
+    const lease = now + TASK_LEASE_MS;
+    await this.st.put(`task:${b.task_id}`, { ...t, state: "claimed", owner: b.agent_id,
+                                             lease_until: lease, updated_at: now });
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "claimed",
                         payload: { task_id: b.task_id, lease_until: lease },
                         dedupe_key: `claim:${b.task_id}:${b.agent_id}:${now}` });
@@ -395,18 +402,27 @@ export class ProjectRoom implements DurableObject {
     if (!t) return json({ error: "not_found" }, 404);
     if (t.owner !== b.agent_id) return json({ error: "not_owner" }, 403);
     const want = b.state ?? "done";
+    if (!["done", "open", "blocked"].includes(want))
+      return json({ error: "bad_release_state", allowed: ["done", "open", "blocked"] }, 422);
     let state = want;
     let pending = 0;
     // 联动：目标是 done 时先看交付——还有没取走的，任务只进 released（已交付待取），
     // 不许直接 done。最后一件被取走时由 submissionSettled 收成 done。
-    // 显式传其它状态（如 blocked）不走联动，照旧。
+    // state=open 是 agent 自己放弃 claim：owner 清空，to 保留，交给管理侧决定取回/转派。
     if (want === "done") {
       pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
       if (pending > 0) state = "released";
     }
-    await this.st.put(`task:${b.task_id}`, { ...t, state, owner: null, lease_until: 0, pending_submissions: pending });
+    const now = Date.now();
+    const patch: any = { state, owner: null, lease_until: 0, pending_submissions: pending,
+                         updated_at: now };
+    if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
+    if (state === "blocked") { patch.blocked_at = now; }
+    await this.st.put(`task:${b.task_id}`, { ...t, ...patch });
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: state,
-                        payload: { task_id: b.task_id, pending_submissions: pending }, dedupe_key: `release:${b.task_id}:${Date.now()}` });
+                        payload: { task_id: b.task_id, pending_submissions: pending,
+                                   ...(state === "open" ? { abandoned_by: b.agent_id } : {}) },
+                        dedupe_key: `release:${b.task_id}:${Date.now()}` });
     return json({ ok: true, state, pending_submissions: pending });
   }
 
@@ -418,7 +434,9 @@ export class ProjectRoom implements DurableObject {
     let state = t.state;
     if (t.state === "released" && pending === 0) {
       state = "done";
-      await this.st.put(`task:${b.task_id}`, { ...t, state, pending_submissions: 0 });
+      const now = Date.now();
+      await this.st.put(`task:${b.task_id}`, { ...t, state, pending_submissions: 0,
+                                               updated_at: now, closed_at: now, closed_by: "collection" });
       await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task", kind: "done",
                           payload: { task_id: b.task_id, closed_by: "collection" }, dedupe_key: `close:${b.task_id}` });
     } else {
@@ -429,7 +447,104 @@ export class ProjectRoom implements DurableObject {
 
   private async listTasks() {
     const r = await this.st.list<Task>({ prefix: "task:" });
-    return json({ tasks: [...r.values()] });
+    const now = Date.now();
+    const agents = new Map<string, any>();
+    for (const a of (await this.st.list<any>({ prefix: "agent:" })).values()) agents.set(a.agent_id, a);
+    const tasks = [...r.values()].map((t: any) => {
+      const ownerAge = t.owner ? now - Number(agents.get(t.owner)?.last_hb_ms ?? 0) : Infinity;
+      return {
+        ...t,
+        lease_left_ms: Math.max(0, Number(t.lease_until ?? 0) - now),
+        owner_online: t.owner ? ownerAge <= 300_000 : null,
+        owner_alive: t.owner ? (ownerAge <= 120_000 ? "alive" : ownerAge <= 300_000 ? "late" : "offline") : null,
+      };
+    });
+    const rank = (s: string) => s === "claimed" ? 0 : s === "open" ? 1 : s === "released" ? 2 : s === "blocked" ? 3 : 4;
+    tasks.sort((a: any, b: any) => rank(a.state) - rank(b.state)
+      || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
+    return json({ tasks });
+  }
+
+  private adminReason(b: any): string {
+    return String(b?.reason ?? "").trim().slice(0, 240);
+  }
+
+  private taskIdOf(b: any): string | null {
+    const id = String(b?.task_id ?? "").trim();
+    return id || null;
+  }
+
+  private async loadTaskForAdmin(b: any): Promise<{ t: any; project: string } | Response> {
+    if (b?.sender !== "admin") return json({ error: "admin_only" }, 403);
+    const id = this.taskIdOf(b);
+    if (!id) return json({ error: "task_id_required" }, 422);
+    const t: any = await this.st.get(`task:${id}`);
+    if (!t) return json({ error: "not_found", task_id: id }, 404);
+    return { t, project: String(b.project ?? t.project ?? this.projectName()) };
+  }
+
+  private async adminClose(b: any) {
+    const got = await this.loadTaskForAdmin(b);
+    if (got instanceof Response) return got;
+    const { t, project } = got;
+    if (t.state === "done") return json({ ok: true, task: t, already: true });
+    const now = Date.now();
+    const reason = this.adminReason(b);
+    const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
+    const task = { ...t, state: "done", owner: null, lease_until: 0,
+                   pending_submissions: pending, updated_at: now,
+                   closed_at: now, closed_by: "admin" };
+    await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    await this.append({ project, sender: "admin", topic: "task", kind: "done",
+                        payload: { task_id: t.task_id ?? t.id, closed_by: "admin",
+                                   pending_submissions: pending, prev_state: t.state, reason },
+                        dedupe_key: `admin-close:${t.task_id ?? t.id}:${now}` });
+    return json({ ok: true, task });
+  }
+
+  private async adminReclaim(b: any) {
+    const got = await this.loadTaskForAdmin(b);
+    if (got instanceof Response) return got;
+    const { t, project } = got;
+    if (t.state === "done") return json({ error: "task_done", task_id: t.task_id ?? t.id }, 409);
+    const now = Date.now();
+    const reason = this.adminReason(b);
+    const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
+    const task = { ...t, state: "open", owner: null, lease_until: 0, to: null,
+                   pending_submissions: pending, updated_at: now, reclaimed_at: now,
+                   reclaimed_from: t.owner ?? null };
+    await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    await this.append({ project, sender: "admin", topic: "task", kind: "reclaimed",
+                        payload: { task_id: t.task_id ?? t.id, prev_state: t.state,
+                                   prev_owner: t.owner ?? null, prev_to: t.to ?? null, reason },
+                        dedupe_key: `admin-reclaim:${t.task_id ?? t.id}:${now}` });
+    return json({ ok: true, task });
+  }
+
+  private async adminReassign(b: any) {
+    const got = await this.loadTaskForAdmin(b);
+    if (got instanceof Response) return got;
+    const { t, project } = got;
+    if (t.state === "done") return json({ error: "task_done", task_id: t.task_id ?? t.id }, 409);
+    const to = String(b.to ?? "").trim();
+    if (!to) return json({ error: "assignee_required" }, 422);
+    const agent = await this.env.DB.prepare(
+      `SELECT agent_id FROM agents WHERE project = ? AND agent_id = ?
+         AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`
+    ).bind(project, to, Date.now()).first<any>();
+    if (!agent) return json({ error: "assignee_not_found", agent_id: to }, 422);
+    const now = Date.now();
+    const reason = this.adminReason(b);
+    const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
+    const task = { ...t, state: "open", owner: null, lease_until: 0, to,
+                   pending_submissions: pending, updated_at: now,
+                   reassigned_at: now, reassigned_from: t.owner ?? t.to ?? null };
+    await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    await this.append({ project, sender: "admin", topic: "task", kind: "reassigned", to,
+                        payload: { task_id: t.task_id ?? t.id, to, prev_state: t.state,
+                                   prev_owner: t.owner ?? null, prev_to: t.to ?? null, reason },
+                        dedupe_key: `admin-reassign:${t.task_id ?? t.id}:${now}` });
+    return json({ ok: true, task });
   }
 
   // ── 广播：一条消息 + 待确认名单 + supersedes 失效 ─────────

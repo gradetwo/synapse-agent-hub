@@ -9,7 +9,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "task-closure-link-20261120";
+const BUILD_TAG = "task-dispatch-20261122";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.1";
 
@@ -457,6 +457,7 @@ function need(action: string) {
   if (action.startsWith("report")) return "report";
   if (action.startsWith("inbox")) return "poll";
   if (action === "tasks/list") return "admin";      // 任务台账含派单对象，不对普通 agent 开放
+  if (action.startsWith("tasks/admin-")) return "admin";
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
 }
@@ -789,6 +790,17 @@ async function admin(req: Request, env: Env, url: URL) {
       }));
     }
     if (action === "tasks" && req.method === "GET") return stub.fetch(new Request("https://do/tasks/list"));
+    // 任务四个出口里的管理侧动作：关单、取回、转派。sender 固定 admin，不接受客户端伪造。
+    if (["tasks/close", "tasks/reclaim", "tasks/reassign"].includes(action) && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      if (!String(b.task_id ?? "").trim()) return err(422, "task_id_required");
+      const doAction = action === "tasks/close" ? "tasks/admin-close"
+        : action === "tasks/reclaim" ? "tasks/admin-reclaim" : "tasks/admin-reassign";
+      return stub.fetch(new Request("https://do/" + doAction, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...b, project, sender: "admin" }),
+      }));
+    }
     if (action === "snapshot") return stub.fetch(new Request("https://do/snapshot"));
 
     // 吊销一个或多个 agent（幂等）：二次确认由前端承担，后端要 confirm 标记

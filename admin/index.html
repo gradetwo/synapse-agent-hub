@@ -59,6 +59,17 @@ if (location.search.includes("reset=1")) {
   .badge.delivered{color:var(--accent);border-color:#24406e}
   .badge.collected{color:var(--ok);border-color:#1d3a25}
   .badge.archived{opacity:.55}
+  /* 任务台账：状态必须一眼可辨，不要只靠颜色（手机/色弱） */
+  .badge.open{color:#9aa4b2;border-color:#2a333f}
+  .badge.claimed{color:#8fb8ff;border-color:#24406e;background:#101a2a}
+  .badge.released{color:#ffd58a;border-color:#674b18;background:#241b0e}
+  .badge.blocked{color:#ff9b9b;border-color:#5b2626;background:#211012}
+  .badge.done{color:#86d99e;border-color:#1d3a25;background:#101b13}
+  .taskForm .row{grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr)}
+  .taskForm .row3{grid-template-columns:minmax(0,1.2fr) minmax(120px,.7fr) auto;align-items:center}
+  .taskForm .row3 button{min-height:38px}
+  .taskRow select{max-width:118px;font-size:11px;padding:3px 6px;min-height:28px}
+  @media(max-width:640px){.taskForm .row,.taskForm .row3{grid-template-columns:1fr}.taskRow select{max-width:100%}}
   /* 待取交付的全局提醒：不是普通提示条，必须一直可见直到取走 */
   .alertbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;
     border:1px solid #674b18;border-radius:var(--radius);background:#241b0e;color:#ffd58a;
@@ -328,6 +339,30 @@ if (location.search.includes("reset=1")) {
   </div>
 
   <div class="card">
+    <h2>任务 <span class="muted" id="taskStat"></span></h2>
+    <div class="form taskForm">
+      <div class="row">
+        <label>任务 ID<input id="taskId" placeholder="例如 T-FIX-71" autocomplete="off"></label>
+        <label>标题<input id="taskTitle" placeholder="一句话说清要做什么" autocomplete="off"></label>
+      </div>
+      <div class="row3">
+        <label>指派给
+          <select id="taskTo"><option value="">不指派（公共池）</option></select>
+        </label>
+        <button class="primary" id="btnTaskCreate">派单</button>
+        <span class="muted" style="font-size:11px;line-height:1.5">不填 ID 自动生成；指派离线节点也会留在它的队列里。</span>
+      </div>
+      <label>正文<textarea id="taskBody" placeholder="补丁范围、验收口径、依赖任务…"></textarea></label>
+    </div>
+    <table>
+      <thead><tr>
+        <th>任务</th><th>状态</th><th>执行节点</th><th>租约</th><th class="num">待取</th><th>更新</th><th>操作</th>
+      </tr></thead>
+      <tbody id="tasks"><tr><td colspan="7" class="empty">选择具体项目查看任务</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
     <h2>交付箱 <span class="muted" id="subStat"></span></h2>
     <table>
       <thead><tr>
@@ -501,6 +536,7 @@ let current = "";
 let allProjects = [];
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
+let TASK_ROWS = [];                // 最近一次任务台账快照（任务 tab 用）
 let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
 let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
 let toastTimer = null;
@@ -676,6 +712,75 @@ async function loadAgents() {
   bindBulk();
   reapplyFilters();
   renderSndWho(rows);
+}
+
+function taskAgentOptions(selected) {
+  const agents = (window._agents || []).filter((a) => !current || current === "*" || a.project === current);
+  const opts = [`<option value="">不指派（公共池）</option>`];
+  for (const a of agents) {
+    const mark = a.alive === "alive" ? "" : a.alive === "late" ? "（迟到）" : "（离线）";
+    opts.push(`<option value="${a.agent_id}"${a.agent_id === selected ? " selected" : ""}>${a.agent_id}${mark}</option>`);
+  }
+  return opts.join("");
+}
+
+function taskLease(t) {
+  if (t.state !== "claimed") return t.lease_left_ms > 0 && t.owner ? `${Math.ceil(t.lease_left_ms / 1000)}s` : "—";
+  if (!t.owner) return "—";
+  if (t.lease_left_ms <= 0) return `<span class="badv">已过期</span>`;
+  const s = Math.ceil(t.lease_left_ms / 1000);
+  return t.owner_online === false ? `<span class="badv">节点离线</span>` :
+    `<span class="${s <= 60 ? "warnv" : ""}">${s}s</span>`;
+}
+
+function taskStateLabel(s) {
+  return { open: "待领取", claimed: "执行中", released: "已交付待取", blocked: "已阻塞", done: "已完成" }[s] || s;
+}
+
+async function loadTasks() {
+  if (current === "*") {
+    TASK_ROWS = [];
+    $("taskStat").textContent = "全部项目视图不汇总";
+    $("tasks").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看任务</td></tr>`;
+    BADGES.task = 0;
+    updateBadges();
+    return;
+  }
+  const raw = await api(`/admin/p/${current}/tasks`);
+  const d = Array.isArray(raw) ? raw : (raw.tasks || []);
+  TASK_ROWS = d;
+  const active = d.filter((t) => t.state !== "done").length;
+  $("taskStat").textContent = `${active} 活跃 / 共 ${d.length}`;
+  BADGES.task = active;
+  updateBadges();
+  const keepTo = $("taskTo").value;
+  $("taskTo").innerHTML = taskAgentOptions(keepTo);
+  if (keepTo) $("taskTo").value = keepTo;
+  $("tasks").innerHTML = d.length ? d.map((t) => {
+    const id = t.task_id || t.id || "";
+    const st = t.state || "open";
+    const owner = t.owner ? `<span class="mono">${t.owner}</span>` :
+      (t.to ? `<span class="muted">→ <span class="mono">${t.to}</span></span>` : "—");
+    const pending = Number(t.pending_submissions ?? 0);
+    const assigned = t.to || t.owner || "";
+    const acts = st === "done" ? `<span class="muted">已结</span>` : `
+      <button class="ghost mini" data-task-close="${id}">完成</button>
+      <button class="ghost mini" data-task-reclaim="${id}">取回</button>
+      <select class="mini taskRow" data-task-assignee="${id}">${taskAgentOptions(assigned)}</select>
+      <button class="ghost mini" data-task-reassign="${id}">转派</button>`;
+    const pendingCell = pending > 0
+      ? `<button class="ghost mini" data-goto-delivery="1" title="去交付箱取走">${pending}</button>` : "—";
+    return `<tr data-task-id="${id}" data-state="${st}">
+      <td><span class="mono">${id}</span><div class="muted" style="white-space:normal;max-width:240px">${t.title || ""}</div></td>
+      <td><span class="badge ${st}">${taskStateLabel(st)}</span></td>
+      <td>${owner}</td>
+      <td>${taskLease(t)}</td>
+      <td class="num">${pendingCell}</td>
+      <td class="muted">${t.updated_at ? ago((Date.now() - t.updated_at) / 1000) + "前" : "—"}</td>
+      <td style="white-space:nowrap">${acts}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">当前项目还没有任务，先在上面派一件</td></tr>`;
+  reapplyFilters();
 }
 
 async function loadSubs() {
@@ -1347,11 +1452,23 @@ function bindFilters() {
       ],
       test: (row, v) => v === "all" || (row.dataset.state || "") === v,
     });
+    else if (/^任务/.test(t)) addFilter(c, "搜任务号 / 标题 / 节点", {
+      items: [
+        { v: "all", label: "全部" },
+        { v: "open", label: "待领取" },
+        { v: "claimed", label: "执行中" },
+        { v: "released", label: "已交付待取" },
+        { v: "blocked", label: "已阻塞" },
+        { v: "done", label: "已完成" },
+      ],
+      test: (row, v) => v === "all" || (row.dataset.state || "") === v,
+    });
   });
 }
 
 const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "名册"] },
+  { id: "task",     label: "任务", cards: ["任务"] },
   { id: "msg",      label: "消息", cards: ["消息流", "定向指令", "广播"] },
   { id: "deli",     label: "交付", cards: ["交付箱"] },
   { id: "access",   label: "接入", cards: ["签发 token", "注册审批", "登录封禁"] },
@@ -1366,7 +1483,7 @@ function setCardOpen(title, open) {
   try { localStorage.setItem(`hub.fold2.${title}`, open ? "0" : "1"); } catch {}
 }
 
-const BADGES = { access: 0, deli: 0, msg: 0 };
+const BADGES = { access: 0, deli: 0, msg: 0, task: 0 };
 let MSG_MAX = 0;
 let ACTIVE_TAB = "overview";
 function markMsgSeen() {
@@ -1378,7 +1495,7 @@ function markMsgSeen() {
 function updateBadges() {
   const bar = $("tabs");
   if (!bar) return;
-  Object.entries({ access: BADGES.access, deli: BADGES.deli, msg: BADGES.msg }).forEach(([g, n]) => {
+  Object.entries({ access: BADGES.access, deli: BADGES.deli, msg: BADGES.msg, task: BADGES.task }).forEach(([g, n]) => {
     const el = bar.querySelector(`[data-cnt="${g}"]`);
     if (el) el.textContent = n > 0 ? ` ${n}` : "";
   });
@@ -1536,7 +1653,7 @@ async function loadStats() {
 }
 
 function setProjectPanels(enabled) {
-  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast"]) {
+  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast", "btnTaskCreate"]) {
     const el = $(id);
     if (el) el.disabled = !enabled;
   }
@@ -1550,6 +1667,8 @@ function setProjectPanels(enabled) {
     return;
   }
   // 全部项目只做聚合总览；涉及写操作/交付/消息的卡片必须回到具体项目。
+  $("taskStat").textContent = "全部项目视图不汇总";
+  $("tasks").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看任务</td></tr>`;
   $("subStat").textContent = "全部项目视图不汇总";
   $("subs").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看交付箱</td></tr>`;
   $("msgStat").textContent = "";
@@ -1562,7 +1681,9 @@ function setProjectPanels(enabled) {
   document.title = BASE_TITLE;
   BADGES.deli = 0;
   BADGES.msg = 0;
+  BADGES.task = 0;
   updateBadges();
+  TASK_ROWS = [];
   SUB_ROWS = [];
   SUB_STATE = new Map();
   lastPending = null;
@@ -1587,6 +1708,8 @@ async function refresh() {
     return;
   }
   setProjectPanels(true);
+  // 任务台账要等 loadAgents 完成后再渲染，才能把 active/offline 标在转派下拉里
+  try { await loadTasks(); } catch (e) { console.warn("[hub] loadTasks failed", e); }
   // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
   await loadSubs();
   await loadMsgs();
@@ -1665,9 +1788,32 @@ $("gateCancel").onclick = () => {
   token = ""; localStorage.removeItem(KEY);
   lock("已取消：没有凭证时不会显示任何项目数据。点“连接”可重新输入。");
 };
+$("btnTaskCreate").onclick = async () => {
+  if (current === "*") return alert("先选择具体项目再派单");
+  const title = $("taskTitle").value.trim();
+  const body = $("taskBody").value.trim();
+  if (!title) return $("taskTitle").focus();
+  let id = $("taskId").value.trim();
+  if (!id) {
+    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    id = `T-${stamp}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+  }
+  const to = $("taskTo").value || null;
+  $("btnTaskCreate").disabled = true;
+  try {
+    const r = await api(`/admin/p/${current}/tasks`, "POST", { task_id: id, title, body, to });
+    showToast(`已派单 ${r.task_id || id}${to ? " → " + to : ""}`, 6000);
+    $("taskId").value = ""; $("taskTitle").value = ""; $("taskBody").value = "";
+    await loadTasks();
+    setCardOpen("任务", true);
+  } finally {
+    $("btnTaskCreate").disabled = false;
+  }
+};
+
 document.addEventListener("click", async (e) => {
   const el = e.target;
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery],[data-task-close],[data-task-reclaim],[data-task-reassign]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const ca = btn.getAttribute("data-collect-all");
@@ -1691,6 +1837,39 @@ document.addEventListener("click", async (e) => {
     if (co) return collect(co);
     const ub = btn.getAttribute("data-unblock");
     if (ub) { if (!confirm(`解除 ${ub} 的封禁？`)) return; await api("/admin/security/unblock", "POST", { ip: ub }); return loadSec(); }
+    const tc = btn.getAttribute("data-task-close");
+    if (tc) {
+      const row = btn.closest("[data-task-id]");
+      const pending = Number(row?.querySelector(".num")?.textContent?.trim() || 0);
+      const extra = pending > 0 ? `\n还有 ${pending} 份交付未取走；完成后交付仍留在交付箱。` : "";
+      if (!confirm(`关闭任务 ${tc}？${extra}`)) return;
+      const reason = prompt("修正理由（写入任务审计）", "管理员手动关单");
+      if (reason === null) return;
+      await api(`/admin/p/${current}/tasks/close`, "POST", { task_id: tc, reason });
+      showToast(`已关闭 ${tc}`, 5000);
+      return refresh();
+    }
+    const tr = btn.getAttribute("data-task-reclaim");
+    if (tr) {
+      if (!confirm(`取回任务 ${tr}？会清空执行节点与定向，回到公共池，交付保留。`)) return;
+      const reason = prompt("修正理由（写入任务审计）", "管理员取回公共池");
+      if (reason === null) return;
+      await api(`/admin/p/${current}/tasks/reclaim`, "POST", { task_id: tr, reason });
+      showToast(`已取回 ${tr}`, 5000);
+      return refresh();
+    }
+    const tas = btn.getAttribute("data-task-reassign");
+    if (tas) {
+      const row = btn.closest("[data-task-id]");
+      const to = row?.querySelector("[data-task-assignee]")?.value || "";
+      if (!to) return alert("先在左侧下拉里选择要转派给的节点");
+      if (!confirm(`把 ${tas} 转派给 ${to}？旧节点会失去 claim。`)) return;
+      const reason = prompt("修正理由（写入任务审计）", `管理员转派给 ${to}`);
+      if (reason === null) return;
+      await api(`/admin/p/${current}/tasks/reassign`, "POST", { task_id: tas, to, reason });
+      showToast(`已转派 ${tas} → ${to}`, 5000);
+      return refresh();
+    }
     return;
   }
   const dq = el.getAttribute && el.getAttribute("data-dq");
