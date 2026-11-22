@@ -33,12 +33,18 @@ if (location.search.includes("reset=1")) {
        font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
   .bar{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);
        background:var(--panel);position:sticky;top:0;z-index:9}
-  .bar h1{font-size:14px;font-weight:600;margin:0}
+  .bar h1{font-size:14px;font-weight:600;margin:0;display:flex;align-items:center;gap:8px}
+  .bar h1::before{content:"";width:7px;height:7px;border-radius:2px;background:var(--accent);flex:0 0 auto;vertical-align:1px}
+  #build{max-width:290px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #scope{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #btnMore{display:none}
   .muted{color:var(--dim);font-size:12px}
   .seg{margin-left:auto;display:flex;gap:8px;align-items:center}
   select,button,input,textarea{font:inherit;color:var(--fg);background:#1b222b;
        border:1px solid var(--line);border-radius:8px;padding:7px 10px}
-  button{cursor:pointer}
+  button{cursor:pointer;transition:border-color .15s ease,color .15s ease,background .15s ease,opacity .15s ease}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #2f6da8;outline-offset:2px}
   button.primary{background:var(--accent);border-color:var(--accent);color:#0b0f14;font-weight:600}
   button.ghost{background:transparent}
   .wrap{padding:16px 18px;display:grid;gap:16px;max-width:1280px}
@@ -66,8 +72,10 @@ if (location.search.includes("reset=1")) {
   .badge.blocked{color:#ff9b9b;border-color:#5b2626;background:#211012}
   .badge.done{color:#86d99e;border-color:#1d3a25;background:#101b13}
   .taskForm .row{grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr)}
-  .taskForm .row3{grid-template-columns:minmax(0,1.2fr) minmax(120px,.7fr) auto;align-items:center}
+  .taskForm .row3{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:10px;align-items:center}
+  .taskForm .row3 > .muted{grid-column:1/-1;font-size:11px;line-height:1.5}
   .taskForm .row3 button{min-height:38px}
+  body.view-all .taskForm,body.view-all .sndForm{display:none}
   .taskRow select{max-width:118px;font-size:11px;padding:3px 6px;min-height:28px}
   @media(max-width:640px){.taskForm .row,.taskForm .row3{grid-template-columns:1fr}.taskRow select{max-width:100%}}
   /* 待取交付的全局提醒：不是普通提示条，必须一直可见直到取走 */
@@ -195,7 +203,14 @@ if (location.search.includes("reset=1")) {
   .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid #232a33;border-radius:8px;background:#151b23}
   .whoItem input{width:auto;height:15px;min-height:0;margin:0;flex:0 0 auto}
   .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(6,minmax(0,1fr))}
-  .stat{background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px}
+  .stat{position:relative;background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;overflow:hidden}
+  .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:transparent}
+  .stat.ok::before{background:var(--ok)}
+  .stat.warn::before{background:var(--warn)}
+  .stat.accent::before{background:var(--accent)}
+  .stat.warn .v{color:#ffd58a}
+  .stat.accent .v{color:#8fb8ff}
+  .stat:hover{border-color:#2b3644}
   .stat .k{color:var(--dim);font-size:11px;letter-spacing:.02em}
   .stat .v{font-size:19px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
   .stat .sub{display:block;font-size:10px;color:var(--dim);font-weight:400;margin-top:1px}
@@ -216,14 +231,27 @@ if (location.search.includes("reset=1")) {
     min-height:0;background:transparent;color:#8b95a5;font-size:11px;line-height:18px;white-space:nowrap}
   .legend button:hover{background:#19212b;color:var(--fg)}
   .legend button.on{background:#132234;color:#eaf0f8}
+  .legend button.zero{opacity:.45}
   .legend i{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
   .legend b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
+  .dashWarn{width:100%;margin-top:8px;padding:5px 9px;text-align:left;border-radius:7px;
+    border:1px solid #674b18;background:#241b0e;color:#ffd58a;font-size:11px;min-height:28px}
+  .dashWarn[hidden]{display:none!important}
+  .dashWarn:hover{border-color:#a87922;color:#ffe5ae}
+  .projStrip{display:flex;gap:8px;overflow-x:auto;margin-top:10px;padding-bottom:2px}
+  .projStrip[hidden]{display:none!important}
+  .projChip{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:6px 10px;
+    border:1px solid #232a33;border-radius:8px;background:#121820;color:var(--fg);min-height:34px}
+  .projChip b{font-size:12px;font-weight:600}
+  .projChip span{font-size:11px;color:var(--dim);white-space:nowrap}
+  .projChip:hover{border-color:#2f6da8;background:#132234}
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
   @media(max-width:900px){.dashGrid{grid-template-columns:1fr 1fr}.dashGrid .dashTile:first-child{grid-column:1/-1}}
   @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
   @media(max-width:600px){.dashGrid{grid-template-columns:1fr}.dashGrid .dashTile:first-child{grid-column:auto}}
 
   @media (max-width:760px){
+    #build{display:none}
     .bar{flex-wrap:wrap;gap:8px;padding:calc(8px + env(safe-area-inset-top)) 12px 8px}
     .bar h1{font-size:13px}
     .seg{margin-left:0;width:100%;flex-wrap:wrap}
@@ -237,8 +265,17 @@ if (location.search.includes("reset=1")) {
 
   /* ===== 手机触控优先 ===== */
   @media(max-width:640px){
-    .bar{flex-wrap:wrap;gap:8px;padding:10px 0}
-    .seg{width:100%;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+    #scope{display:none}
+    .bar{position:static;flex-wrap:wrap;gap:8px;padding:10px 0}
+    .seg{width:100%;display:grid;grid-template-columns:minmax(0,1fr) 64px 46px;gap:8px}
+    .seg #liveDot{grid-column:1/-1;justify-self:start;padding:5px 9px!important;grid-row:1}
+    .seg #proj{grid-column:1;min-width:0;grid-row:2}
+    .seg #btnReload{grid-column:2;grid-row:2}
+    .seg #btnMore{grid-column:3;display:block;padding:0;font-size:20px;line-height:1;grid-row:2}
+    .seg #btnSettings,.seg #btnPurge,.seg #foldAll,.seg #autoRef{display:none}
+    .seg.more-open #btnSettings,.seg.more-open #btnPurge,.seg.more-open #foldAll,.seg.more-open #autoRef{
+      display:block;grid-column:1/-1;width:100%
+    }
     .seg select,.seg button{min-height:44px;width:100%}
     .wrap{padding:0 8px}
     .card{padding:12px}
@@ -318,6 +355,7 @@ if (location.search.includes("reset=1")) {
     <h2>概览 <span class="muted" id="ovAt">—</span></h2>
     <div class="ovBody">
       <div class="stats" id="stats"><div class="stat"><div class="k">加载中</div><div class="v">—</div></div></div>
+      <div class="projStrip" id="dashProjects" hidden></div>
       <div class="dashGrid">
         <div class="dashTile">
           <div class="dashHead">状态分布 <span id="dashScope" class="muted"></span></div>
@@ -333,6 +371,7 @@ if (location.search.includes("reset=1")) {
             <span class="num" id="dashSubTotal">—</span>
           </div>
           <div class="legend" id="dashSubLegend"></div>
+          <button class="dashWarn" id="dashStale" hidden></button>
         </div>
         <div class="dashTile">
           <div class="dashHead">节点 <span id="dashAgentTotal" class="muted"></span></div>
@@ -404,7 +443,7 @@ if (location.search.includes("reset=1")) {
           <select id="taskTo"><option value="">不指派（公共池）</option></select>
         </label>
         <button class="primary" id="btnTaskCreate">派单</button>
-        <span class="muted" style="font-size:11px;line-height:1.5">不填 ID 自动生成；只能指派在线节点，离线节点会被服务端拒绝。</span>
+        <span class="muted" style="font-size:11px;line-height:1.5">留空自动生成 ID；仅可指派在线节点。</span>
       </div>
       <label>正文<textarea id="taskBody" placeholder="补丁范围、验收口径、依赖任务…"></textarea></label>
     </div>
@@ -588,6 +627,7 @@ const deepEsc = (v) => Array.isArray(v) ? v.map(deepEsc)
 let policy = { mode: "all", projects: [] };
 let current = "";
 let allProjects = [];
+let refreshEpoch = 0;              // 切换项目/并发刷新时，旧请求只能静默丢弃
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
 let TASK_ROWS = [];                // 最近一次任务台账快照（任务 tab 用）
@@ -716,9 +756,6 @@ async function loadProjects() {
   const d = await api("/admin/projects");
   policy = d.policy;
   allProjects = d.projects || [];
-  $("scope").textContent = policy.mode === "all"
-    ? `全部项目 ${d.projects.length} 个`
-    : `指定项目 ${policy.projects.length} 个`;
   const sel = $("proj");
   sel.innerHTML = `<option value="*">全部项目</option>` + d.projects.map(p =>
     `<option value="${p.project}">${p.display_name}</option>`).join("");
@@ -732,8 +769,20 @@ async function loadProjects() {
   }
   sel.value = current;
   try { localStorage.setItem("hub.project", current); } catch {}
+  updateScopeLabel();
   fillDetailProjects();
   connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
+}
+
+function updateScopeLabel() {
+  const el = $("scope");
+  if (!el) return;
+  if (current === "*") {
+    el.textContent = `全部项目 ${allProjects.length} 个`;
+  } else {
+    const p = allProjects.find((x) => x.project === current);
+    el.textContent = p?.display_name || current || "—";
+  }
 }
 
 function fillDetailProjects() {
@@ -753,6 +802,7 @@ function activateProject(project) {
   const sel = $("proj");
   if (sel) sel.value = project;
   try { localStorage.setItem("hub.project", project); } catch {}
+  updateScopeLabel();
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
@@ -762,9 +812,11 @@ function activateProject(project) {
 }
 
 async function loadAgents() {
-  const isAll = current === "*";
-  const d = isAll ? await api("/admin/agents") : await api(`/admin/p/${current}/agents`);
-  const rows = (d.agents || []).map((a) => ({ ...a, project: a.project || current }));
+  const project = current;
+  const isAll = project === "*";
+  const d = isAll ? await api("/admin/agents") : await api(`/admin/p/${project}/agents`);
+  if (current !== project) return;   // 切项目/切视图后，旧请求只允许静默丢弃
+  const rows = (d.agents || []).map((a) => ({ ...a, project: a.project || project }));
   const alive = rows.filter(a => a.alive === "alive").length;
   $("agentStat").textContent = `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}`;
   $("agents").innerHTML = rows.length ? rows.map(a => {
@@ -798,12 +850,16 @@ async function loadAgents() {
   renderDashboard();
 }
 
-function taskAgentOptions(selected) {
+function taskAgentOptions(selected, allowOffline = false) {
   const agents = (window._agents || []).filter((a) => !current || current === "*" || a.project === current);
   const opts = [`<option value="">不指派（公共池）</option>`];
   for (const a of agents) {
     const mark = a.alive === "alive" ? "" : a.alive === "late" ? "（迟到）" : "（离线）";
-    opts.push(`<option value="${a.agent_id}"${a.agent_id === selected ? " selected" : ""}>${a.agent_id}${mark}</option>`);
+    const isCurrent = a.agent_id === selected;
+    // 行内下拉允许把“当前离线 owner”显示成选中态，但不能让它再次被提交给后端。
+    const off = a.alive !== "alive" && (!allowOffline || isCurrent);
+    const picked = isCurrent && !(a.alive !== "alive" && !allowOffline);
+    opts.push(`<option value="${a.agent_id}"${picked ? " selected" : ""}${off ? " disabled" : ""}>${a.agent_id}${mark}</option>`);
   }
   return opts.join("");
 }
@@ -821,12 +877,22 @@ function taskStateLabel(s) {
   return { open: "待领取", claimed: "执行中", released: "已交付待取", blocked: "已阻塞", done: "已完成" }[s] || s;
 }
 
+// 滞留：派了没人领，或领了但节点离线/租约过期。和“回收滞留”按钮共用同一口径。
+function taskIsStale(t) {
+  if (!t) return false;
+  if (t.state === "open") return !!t.to;
+  if (t.state === "claimed") return t.owner_online === false || Number(t.lease_left_ms) <= 0;
+  return false;
+}
+
 async function loadTasks() {
-  const isAll = current === "*";
+  const project = current;
+  const isAll = project === "*";
   let rows = [];
   if (isAll) {
     const projects = (allProjects || []).filter((p) => p.project !== "*");
     const got = await Promise.allSettled(projects.map((p) => api(`/admin/p/${p.project}/tasks`)));
+    if (current !== project) return;
     got.forEach((r, i) => {
       if (r.status !== "fulfilled") { console.warn("[hub] task list failed", projects[i]?.project, r.reason); return; }
       const raw = r.value;
@@ -834,7 +900,8 @@ async function loadTasks() {
       rows.push(...list.map((t) => ({ ...t, project: t.project || projects[i].project })));
     });
   } else {
-    const raw = await api(`/admin/p/${current}/tasks`);
+    const raw = await api(`/admin/p/${project}/tasks`);
+    if (current !== project) return;
     rows = Array.isArray(raw) ? raw : (raw.tasks || []);
   }
   const rank = (st) => st === "claimed" ? 0 : st === "open" ? 1 : st === "released" ? 2 : st === "blocked" ? 3 : 4;
@@ -842,9 +909,10 @@ async function loadTasks() {
     || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
   TASK_ROWS = rows;
   const active = rows.filter((t) => t.state !== "done").length;
+  const staleCount = rows.filter(taskIsStale).length;
   $("taskStat").textContent = isAll
-    ? `${active} 活跃 / 共 ${rows.length} · 全部项目（只读）`
-    : `${active} 活跃 / 共 ${rows.length}`;
+    ? `${active} 活跃 / 共 ${rows.length}${staleCount ? ` · 滞留 ${staleCount}` : ""} · 全部项目（只读）`
+    : `${active} 活跃 / 共 ${rows.length}${staleCount ? ` · 滞留 ${staleCount}` : ""}`;
   BADGES.task = active;
   updateBadges();
   const keepTo = $("taskTo").value;
@@ -857,15 +925,16 @@ async function loadTasks() {
       (t.to ? `<span class="muted">→ <span class="mono">${t.to}</span></span>` : "—");
     const pending = Number(t.pending_submissions ?? 0);
     const assigned = t.to || t.owner || "";
+    const stale = taskIsStale(t);
     const projectTag = isAll ? `<span class="muted" style="font-size:10px">${t.project || "—"}</span><br>` : "";
     const acts = isAll ? `<span class="muted">切到项目</span>` : (st === "done" ? `<span class="muted">已结</span>` : `
       <button class="ghost mini" data-task-close="${id}">完成</button>
       <button class="ghost mini" data-task-reclaim="${id}">取回</button>
-      <select class="mini taskRow" data-task-assignee="${id}">${taskAgentOptions(assigned)}</select>
+      <select class="mini taskRow" data-task-assignee="${id}">${taskAgentOptions(assigned, true)}</select>
       <button class="ghost mini" data-task-reassign="${id}">转派</button>`);
     const pendingCell = pending > 0
       ? (isAll ? `<span class="warnv">${pending}</span>` : `<button class="ghost mini" data-goto-delivery="1" title="去交付箱取走">${pending}</button>`) : "—";
-    return `<tr data-task-id="${id}" data-state="${st}" data-project="${t.project || current}">
+    return `<tr data-task-id="${id}" data-state="${st}" data-stale="${stale ? 1 : 0}" data-project="${t.project || current}">
       <td>${projectTag}<span class="mono">${id}</span><div class="muted" style="white-space:normal;max-width:240px">${t.title || ""}</div></td>
       <td><span class="badge ${st}">${taskStateLabel(st)}</span></td>
       <td>${owner}</td>
@@ -877,10 +946,14 @@ async function loadTasks() {
   }).join("") : `<tr><td colspan="7" class="empty">${isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件"}</td></tr>`;
   reapplyFilters();
   renderDashboard();
+  syncBulkAvailability();
 }
 
 async function loadSubs() {
-  const raw = await api(`/admin/p/${current}/submissions`);
+  const project = current;
+  if (!project || project === "*") return;
+  const raw = await api(`/admin/p/${project}/submissions`);
+  if (current !== project) return;
   const d = Array.isArray(raw) ? raw : (raw.submissions || []);
   SUB_ROWS = d;
   SUB_STATE = new Map(d.map((s) => [s.submission_id, s.state]));
@@ -932,9 +1005,11 @@ function subStateOf(id) {
   return row ? row.state : "";
 }
 
-async function downloadBundle(id) {
+async function downloadBundle(id, projectArg) {
+  const project = projectArg || current;
+  if (!project || project === "*") return false;
   try {
-    const r = await fetch(`/console/admin/p/${current}/submissions/${id}/bundle`,
+    const r = await fetch(`/console/admin/p/${project}/submissions/${id}/bundle`,
                           { credentials: "same-origin" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const blob = await r.blob();
@@ -951,11 +1026,13 @@ async function downloadBundle(id) {
   // "文件已经下载到本地、控制台还显示待取"的错位状态存在。
   if (subStateOf(id) === "delivered") {
     try {
-      await api(`/admin/p/${current}/submissions/${id}/collect`, "POST", {});
+      await api(`/admin/p/${project}/submissions/${id}/collect`, "POST", {});
       SUB_STATE.set(id, "collected");
       showToast(`已取走 ${id}`);
-      await loadSubs();
-      if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);
+      if (project === current) {
+        await loadSubs();
+        if (detailAgent && $("detail") && !$("detail").hidden) openAgent(detailAgent);
+      }
     } catch (e) {
       alert(`文件已下载，但标记已取失败：${e.message}\n请重试或手动点“取走”。`);
     }
@@ -969,14 +1046,16 @@ async function collect(id) {
 }
 
 async function collectAll() {
+  if (!current || current === "*") { showToast("请先选择具体项目"); return; }
+  const project = current;
   const pending = SUB_ROWS.filter((s) => s.state === "delivered");
   if (!pending.length) { showToast("当前没有待取交付"); return; }
   if (!confirm(`将逐个下载并取走 ${pending.length} 份交付。\n浏览器可能提示“允许下载多个文件”，请允许。继续？`)) return;
   let ok = 0;
   for (const s of pending) {
-    if (await downloadBundle(s.submission_id)) ok++;
+    if (await downloadBundle(s.submission_id, project)) ok++;
   }
-  await loadSubs();
+  if (project === current) await loadSubs();
   showToast(`已处理 ${ok}/${pending.length} 份；未成功的仍会留在待取列表`);
 }
 
@@ -1213,7 +1292,7 @@ function renderStack(el, parts) {
 function renderLegend(el, parts, kind) {
   if (!el) return;
   el.innerHTML = parts.map((p) =>
-    `<button type="button" data-dash-${kind}="${p.key}" title="点击筛选">
+    `<button type="button" class="${p.value ? "" : "zero"}" data-dash-${kind}="${p.key}" title="点击筛选">
       <i style="background:${p.color}"></i><span>${esc(p.label)}</span><b>${p.value}</b>
     </button>`).join("");
 }
@@ -1222,6 +1301,7 @@ function showCardFilter(cardName, tab, value) {
   window.hubTab?.(tab);
   const card = cardByTitle(cardName);
   if (!card) return;
+  setCardOpen(cardName, true);      // 图例点进来必须直接看到明细，不能只切页不展开
   if (card._filterSel && value) {
     card._filterSel.value = value;
     card._applyFilter?.();
@@ -1231,7 +1311,8 @@ function showCardFilter(cardName, tab, value) {
 
 function renderDashboard() {
   if (!document.getElementById("dashTaskBar")) return;
-  const scope = current === "*" ? "全部项目" : (current || "—");
+  const scope = current === "*" ? "全部项目"
+    : ((allProjects.find((p) => p.project === current)?.display_name) || current || "—");
   const scopeEl = $("dashScope"); if (scopeEl) scopeEl.textContent = scope;
   const taskParts = [
     { key: "open", label: "待领取", color: "#7d8798", value: 0 },
@@ -1248,6 +1329,34 @@ function renderDashboard() {
   $("dashTaskTotal").textContent = taskTotal ? `${taskTotal}` : "—";
   renderStack($("dashTaskBar"), taskParts);
   renderLegend($("dashTaskLegend"), taskParts, "task");
+
+  const stale = (TASK_ROWS || []).filter(taskIsStale).length;
+  const staleBtn = $("dashStale");
+  if (staleBtn) {
+    staleBtn.hidden = !stale;
+    staleBtn.textContent = current === "*"
+      ? `滞留 ${stale} 个 · 点这里筛选`
+      : `滞留 ${stale} 个 · 点这里筛选并回收`;
+    staleBtn.onclick = () => showCardFilter("任务", "task", "stale");
+  }
+
+  const projStrip = $("dashProjects");
+  if (projStrip) {
+    const projects = (allProjects || []).filter((p) => p.project !== "*");
+    projStrip.hidden = current !== "*" || !projects.length;
+    if (!projStrip.hidden) {
+      projStrip.innerHTML = projects.map((p) => {
+        const tasks = (TASK_ROWS || []).filter((t) => (t.project || "") === p.project);
+        const active = tasks.filter((t) => t.state !== "done").length;
+        const agents = (window._agents || []).filter((a) => (a.project || "") === p.project);
+        const online = agents.filter((a) => a.alive === "alive").length;
+        return `<button class="projChip" data-goto-project="${p.project}" title="切到该项目">
+          <i class="dot ${agents.length && online === agents.length ? "alive" : online > 0 ? "late" : "offline"}"></i>
+          <b>${esc(p.display_name || p.project)}</b>
+          <span>${active} 活跃 · ${online}/${agents.length} 在线</span></button>`;
+      }).join("");
+    }
+  }
 
   const subStates = ANALYTICS.submission_states || {};
   const subParts = [
@@ -1638,8 +1747,9 @@ function addFilter(card, placeholder, opts) {
   const cnt = document.createElement("span");
   cnt.className = "muted";
   bar.append(inp, cnt);
-  const h = card.querySelector("h2");
-  h.after(bar);
+  const body = card.querySelector(".cardBody");
+  if (body) body.insertBefore(bar, body.firstChild);
+  else card.querySelector("h2").after(bar);
   card._filterSel = sel;
   card._filterInput = inp;
   const apply = () => {
@@ -1647,17 +1757,17 @@ function addFilter(card, placeholder, opts) {
     const body = card.querySelector(".cardBody") || card;
     const rows = [...body.querySelectorAll("tbody tr")];
     const v = sel ? sel.value : "all";
-    let shown = 0;
+    let shown = 0, total = 0;
     rows.forEach((r) => {
-      if (r.querySelector(".empty")) return;
-      if (r.dataset.msgDetail) return;   // 消息正文展开行不参与筛选
+      if (r.querySelector(".empty") || r.dataset.msgDetail) return;   // 空态行/展开正文不参与计数
+      total++;
       const okSel = !opts || !opts.test || opts.test(r, v);
       const okTxt = !q || (r.textContent || "").toLowerCase().includes(q);
       const hit = okSel && okTxt;
       r.style.display = hit ? "" : "none";
       if (hit) shown++;
     });
-    cnt.textContent = (q || v !== "all") ? `${shown}/${rows.length}` : "";
+    cnt.textContent = (q || v !== "all") ? `${shown}/${total}` : "";
   };
   inp.oninput = apply;
   if (sel) sel.onchange = apply;      // 原来只绑了 input，下拉选了根本不触发
@@ -1713,13 +1823,15 @@ function bindFilters() {
     else if (/^任务/.test(t)) addFilter(c, "搜任务号 / 标题 / 节点", {
       items: [
         { v: "all", label: "全部" },
+        { v: "stale", label: "滞留" },
         { v: "open", label: "待领取" },
         { v: "claimed", label: "执行中" },
         { v: "released", label: "已交付待取" },
         { v: "blocked", label: "已阻塞" },
         { v: "done", label: "已完成" },
       ],
-      test: (row, v) => v === "all" || (row.dataset.state || "") === v,
+      test: (row, v) => v === "all"
+        || (v === "stale" ? row.dataset.stale === "1" : (row.dataset.state || "") === v),
     });
   });
 }
@@ -1784,6 +1896,14 @@ function bindTabs() {
       b.classList.toggle("on", b.dataset.tab === g.id));
     localStorage.setItem("hub.tab", g.id);
     if (g.id === "msg") markMsgSeen();
+    // 切到某页时如果该页所有卡片都是收起的，自动展开第一张；否则用户只会看到一排标题。
+    const groupCards = cardsAll().filter((c) => {
+      const t = titleOf(c);
+      return g.cards.some((name) => t.startsWith(name));
+    });
+    if (groupCards.length && !groupCards.some((c) => !c.classList.contains("collapsed"))) {
+      setCardOpen(g.cards[0], true);
+    }
     window.scrollTo({ top: 0 });
     setTimeout(renderDashboard, 30);   // 切到总览时按真实宽度重画
   };
@@ -1800,15 +1920,31 @@ function cardByTitle(name) {
     (c) => (c.querySelector("h2")?.textContent || "").trim().startsWith(name));
 }
 
-function addCardBtn(card, text, fn) {
+function addCardBtn(card, text, fn, projectOnly = false) {
   const h = card && card.querySelector("h2");
-  if (!h || !h.querySelector(".cardTools")) return;
-  if ([...h.querySelectorAll("button")].some((b) => b.textContent === text)) return;
+  if (!h || !h.querySelector(".cardTools")) return null;
+  if ([...h.querySelectorAll("button")].some((b) => b.textContent === text)) return null;
   const b = document.createElement("button");
   b.className = "ghost mini";
   b.textContent = text;
+  if (projectOnly) b.dataset.projectOnly = "1";
   b.onclick = (e) => { e.stopPropagation(); fn(); };
   h.querySelector(".cardTools").prepend(b);
+  return b;
+}
+
+function syncBulkAvailability() {
+  const all = current === "*";
+  document.querySelectorAll("[data-project-only]").forEach((b) => {
+    b.disabled = all;
+    b.title = all ? "全部项目视图只读，请先选具体项目" : "";
+  });
+  const stale = (TASK_ROWS || []).filter(taskIsStale).length;
+  document.querySelectorAll("[data-task-bulk]").forEach((b) => {
+    b.disabled = all || stale === 0;
+    b.title = all ? "全部项目视图只读，请先选具体项目"
+      : stale ? `回收 ${stale} 个滞留任务` : "当前没有滞留任务";
+  });
 }
 
 function bindBulk() {
@@ -1830,7 +1966,26 @@ function bindBulk() {
     if (!confirm(`吊销 ${off.length} 个失联 agent？\n${off.slice(0, 8).join(", ")}${off.length > 8 ? " …" : ""}`)) return;
     await api(`/admin/p/${current}/revoke`, "POST", { agents: off, confirm: true });
     await refresh();
-  });
+  }, true);
+  // 任务：清掉“派了没人领”和“领了但节点已离线/租约过期”的滞留单，避免项目卡住
+  const taskCard = cardByTitle("任务");
+  const taskBulk = taskCard && addCardBtn(taskCard, "回收滞留", async () => {
+    if (current === "*") { alert("全部项目视图下请先选择具体项目，再回收任务。"); return; }
+    const ids = (TASK_ROWS || []).filter(taskIsStale).map((t) => t.task_id || t.id).filter(Boolean);
+    if (!ids.length) { alert("没有待回收的滞留任务"); return; }
+    if (!confirm(`把 ${ids.length} 个滞留任务退回公共池？\n（未领取 + 节点离线/租约过期）\n${ids.slice(0, 8).join(", ")}${ids.length > 8 ? " …" : ""}`)) return;
+    let ok = 0, lastErr = "";
+    for (const id of ids) {
+      try {
+        await api(`/admin/p/${current}/tasks/reclaim`, "POST", { task_id: id, reason: "回收滞留任务" });
+        ok++;
+      } catch (e) { lastErr = e?.message || String(e); console.warn("[hub] reclaim failed", id, e); }
+    }
+    showToast(`已回收 ${ok}/${ids.length} 个滞留任务${ok < ids.length && lastErr ? ` · ${lastErr}` : ""}`, 6000);
+    await refresh();
+  }, true);
+  if (taskBulk) taskBulk.dataset.taskBulk = "1";
+  syncBulkAvailability();
 }
 
 function bindFoldAll() {
@@ -1840,6 +1995,20 @@ function bindFoldAll() {
   b.id = "foldAll"; b.className = "ghost";
   b.textContent = "全收";
   seg.insertBefore(b, seg.querySelector("#autoRef"));
+  // 手机端的低频操作收进“更多”；桌面端仍保持一眼可达。
+  if (!document.getElementById("btnMore")) {
+    const more = document.createElement("button");
+    more.id = "btnMore"; more.className = "ghost"; more.type = "button";
+    more.textContent = "⋯"; more.title = "更多操作";
+    more.setAttribute("aria-expanded", "false");
+    more.onclick = (e) => {
+      e.stopPropagation();
+      const open = seg.classList.toggle("more-open");
+      more.textContent = open ? "×" : "⋯";
+      more.setAttribute("aria-expanded", open ? "true" : "false");
+    };
+    seg.appendChild(more);
+  }
   const extras = () => [...document.querySelectorAll(".card")].filter((c) => {
     const t = (c.querySelector("h2")?.textContent || "").trim();
     return !/^(概览|名册)/.test(t);
@@ -1862,8 +2031,11 @@ function bindFoldAll() {
 
 async function loadMsgs() {
   if (!current) return;
+  const project = current;
+  if (project === "*") return;
   let d;
-  try { d = await api(`/admin/p/${current}/messages?limit=120`); } catch { return; }
+  try { d = await api(`/admin/p/${project}/messages?limit=120`); } catch { return; }
+  if (current !== project) return;
   const rows = (d.messages || []).slice().reverse();
   MSG_MAX = rows.reduce((a, m) => Math.max(a, m.seq || 0), 0);
   const lastSeen = Number(localStorage.getItem("hub.lastSeq") || 0);
@@ -1901,15 +2073,15 @@ async function loadStats() {
   const sub = d.submissions || {};
   const total = Object.values(sub).reduce((a, b) => a + b, 0);
   const items = [
-    ["在线 agent", d.agents_online ?? 0],
+    ["在线 agent", d.agents_online ?? 0, "", "ok"],
     ["注册 agent", d.agents_active ?? 0],
     ["24h 有心跳", d.agents_heartbeat_24h ?? 0],
-    ["待审注册", d.enrollments_pending ?? 0],
+    ["待审注册", d.enrollments_pending ?? 0, "", "warn"],
     ["项目", d.projects ?? 0],
-    ["交付", total, `待取 ${sub.delivered ?? 0}`],
+    ["交付", total, `待取 ${sub.delivered ?? 0}`, "accent"],
   ];
-  $("stats").innerHTML = items.map(([k, v, sub]) =>
-    `<div class="stat"><div class="k">${k}</div><div class="v">${v}${sub ? `<span class="sub">${sub}</span>` : ""}</div></div>`).join("");
+  $("stats").innerHTML = items.map(([k, v, note, cls]) =>
+    `<div class="stat${cls ? " " + cls : ""}"><div class="k">${k}</div><div class="v">${v}${note ? `<span class="sub">${note}</span>` : ""}</div></div>`).join("");
   $("ovAt").textContent = new Date(d.at).toLocaleTimeString();
 }
 
@@ -1928,6 +2100,8 @@ async function loadAnalytics() {
 }
 
 function setProjectPanels(enabled) {
+  document.body.classList.toggle("view-all", !enabled);
+  syncBulkAvailability();
   for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast", "btnTaskCreate"]) {
     const el = $(id);
     if (el) el.disabled = !enabled;
@@ -1971,10 +2145,13 @@ function setProjectPanels(enabled) {
 
 async function refresh() {
   if (!current) return;
+  const scope = current;
+  const epoch = ++refreshEpoch;
   // 各面板独立容错：任一非核心接口失败不应让整页 lock()。
   // 用 allSettled 并打印失败项，界面其余部分照常渲染。
   const parts = [loadAgents(), loadSec(), loadStats(), loadEnr(), loadAnalytics()];
   const results = await Promise.allSettled(parts);
+  if (current !== scope || epoch !== refreshEpoch) return;
   results.forEach((r, i) => {
     if (r.status === "rejected") console.warn("[hub] refresh part failed", i, r.reason);
   });
@@ -1986,11 +2163,13 @@ async function refresh() {
   setProjectPanels(true);
   // 任务台账要等 loadAgents 完成后再渲染，才能把 active/offline 标在转派下拉里
   try { await loadTasks(); } catch (e) { console.warn("[hub] loadTasks failed", e); }
+  if (epoch !== refreshEpoch) return;
   // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
   try { await loadSubs(); } catch (e) {
     if (e instanceof AuthError) throw e;
     console.warn("[hub] loadSubs failed", e);
   }
+  if (epoch !== refreshEpoch) return;
   try { await loadMsgs(); } catch (e) {
     if (e instanceof AuthError) throw e;
     console.warn("[hub] loadMsgs failed", e);
@@ -2000,6 +2179,7 @@ async function refresh() {
 $("proj").onchange = (e) => {
   current = e.target.value;
   try { localStorage.setItem("hub.project", current); } catch {}
+  updateScopeLabel();
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
@@ -2024,7 +2204,7 @@ let liveGen = 0, liveMode = localStorage.getItem("hub.live") || "ws";
 function paintLive(on, note, why) {
   const el = $("liveDot"); if (!el) return;
   el.textContent = on ? "● 实时" : "○ " + (why || (liveMode === "ws" ? "连接中…" : "轮询"));
-  el.style.color = on ? "#3fb950" : "#8b95a5";
+  el.style.color = on ? "#3fb950" : /重连|超时|失败/.test(why || "") ? "#d29922" : "#8b95a5";
   el.title = note + (on ? "（点击切到轮询）" : "（点击尝试实时）");
 }
 function scheduleRefresh() { clearTimeout(liveTimer); liveTimer = setTimeout(refresh, 400); }
@@ -2069,7 +2249,7 @@ function connectLive() {
       if (gen !== liveGen || ws !== liveWs || ws.readyState !== WebSocket.CONNECTING) return;
       detachLive(ws); liveWs = null;
       try { ws.close(1000, "handshake timeout"); } catch {}
-      paintLive(false, "实时握手超时，5 秒后重试", "轮询·超时");
+      paintLive(false, "实时握手超时，5 秒后重试", "重连中");
       scheduleLiveRetry(5000);
     }, 10000);
     ws.onopen = () => {
@@ -2086,11 +2266,11 @@ function connectLive() {
       if (gen !== liveGen || ws !== liveWs) return;  // 已切项目/已主动关闭，别再抢当前连接
       liveWs = null;
       clearLiveTimers();
-      paintLive(false, "实时断开，5 秒后重连", "轮询·断开" + (e.code ? ` ${e.code}` : ""));
+      paintLive(false, "实时断开，5 秒后重连", "重连中");
       scheduleLiveRetry(5000);
     };
     ws.onerror = () => {
-      if (gen === liveGen && ws === liveWs) paintLive(false, "实时连不上，等待重试", "轮询·失败");
+      if (gen === liveGen && ws === liveWs) paintLive(false, "实时连不上，等待重试", "重连中");
     };
   } catch { paintLive(false, "浏览器不支持 WebSocket", "不支持"); }
 }
@@ -2171,9 +2351,11 @@ document.addEventListener("click", async (e) => {
     const agentState = dash.getAttribute("data-dash-agent");
     if (agentState) return showCardFilter("名册", "overview", agentState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery],[data-task-close],[data-task-reclaim],[data-task-reassign]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
+    const gp = btn.getAttribute("data-goto-project");
+    if (gp) { activateProject(gp); refresh(); return; }
     const ca = btn.getAttribute("data-collect-all");
     if (ca) return collectAll();
     const gd = btn.getAttribute("data-goto-delivery");
@@ -2219,8 +2401,10 @@ document.addEventListener("click", async (e) => {
     const tas = btn.getAttribute("data-task-reassign");
     if (tas) {
       const row = btn.closest("[data-task-id]");
-      const to = row?.querySelector("[data-task-assignee]")?.value || "";
+      const sel = row?.querySelector("[data-task-assignee]");
+      const to = sel?.value || "";
       if (!to) return alert("先在左侧下拉里选择要转派给的节点");
+      if (sel?.selectedOptions?.[0]?.disabled) return alert("该节点当前离线或不可用，请选择在线节点");
       if (!confirm(`把 ${tas} 转派给 ${to}？旧节点会失去 claim。`)) return;
       const reason = prompt("修正理由（写入任务审计）", `管理员转派给 ${to}`);
       if (reason === null) return;
@@ -2262,7 +2446,8 @@ $("btnUnblockAll").onclick = async () => {
     diag = `jwt=${!!d.jwt_present} sess=${!!d.session} id=${d.cookie_identity ?? "—"}`;
   } catch (e) { diag = "diag-fail"; }
   buildTag = await fetch("/ver").then((r) => r.json()).then((v) => v.build || "?").catch(() => "?");
-  $("build").textContent = `build ${buildTag} · ${diag}`;
+  $("build").textContent = `build ${buildTag}`;
+  $("build").title = `build ${buildTag} · ${diag}`;
   if (diag.includes("sess=false") && !diag.includes("id=")) { /* 仅记录，不阻断 */ }
   // 先尝试用 Access 身份换会话（/console/whoami 在 Access 覆盖范围内，会带上 CF 令牌）
   await fetch("/console/whoami", { credentials: "same-origin" })
