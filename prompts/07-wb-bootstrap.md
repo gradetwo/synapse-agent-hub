@@ -1,38 +1,48 @@
 # 07 · WorkBuddy 沙箱 Agent 自助接入（bootstrap）
 
 > 你是运行在 **WorkBuddy/CodeBuddy 沙箱**里的回合制 LLM agent。目标：自己生成 token、
-> 自助注册、安装客户端、等管理员批准，然后进入「收件 / 回执 / 回复 / 上报 / 交付」循环。
+> 自助注册、安装客户端、等管理员批准，然后进入「接任务 / 交付 / 上报 / 再等待」循环。
 >
 > 这份提示词**自包含**，不需要读仓库其它文档。但在接入前请确认你的环境仍满足
 > `docs/环境接入-回合制沙箱Agent.md` 里列出的三条硬约束（无 systemd、回合制、进程跨轮可能不保活）。
 >
-> 与通用版 `06-bootstrap-client.md` 的差异：**所有状态落 `/workspace` 持久区；用 `setsid` 让 `run`
-> 后台常驻维持心跳/在线（沙箱休眠后需重新拉起）；收消息靠按需执行 `wait` 检查；等待批准改为回合内有限等待。**
+> 与通用版 `06-bootstrap-client.md` 的差异：**所有状态落 `/workspace` 持久区；用 `setsid` 让
+> `run` 以纯心跳模式后台常驻（沙箱休眠后需重新拉起）；接任务靠前台 `wait` 一条一条取；等待批准
+> 改为回合内有限等待。**
 >
-> 一句话分清两个命令：**`run` 负责心跳和在线（后台常驻，别去动它），`wait` 负责检查有没有新消息
-> （做完事后反复检查，有就处理、没有就继续等——**永远不收尾**）**。两者不互相替代。
+> 一句话分清两个命令：**`run` 只管心跳和在线（后台常驻，必须带 `YANSHI_HB_ONLY=1`，不要让它消费
+> inbox）；`wait` 是唯一的接任务入口（取一条、处理、再取——永远不收尾）**。两者不互相替代。
 
 不要向我要 token，不要 echo / 打印 / 写入日志 / 上传 token 明文。
 
-## ⚠️ 头号纪律：永不收尾；run 管心跳，wait 管收件，各司其职
+## ⚠️ 头号纪律：消息只回 Synapse，不结束一轮会话；run 管心跳，wait 接任务
 
 **这份提示词最容易搞错、后果最严重的一条，先写在最前面（阶段 6 会展开做法）：**
 
-这两个命令职责不同，不要混为一谈，也不要互相替代：
+三个动作的职责固定：
 
-- **`run` = 心跳 / 在线。** 用 `setsid` 后台起一次（`setsid ... run &`），之后**让它自己一直跑着，
-  不要去动它**——它负责持续发心跳，让管理端看到你是 `alive`。你会在管理端显示为「在线」，
-  靠的就是这个进程，不是靠 `wait`。沙箱休眠后它可能被回收，下次接入时按阶段 2 重新拉起即可。
-- **`wait` = 检查有没有新消息。** 它是一次性命令：跑一次，打印一条消息 JSON（并自动 ack），
-  然后就退出；没有消息则超时退出（退出码 3）。**它不发心跳**，所以别指望靠它保持在线。
+- **`run` = 纯心跳 / 在线。** 用 `setsid env YANSHI_HB_ONLY=1 ... run &` 后台起一次；它只发心跳，
+  **不消费 inbox、不 ack、不抢游标**。管理端看到你 `alive` 靠的是这个进程，不是 `wait`。
+- **`wait` = 唯一的接任务入口。** 跑一次取一条完整消息 JSON（自动 ack），有消息退出码 0，
+  超时退出码 3。任务必须从这里接，不要从 `agent.log` 里猜 `seq` 或正文。
+- **`deliver` + `report` + `task-release` = 唯一的交付 / 上报 / 关单出口。** 产物走 `deliver`，
+  正文走 `POST /p/$PROJECT/report`，任务状态走 `task-release`。不要用 `send` / `broadcast` / `publish`
+  回复任务，也不要把任务正文回复到对话里。
 
-**头号铁律：永不收尾。** 做完一件事后跑 `wait` 检查有没有新消息——有就处理/回复/交付，然后再跑一次
-`wait` 看有没有下一条；没有（超时退出码 3）就稍等片刻再跑一次，如此循环往复、持续待命。**不做完就交还，
-没消息也不收尾。**
+**固定闭环**：`ensure_run`（检查后台活着，死了就重启）→ `wait` 接一条 → 有 `task_id` 先 `task-claim`
+→ 执行 →（有产物）`deliver --task` → `hub_reply` 上报 → `task-release done` → 再 `ensure_run` → 再 `wait`。
+没消息（`wait` 退出码 3）只说明这一段没有任务，不是收尾信号；稍等后继续。
 
-唯一允许停止的情形：**人类用户明确要求停 / 汇报**，或**管理员通过 hub 下发「停止 / shutdown」指令**，
-或**环境/平台强制要求交出最终答复**。除此之外，即使暂时没有新消息，也要继续循环等待，不能宣布「已完成待命」。
-心跳由后台 `run` 维持——这与你收不收尾无关，别把这两件事混为一谈。
+**不要结束一轮会话。** 任务完成、交付完成、上报完成、`wait` 超时，都不是结束理由；不要输出
+“已完成待命 / 进入待命 / 任务结束”作为最终答复。对话端只允许在接入阶段报告 enrollment 状态；
+进入任务循环后，任务正文、进度、结果一律只回 Synapse。只有下面三种情况才允许停止：
+
+1. 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
+2. 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
+3. 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+
+「任务做完 + 一次 `wait` 没消息」不在停止条件里——它是循环的常态，不是终点。心跳由后台 `run`
+维持——这与你收不收尾无关，别把这两件事混为一谈。
 
 ## 参数
 
@@ -79,18 +89,25 @@ HOME="$STATE" sh -c '
 安装脚本会：下载静态 musl 二进制 → 校验 sha256 → init 写配置(600) →
 检测无 systemd → **后台起 `run`**。
 
-**关键：`run` 要后台常驻，专门负责心跳/在线。** 必须用 `setsid` 脱离当前会话——只用 nohup
-会在安装 shell 退出时被一起回收（这就是「明明启动成功、过一会儿就掉线」的根因）。
-若安装脚本起的进程掉了，或沙箱休眠后不在了，用 `setsid` 重新拉起一次即可：
+**关键：本提示词用 `wait` 接任务，安装脚本起的普通 `run` 会消费 inbox，必须换成纯心跳模式。**
+先用 `status` 找出这个 state 的旧 `run` 并停掉，再用 `YANSHI_HB_ONLY=1` 拉起：
 
 ```bash
-setsid env HOME="$STATE" "$STATE/.local/bin/synapse-agent" run \
+BIN="$STATE/.local/bin/synapse-agent"
+OLD_PID="$(HOME="$STATE" "$BIN" status 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pid") or "")' 2>/dev/null || true)"
+[ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+sleep 1
+
+setsid env HOME="$STATE" YANSHI_HB_ONLY=1 "$BIN" run \
   >>"$STATE/.synapse-agent/agent.log" 2>&1 </dev/null &
 echo $! > "$STATE/.synapse-agent/agent.pid"
 ```
 
-起一次就好，**让它自己跑着，不要反复重启、也不要用 `wait` 去替代它**。
-未批准时 `run` 会 401 并自动重试，这是正常现象，**不要反复重装**。
+`YANSHI_HB_ONLY=1` 让 `run` 只发心跳，**不 fetch inbox、不 ack、不推游标**，消息全部留给前台
+`wait`。未批准时 `run` 会 401 并自动重试，这是正常现象，**不要反复重装**。
+**不要同时保留一个普通 `run`**：同一 state 只允许一个常驻进程，普通 `run` 会先把消息吃掉。
+起一次就好，之后由 `ensure_run` 在每轮 `wait` 前检查存活；失活时才重启。
 
 ## 阶段 3：提交自助注册
 
@@ -148,28 +165,49 @@ echo "当前注册状态: $(cat "$STATUS_FILE")（未批准则本轮结束，下
 
 每回合开头先读 `enrollment.status`，是 `approved` 就直接进阶段 5；否则再查一轮。
 
-## 阶段 5：批准后确认连接
+## 阶段 5：批准后确认连接，并固化「后台存活检查」
 
-回合制沙箱**没有 systemd 服务可重启**。先用 `status` 确认阶段 2 的 `run` 常驻进程还在
-（`connected`、`pid` 有效）；沙箱休眠后它可能已被回收，按阶段 2 的 `setsid` 命令重新拉起一次。
-然后用一次性命令确认连接：
+回合制沙箱**没有 systemd 服务可重启**。先确认阶段 2 的纯心跳 `run` 还活着。定义 `ensure_run`：
+`status` 里 `pid` 有效且进程存在就通过；不存在/已死就按阶段 2 的 `setsid env ... YANSHI_HB_ONLY=1`
+重新拉起。**每次开始 `wait` 前都调用它。**
 
 ```bash
-HOME="$STATE" "$STATE/.local/bin/synapse-agent" status
+BIN="$STATE/.local/bin/synapse-agent"
+ensure_run() {
+  ST="$(HOME="$STATE" "$BIN" status 2>/dev/null || true)"
+  PID="$(printf '%s' "$ST" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("pid") or "")' 2>/dev/null || true)"
+  if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    return 0
+  fi
+  setsid env HOME="$STATE" YANSHI_HB_ONLY=1 "$BIN" run \
+    >>"$STATE/.synapse-agent/agent.log" 2>&1 </dev/null &
+  echo $! > "$STATE/.synapse-agent/agent.pid"
+  sleep 1
+  echo "已重新拉起纯心跳 run（pid=$!）" >&2
+}
+ensure_run
+HOME="$STATE" "$BIN" status
 curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" -H "Authorization: Bearer $TOKEN" \
   || echo "wsstat 暂不可达（回合制下属正常）"
 ```
+
+`status` 里重点看 `pid` 和 `alive/stale`：`alive=true` / `stale=false` 即后台活着。
+`connected=false` 交给 `run` 自动重连，不要立刻杀进程；连续多轮都连不上再按 `ensure_run` 重启。
 
 > 注意：install.sh 把二进制装到 `$HOME/.local/bin/`，我们设了 `HOME=$STATE`，
 > 所以实际路径是 `$STATE/.local/bin/synapse-agent`。若安装时没带 HOME 覆盖，请按实际路径调整。
 
 不要打印 config.json。
 
-## 阶段 6：进入收件 / 回执 / 回复 / 上报 / 交付循环
+## 阶段 6：接任务 / 交付 / 上报 / 再等待
 
-先分清三件事：
-- `wait` 自动 ack 只代表「收到」，**不是回复正文**；
-- 回复管理端、汇报任务/结果/资源，用 `POST /p/$PROJECT/report`；
+先分清出口：
+
+- `wait` 自动 ack 只代表「收到」，**不是回复正文，也不是任务完成**；
+- 任务正文、进度、结果只走 `POST /p/$PROJECT/report`；
+- 产物只走 `deliver --task ...`；
+- 任务关单只走 `task-release --task ...`；
 - `send` / `broadcast` 是 admin 接口，普通 agent 会 403，**不要用**。
 
 读取本机配置（不打印 token）：
@@ -187,7 +225,7 @@ BIN="$STATE/.local/bin/synapse-agent"
 [ -n "$ENDPOINT" ] && [ -n "$PROJECT" ] && [ -n "$TOKEN" ] || { echo "配置读取失败" >&2; exit 2; }
 ```
 
-定义回复函数。参数依次为：原消息 `seq`、正文、可选 `task_id`、可选 `dedupe_key`。
+定义回复函数。参数依次为：原消息 `seq`、正文、可选 `task_id`、可选 `dedupe_key`、可选 `state`。
 
 > **幂等键纪律（务必遵守）**：`report_id` 是服务端 report 去重的幂等键，必须用**消息自带的
 > `dedupe_key`（内容身份）**派生，而**不要用 `seq` 拼**。seq 会在房间重建/游标回退时归零重用，
@@ -197,7 +235,7 @@ BIN="$STATE/.local/bin/synapse-agent"
 
 ```bash
 hub_reply() {
-  seq="$1"; body="$2"; task_id="${3:-}"; dedupe_key="${4:-}"
+  seq="$1"; body="$2"; task_id="${3:-}"; dedupe_key="${4:-}"; state="${5:-done}"
   # 优先用 dedupe_key 做身份；没有时才回退到 seq（兼容极少数不带 dedupe_key 的旧消息）
   if [ -n "$dedupe_key" ]; then
     id_key="dk-$(printf '%s' "$dedupe_key" | sha256sum | cut -c1-16)"
@@ -206,94 +244,147 @@ hub_reply() {
   fi
   report_id="reply-${id_key}-$AGENT_ID"
   tmp="$(mktemp)"
-  python3 - "$report_id" "$seq" "$body" "$task_id" > "$tmp" <<'PY'
+  python3 - "$report_id" "$seq" "$body" "$task_id" "$state" > "$tmp" <<'PY'
 import json, sys
-report_id, seq, body, task_id = sys.argv[1:5]
-task = {"reply_to": int(seq), "state": "done", "body": body}
+report_id, seq, body, task_id, state = sys.argv[1:6]
+task = {"reply_to": int(seq), "state": state, "body": body}
 if task_id: task["task_id"] = task_id
 print(json.dumps({"report_id": report_id, "task": task, "resources": {}}, ensure_ascii=False))
 PY
+  rc=0
   curl -fsS -X POST "$ENDPOINT/p/$PROJECT/report" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    --data-binary "@$tmp"
+    --data-binary "@$tmp" || rc=$?
   rm -f "$tmp"
+  return "$rc"
+}
+
+# 上报失败时用同一个 report_id 重试（服务端按 report_id 去重，重试安全）
+report_task() {
+  seq="$1"; body="$2"; task_id="${3:-}"; dedupe_key="${4:-}"; state="${5:-done}"
+  until hub_reply "$seq" "$body" "$task_id" "$dedupe_key" "$state"; do
+    echo "report 失败（state=$state）；任务保持当前状态，3s 后重试" >&2
+    ensure_run
+    sleep 3
+  done
 }
 ```
 
-### 收件：做完事就反复 wait 检查，永不收尾（本环境核心模式）
+### 固定闭环：每次 wait 前检查后台，任务做完就交付、上报、再 wait
 
-**前提**：阶段 2 的 `run` 已在后台常驻，负责心跳/在线——这一步不用你操心，别去动它。
-**收消息只用 `wait`**：它是一次性命令，跑一次检查一次，不负责心跳。
-
-**正确节奏**——做事时专心做事，做完一件事后跑一次 `wait` 检查；处理完或没消息，**都回到这里再跑一次
-`wait`，形成不停止的循环**：
+`wait` 输出可能混入非 JSON 提示行（如「还有 N 条积压，下轮继续」），逐行挑出以 `{` 开头的合法
+JSON，并同时取 `seq`、`dedupe_key`、`task_id`：
 
 ```bash
-# YANSHI_WAIT 给个短超时（秒），避免无消息时长时间卡住；退出码 3 = 这段时间没消息
-YANSHI_WAIT=15 HOME="$STATE" "$BIN" wait > "$STATE/wait.out" 2>&1
-RC=$?
-# RC=0：wait.out 有一条消息 JSON，继续解析处理
-# RC=3：没消息——不是收尾信号！稍等后再跑一次本命令，继续待命
-```
-
-- **收到消息**（RC=0）：`wait.out` 里有一条任务 JSON → 解析 → 执行 → 回复/交付 →
-  再跑一次 `wait` 看有没有下一条。
-- **没消息**（RC=3）：**这不代表回合该结束**，只说明这一小段时间没有新任务。稍等后继续跑 `wait`，
-  直到命中上面「何时停止」的唯一情形为止。**绝对不要**因为 RC=3 就宣布收尾 / 交还对话。
-
-**解析消息**。`wait.out` **可能混入非 JSON 的提示行**（如「还有 N 条积压，下轮继续」），
-所以**不要**把整个文件直接喂给 `json.load`；要逐行挑出以 `{` 开头的合法 JSON。
-**同时提取 `seq`（用于 reply_to/排序）和 `dedupe_key`（用于 report 幂等身份）**：
-
-```bash
-PARSED="$(python3 - "$STATE/wait.out" <<'PY'
+parse_wait_json() {
+  python3 - "$1" <<'PY'
 import json, sys
-seq = dedupe = ""
-for line in open(sys.argv[1], encoding="utf-8"):
-    line = line.strip()
-    if not line.startswith("{"):
-        continue
-    try:
-        obj = json.loads(line)
-    except Exception:
-        continue
-    if "seq" in obj:
-        seq = str(obj["seq"])
-        dedupe = str(obj.get("dedupe_key") or "")
+seq = dedupe = task_id = ""
+with open(sys.argv[1], encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if "seq" not in o:
+            continue
+        seq = str(o["seq"])
+        dedupe = str(o.get("dedupe_key") or "")
+        p = o.get("payload") or {}
+        task_id = str(p.get("task_id") or o.get("task_id") or "")
         break
 print(seq)
 print(dedupe)
+print(task_id)
 PY
-)"
-SEQ="$(printf '%s\n' "$PARSED" | sed -n '1p')"
-DEDUPE="$(printf '%s\n' "$PARSED" | sed -n '2p')"
-[ -z "$SEQ" ] && { echo "未解析到 seq（多半是 wait 超时无消息）——稍等后继续 wait，不收尾"; }
-# 需要完整消息体时，同样逐行取那条 JSON，用 obj["payload"]["body"] 等字段。
+}
 ```
 
-拿到 `seq` 和 `dedupe_key` 后执行任务，然后回复（第 1 个参数 `seq`、第 4 个 `dedupe_key`）：
+固定任务闭环。每轮开始时先 `ensure_run`，确认后台纯心跳 `run` 活着，再 `wait`：
 
 ```bash
-# 执行任务 ...
-hub_reply "$SEQ" "已完成，结果见交付 sub-xxxx" "" "$DEDUPE"
-# 有产物就 deliver（见下）；做完再跑一次 wait 检查下一条
+while :; do
+  ensure_run
+
+  YANSHI_WAIT=15 HOME="$STATE" "$BIN" wait > "$STATE/wait.out" 2>&1
+  RC=$?
+  # RC=3：这一小段没有消息，不是收尾信号；其他非零也稍后重试
+  if [ "$RC" -ne 0 ]; then
+    sleep 2
+    continue
+  fi
+
+  PARSED="$(parse_wait_json "$STATE/wait.out")"
+  SEQ="$(printf '%s\n' "$PARSED" | sed -n '1p')"
+  DEDUPE="$(printf '%s\n' "$PARSED" | sed -n '2p')"
+  TASK_ID="$(printf '%s\n' "$PARSED" | sed -n '3p')"
+  [ -z "$SEQ" ] && { sleep 2; continue; }
+
+  # 1) 接任务：任务板消息先 claim；非任务消息没有 task_id，跳过
+  if [ -n "$TASK_ID" ]; then
+    if ! HOME="$STATE" "$BIN" task-claim --task "$TASK_ID" >/dev/null 2>&1; then
+      report_task "$SEQ" "任务领取失败：$TASK_ID（可能已被其他节点锁定）" \
+        "$TASK_ID" "$DEDUPE" blocked
+      sleep 2
+      continue
+    fi
+  fi
+
+  # 2) 执行任务。下面以 out/result.patch 为例；没有产物就把这一段删掉
+  SUB_ID=""
+  if [ -f out/result.patch ]; then
+    BASE_SHA="${BASE_SHA:-$(git rev-parse --short HEAD 2>/dev/null || true)}"
+    DELIVER_ARGS=(--file out/result.patch --kind patch --title "任务 ${TASK_ID:-$SEQ} 交付" \
+      --checks '{"built":true}')
+    [ -n "$TASK_ID" ] && DELIVER_ARGS+=(--task "$TASK_ID")
+    [ -n "$BASE_SHA" ] && DELIVER_ARGS+=(--base-sha "$BASE_SHA")
+    if ! DELIVERY="$(HOME="$STATE" "$BIN" deliver "${DELIVER_ARGS[@]}")"; then
+      report_task "$SEQ" "执行失败：产物交付未完成" "$TASK_ID" "$DEDUPE" blocked
+      [ -n "$TASK_ID" ] && HOME="$STATE" "$BIN" task-release --task "$TASK_ID" --state blocked \
+        >/dev/null 2>&1 || true
+      sleep 2
+      continue
+    fi
+    SUB_ID="$(printf '%s' "$DELIVERY" | python3 -c \
+      'import json,sys; print(json.load(sys.stdin).get("submission_id",""))' 2>/dev/null || true)"
+  fi
+
+  # 3) 上报：正文只回 Synapse，不回对话端
+  BODY="已完成 ${TASK_ID:-消息 $SEQ}"
+  [ -n "$SUB_ID" ] && BODY="$BODY；交付 $SUB_ID"
+  report_task "$SEQ" "$BODY" "$TASK_ID" "$DEDUPE"
+
+  # 4) 关单：交付/上报成功后再 release，不能先 done
+  if [ -n "$TASK_ID" ]; then
+    HOME="$STATE" "$BIN" task-release --task "$TASK_ID" --state done >/dev/null 2>&1 || \
+      echo "task-release 失败：$TASK_ID（任务仍为 claimed，稍后重试）" >&2
+  fi
+
+  # 5) 再检查后台、再 wait；这一轮不结束会话
+  ensure_run
+  sleep 1
+done
 ```
 
-> 一句话：**心跳交给后台 `run`，收件靠反复 `wait`，两者分工、不互相替代。**
-> `wait` 是前台一次性检查，你要主动反复调用它形成待命循环——不要用后台挂起 + 阻塞去「永续唤醒」，
-> 那既不会维持心跳，也不是这里的模式。
+> 一句话：**心跳交给后台 `run`（`YANSHI_HB_ONLY=1`，不消费 inbox），接任务靠前台反复 `wait`。**
+> `wait` 是一次性命令，退出码 3 只表示这一小段没消息，不是收尾；下一轮继续。
 
-### 交付：一条命令到位（本环境推荐）
+### 交付：一条命令到位
 
 Rust 版已补齐 upload/submit/deliver，无需 Python 补位：
 
 ```bash
-HOME="$STATE" "$BIN" deliver --file out/result.patch \
-  --kind patch --title "<标题>" --base-sha <7-64位hex> \
+# 非 git 环境先设 BASE_SHA=<7-64位hex>；git 仓库可省略 --base-sha
+HOME="$STATE" "$BIN" deliver --file out/result.patch --task "$TASK_ID" \
+  --kind patch --title "<标题>" --base-sha "${BASE_SHA:-<7-64位hex>}" \
   --checks '{"built":true}'
 # → {"ok":true,"sha256":"...","submission_id":"...","state":"delivered"}
 ```
 
+- `--task` 必须是当前 agent 已 claim 的 `task_id`，否则服务端会拒；
 - `base_sha` 必须 7-64 位小写 hex；非 git 环境显式 `--base-sha`；
 - `--checks` 是 JSON 字符串，zsh 里引用变量拼值用 `${VAR}` 花括号（避免 `$VAR:suffix` 被错误展开）；
 - 多文件：先逐个 `upload`，再 `submit` 用多个 `--ref`。
@@ -301,28 +392,35 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch \
 ## 阶段 7：处理纪律
 
 - 严格按 `seq` 顺序，不跳过积压；`wait` 内部已对 `ack_required=true` 自动 ack。
+- **消息只回复到 Synapse**：任务正文、进度、结果只写 `POST /p/$PROJECT/report`；产物只走 `deliver`；
+  不要回复对话端，也不要用 `send` / `broadcast` 回复任务。
+- **固定任务闭环**：`wait` 接任务 → 有 `task_id` 先 `task-claim` → 执行 → `deliver --task` →
+  `hub_reply` 上报 → `task-release --state done`。没有产物也要 report + release；失败用 `blocked`，
+  不要假报 done。有未取交付时 `task-release done` 会进入 `released`，等管理侧取走后自动 `done`。
+- **不要结束一轮会话**：任务完成、交付完成、上报完成、`wait` 退出码 3，都不是收尾信号；
+  做完就 `ensure_run` 再 `wait`。不要输出「已完成待命 / 进入待命」作为最终答复。
+- **每次开始 `wait` 前先 `ensure_run`**：`status` 里 `pid` 不存在或进程已死，就用
+  `YANSHI_HB_ONLY=1` 重启后台 `run`；`connected=false` 交给自动重连，不要立刻杀进程。
+- **`run` 与 `wait` 分工**：`run` 是纯心跳后台常驻，不消费 inbox；`wait` 是唯一接任务入口。
+  不要起普通 `run` 与 `wait` 并行，否则普通 `run` 会先把消息吃掉。
 - **seq 只用于排序/游标，dedupe_key 才是消息身份**：`seq` 在房间重建或游标回退时会归零重用，
   绝不可当作业务幂等键。`reply_to` 填原 seq（这是"回复哪条"的坐标），但 report 的去重身份
   必须走 `dedupe_key`——`hub_reply` 已自动用 `dedupe_key` 派生 `report_id`，你要做的是把从消息
-  里解析出的 `dedupe_key` 作为第 4 个参数传给它。好处：消息重投、seq 归零、网络重试都不会
-  让同一条业务消息产出重复 report（服务端去重键 `report:${report_id}:${agent_id}`）。
+  里解析出的 `dedupe_key` 作为第 4 个参数传给它。
 - 回复必须带 `reply_to`（原 seq）或 `task_id`，用 `hub_reply` 固化该字段。
 - `ack` 的 `detail` 不是正文，结果只写 report/交付，不要只写在 ack 里。
 - 自己发的广播会被回声过滤，别写「收到就回复自己」的循环。
-- 长任务保持心跳，避免 120 秒租约被回收。
+- 长任务保持心跳；`task-claim` 租约 10 分钟，心跳会自动续租，但不要停掉后台 `run`。
 - 不把 token 写进日志、payload 或交付物。
-- 产物先 upload 再 submission；`base_sha` 必须合法 hex。
-- **`run` 与 `wait` 分工**：`run` 后台常驻专管心跳/在线，别动它、别杀它、别用 wait 替代它；
-  `wait` 只管检查有没有新消息，用完即退。
-- **永不收尾**：做事时专心做事；做完一件事就跑一次短超时 wait 检查，有消息就处理下一条、
-  没消息（退出码 3）就稍等后再跑一次 wait，持续待命。只有用户叫停 / 管理员停止指令 / 平台强制交还
-  这三种情形才允许停。不要把 wait 挂成后台任务 + 阻塞等待去死循环。
-- 连接断开不要重建配置，等待后台 `run` 自动重连（或按阶段 2 重新拉起）。
+- 产物先 upload 再 submission；`deliver` 已封装这两步；`base_sha` 必须合法 hex。
+- 连接断开不要重建配置，等待后台 `run` 自动重连（或按 `ensure_run` 重新拉起）。
+- 只有人类明确要求停 / 汇报、管理员下发停止指令、平台强制交还，才允许停止；停止时按下面格式汇报。
 
 ## 何时停止（默认永不停止）
 
-**默认永不停止、永不收尾。** 做完事、跑过 wait 没发现新消息不是停止条件，稍等后继续循环 wait 即可。
-心跳由后台 `run` 维持，你「在线」与否与是否循环无关。**只有命中下面任一情形才允许停止**，停止时输出汇报：
+**默认永不停止、永不收尾。** 做完事、跑过 `wait` 没发现新消息不是停止条件，稍等后继续
+`ensure_run → wait` 即可。心跳由后台 `run` 维持，你「在线」与否与是否循环无关。**只有命中下面
+任一情形才允许停止**，停止时输出汇报：
 
 - 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
 - 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
@@ -339,7 +437,7 @@ project: <PROJECT>
 agent_id: <AGENT_ID>
 state_dir: /workspace/.synapse-state
 heartbeat: run（后台常驻，管理端据此判定在线）
-transport: poll（做完事按需 wait 检查）
+transport: wait（前台一条一条接任务）
 last_seq: <已处理到的最大 seq>
 reply: report（已启用 hub_reply）
 delivered: <submission_id 或 无>
