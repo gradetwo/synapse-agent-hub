@@ -1745,31 +1745,83 @@ if (msgTable) msgTable.addEventListener("click", (e) => {
   const detail = msgTable.querySelector(`tr[data-msg-detail="${row.dataset.seq}"]`);
   if (detail) detail.hidden = !detail.hidden;
 });
-// 实时通道：有新消息就防抖刷新一次，复用现有渲染路径
-let liveWs = null, liveTimer = null, liveMode = localStorage.getItem("hub.live") || "ws";
+// 实时通道：有新消息就防抖刷新一次，复用现有渲染路径。
+// 关键：只有“当前这一条”连接可以改状态/安排重连；被换掉的旧连接即使晚到 onclose 也必须静默。
+let liveWs = null, liveTimer = null, liveRetryTimer = null, livePingTimer = null;
+let liveConnectTimer = null;
+let liveGen = 0, liveMode = localStorage.getItem("hub.live") || "ws";
 function paintLive(on, note, why) {
   const el = $("liveDot"); if (!el) return;
-  el.textContent = on ? "● 实时" : "○ " + (why || (liveMode === "ws" ? "连接中" : "轮询"));
+  el.textContent = on ? "● 实时" : "○ " + (why || (liveMode === "ws" ? "连接中…" : "轮询"));
   el.style.color = on ? "#3fb950" : "#8b95a5";
   el.title = note + (on ? "（点击切到轮询）" : "（点击尝试实时）");
 }
 function scheduleRefresh() { clearTimeout(liveTimer); liveTimer = setTimeout(refresh, 400); }
-function closeLive() { if (liveWs) { try { liveWs.close(); } catch {} liveWs = null; } }
+function detachLive(ws) {
+  if (!ws) return;
+  ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+}
+function clearLiveTimers() {
+  if (liveRetryTimer) { clearTimeout(liveRetryTimer); liveRetryTimer = null; }
+  if (livePingTimer) { clearInterval(livePingTimer); livePingTimer = null; }
+  if (liveConnectTimer) { clearTimeout(liveConnectTimer); liveConnectTimer = null; }
+}
+function closeLive() {
+  liveGen++;                       // 让所有旧回调失效，包括 onclose 里的重连
+  clearLiveTimers();
+  const ws = liveWs; liveWs = null;
+  if (ws) { detachLive(ws); try { ws.close(1000, "switch"); } catch {} }
+}
+function scheduleLiveRetry(delay = 5000) {
+  if (liveRetryTimer) return;
+  if (liveMode !== "ws" || !current || current === "*" || document.visibilityState === "hidden") return;
+  liveRetryTimer = setTimeout(() => {
+    liveRetryTimer = null;
+    if (liveMode === "ws" && (current && current !== "*") && document.visibilityState !== "hidden" && !liveWs) connectLive();
+  }, delay);
+}
 function connectLive() {
   closeLive();
-  if (!current) return;
-  if (current === "*") { paintLive(false, "全部项目视图：定时/手动刷新"); return; }
-  if (liveMode === "poll") { paintLive(false, "轮询模式：按刷新频率拉取"); return; }
+  if (!current) { paintLive(false, "等待选择项目", "等待项目"); return; }
+  if (current === "*") { paintLive(false, "全部项目视图：定时/手动刷新", "全部项目"); return; }
+  if (liveMode === "poll") { paintLive(false, "轮询模式：按刷新频率拉取", "轮询"); return; }
+  const gen = liveGen;
+  paintLive(false, "实时连接中…", "连接中…");
   try {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    // 继续走 /p/{project}/ws：它同样接受管理会话 cookie，但不额外经过 Access 边缘，
+    // 少一层 WebSocket Upgrade 的 302 风险；项目与 admin 身份由 Worker 校验。
     const ws = new WebSocket(`${proto}//${location.host}/p/${encodeURIComponent(current)}/ws`);
-    ws.onopen = () => paintLive(true, "实时模式：服务端推送");
-    ws.onmessage = (ev) => { try { if (JSON.parse(ev.data).type === "msg") scheduleRefresh(); } catch {} };
-    ws.onclose = (e) => { paintLive(false, "实时断开，5 秒后重连", "轮询·断开" + (e.code ? ` ${e.code}` : "")); liveWs = null;
-      setTimeout(() => { if (liveMode === "ws" && current && current !== "*" && document.visibilityState !== "hidden") connectLive(); }, 5000); };
-    ws.onerror = () => paintLive(false, "实时连不上", "轮询·失败");
     liveWs = ws;
-  } catch { paintLive(false, "浏览器不支持 WebSocket"); }
+    // 握手超时：不能永远停在“连接中”。10 秒没 open 就丢弃这条并重试。
+    liveConnectTimer = setTimeout(() => {
+      if (gen !== liveGen || ws !== liveWs || ws.readyState !== WebSocket.CONNECTING) return;
+      detachLive(ws); liveWs = null;
+      try { ws.close(1000, "handshake timeout"); } catch {}
+      paintLive(false, "实时握手超时，5 秒后重试", "轮询·超时");
+      scheduleLiveRetry(5000);
+    }, 10000);
+    ws.onopen = () => {
+      if (gen !== liveGen || ws !== liveWs) { try { ws.close(); } catch {} return; }
+      clearLiveTimers();
+      paintLive(true, "实时模式：服务端推送");
+      livePingTimer = setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send("ping"); }, 25000);
+    };
+    ws.onmessage = (ev) => {
+      if (gen !== liveGen || ws !== liveWs) return;
+      try { if (JSON.parse(ev.data).type === "msg") scheduleRefresh(); } catch {}
+    };
+    ws.onclose = (e) => {
+      if (gen !== liveGen || ws !== liveWs) return;  // 已切项目/已主动关闭，别再抢当前连接
+      liveWs = null;
+      clearLiveTimers();
+      paintLive(false, "实时断开，5 秒后重连", "轮询·断开" + (e.code ? ` ${e.code}` : ""));
+      scheduleLiveRetry(5000);
+    };
+    ws.onerror = () => {
+      if (gen === liveGen && ws === liveWs) paintLive(false, "实时连不上，等待重试", "轮询·失败");
+    };
+  } catch { paintLive(false, "浏览器不支持 WebSocket", "不支持"); }
 }
 const liveEl = $("liveDot");
 if (liveEl) liveEl.onclick = () => {
@@ -1778,7 +1830,18 @@ if (liveEl) liveEl.onclick = () => {
   localStorage.setItem("hub.live", liveMode);
   connectLive();
 };
-connectLive();
+// 手机切前后台/断网恢复：不要相信浏览器会替我们重连，主动重建一次。
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && liveMode === "ws" && current && current !== "*" && !liveWs) connectLive();
+});
+window.addEventListener("online", () => {
+  if (liveMode === "ws" && current && current !== "*" && !liveWs) connectLive();
+});
+window.addEventListener("offline", () => {
+  clearLiveTimers();
+  if (liveWs) { const ws = liveWs; liveWs = null; detachLive(ws); try { ws.close(); } catch {} }
+  paintLive(false, "网络已断开，恢复后重连", "离线");
+});
 $("btnReload").onclick = refresh;
 $("btnBroadcast").onclick = broadcast;
 const btnSendEl = $("btnSend");
