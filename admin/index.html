@@ -529,7 +529,7 @@ function messageText(m) {
     || "—";
 }
 const deepEsc = (v) => Array.isArray(v) ? v.map(deepEsc)
-  : (v && typeof v === "object") ? Object.fromEntries(Object.entries(v).map(([k,x]) => [k, deepEsc(x)]))
+  : (v && typeof v === "object") ? Object.fromEntries(Object.entries(v).map(([k,x]) => [esc(String(k)), deepEsc(x)]))
   : (typeof v === "string" ? esc(v) : v);
 let policy = { mode: "all", projects: [] };
 let current = "";
@@ -576,7 +576,7 @@ const $ = (id) => {
   return STUB;                       // 空壳：赋值不报错，但会留下 warning 便于定位
 };
 
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, _retried = false) {
   // /admin/* 在 Cloudflare Access 里未被放行（边缘直接 403），统一走 /console/admin/*
   const url = path.startsWith("/admin") ? "/console" + path : path;
   // token 为空时绝不能发 "Bearer "：Access 会把无效凭据直接判 403，
@@ -589,14 +589,41 @@ async function api(path, method = "GET", body) {
     body: body ? JSON.stringify(body) : undefined,
     credentials: "same-origin",   // 与 downloadBundle/boot 一致：带上 Access/hub_sess cookie
   });
-  if (r.status === 401 || r.status === 403) {
-    // 不要递归弹窗：清掉凭证、锁屏、抛错让上层停止渲染
-    token = "";
-    lock("凭证无效或已吊销，请重新输入。");
+  const ct = r.headers.get("content-type") || "";
+  const raw = await r.text();     // 只读一次：错误分类和成功 JSON 都复用
+  if (!r.ok) {
+    // 只有真正的认证错误才锁屏；project_not_visible / csrf_blocked / scope 不足
+    // 不能把整页打成“凭证过期”。403 的语义按响应体区分。
+    const authFailure = r.status === 401 ||
+      (r.status === 403 && /"?(admin_required|unauthorized|bad_credentials|bad_ticket|not_authenticated)"?/i.test(raw));
+    if (authFailure) {
+      // 会话 8 小时过期时，若 Access cookie 还有效，/console/whoami 能换新 cookie；
+      // 先无 token 重试一次，失败才锁屏。
+      if (!_retried) {
+        token = "";
+        try {
+          const w = await fetch("/console/whoami", { credentials: "same-origin" });
+          if (w.ok) return api(path, method, body, true);
+        } catch { /* 落到锁屏 */ }
+      }
+      token = "";
+      lock("会话已过期或凭证无效，请重新输入。");
+      throw new AuthError("unauthorized");
+    }
+    throw new Error(r.status + " " + raw.slice(0, 200));
+  }
+  if (!ct.includes("application/json")) {
+    // Access 在会话失效时可能 302 到登录页，fetch 跟随成 200 HTML；这不是合法 API 响应。
+    if (!_retried) {
+      try {
+        const w = await fetch("/console/whoami", { credentials: "same-origin" });
+        if (w.ok) return api(path, method, body, true);
+      } catch { /* 落到锁屏 */ }
+    }
+    lock("会话已过期，请刷新控制台重新登录。");
     throw new AuthError("unauthorized");
   }
-  if (!r.status.toString().startsWith("2")) throw new Error(r.status + " " + (await r.text()).slice(0, 200));
-  const j = await r.json();
+  const j = JSON.parse(raw);
   return deepEsc(j);          // 所有服务端字符串先转义，渲染器一律 innerHTML 也注入不了
 }
 
@@ -1121,7 +1148,7 @@ function openAgent(id, project) {
       const pl = m.payload || {};
       const done = m.kind === "done" || pl.status === "done" || (pl.task && pl.task.state === "done");
       const pend = done ? pendingFor(String(m.sender || "")) : 0;
-      const text = esc(String(messageText(m)));
+      const text = String(messageText(m));   // messageText 已经过 deepEsc；这里不能再 esc 一次
       const kindLabel = m.kind === "released"
         ? `已交付 · 待取 ${pl.pending_submissions ?? ""}`.trim()
         : (done && pend ? "完成待取" : (m.kind || ""));
@@ -1623,7 +1650,7 @@ async function loadMsgs() {
   $("msgs").innerHTML = rows.length ? rows.map((m) => {
     const pl = m.payload || {};
     const task = pl.task && typeof pl.task === "object" ? pl.task : {};
-    const txt = esc(String(messageText(m)));
+    const txt = String(messageText(m));   // 同上：API 已 deepEsc
     const done = m.kind === "done" || pl.status === "done" || task.state === "done";
     const pending = done ? pendingFor(String(m.sender || "")) : 0;
     // done 且仍有交付待取时，合成一个状态显示；不要把“执行完成”和“交付待取”并排成矛盾画面
@@ -1638,7 +1665,7 @@ async function loadMsgs() {
       <td class="muted">${(m.ts || m.at) ? new Date(m.ts || m.at).toLocaleTimeString() : "—"}</td>
     </tr>
     <tr class="msgDetail" data-msg-detail="${m.seq}" hidden>
-      <td colspan="6"><pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">${esc(JSON.stringify(m, null, 2))}</pre></td>
+      <td colspan="6"><pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">${JSON.stringify(m, null, 2)}</pre></td>
     </tr>`;
   }).join("") : `<tr><td colspan="6" class="empty">暂无消息</td></tr>`;
   reapplyFilters();
@@ -1723,8 +1750,14 @@ async function refresh() {
   // 任务台账要等 loadAgents 完成后再渲染，才能把 active/offline 标在转派下拉里
   try { await loadTasks(); } catch (e) { console.warn("[hub] loadTasks failed", e); }
   // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
-  await loadSubs();
-  await loadMsgs();
+  try { await loadSubs(); } catch (e) {
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] loadSubs failed", e);
+  }
+  try { await loadMsgs(); } catch (e) {
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] loadMsgs failed", e);
+  }
 }
 
 $("proj").onchange = (e) => {

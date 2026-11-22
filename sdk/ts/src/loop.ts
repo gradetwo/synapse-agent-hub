@@ -31,6 +31,10 @@ export class Loop {
   private needCatchup = false;
   private transport: "auto" | "ws" | "poll" = "auto";
   private probeMs = 4000;
+  private probing = false;
+  private stopped = false;
+  private probeTimer: NodeJS.Timeout | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
   profile: ReturnType<typeof detectProfile>;
 
   constructor(client: Client, opts: LoopOptions = {}) {
@@ -64,34 +68,61 @@ export class Loop {
 
   /** 先试长连接；环境不支持（无 WebSocket / 握手失败）就退回轮询 */
   private async probeWs(): Promise<void> {
+    if (this.stopped || this.probing) return;
     const GS: any = (globalThis as any).WebSocket;
     if (!GS) { this.mode = "poll"; return; }
+    this.probing = true;
+    let ws: any = null;
     try {
       const ticket = await this.c.wsTicket();
       const base = this.c.endpoint.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
-      const ws = new GS(`${base}/p/${this.c.project}/ws?ticket=${ticket}`);
+      ws = new GS(`${base}/p/${this.c.project}/ws?ticket=${ticket}`);
+      // 先挂 onmessage，避免 open 到赋值之间丢帧。
+      this.ws = ws;
+      this.needCatchup = true;
+      ws.onmessage = (ev: any) => this.onWsMessage(ev);
+      ws.onclose = () => {
+        if (this.ws !== ws) return;             // 旧连接的 close 不能清掉新连接/重连定时器
+        this.ws = null; this.mode = "poll";
+        this.stopPing();
+        if (!this.stopped) this.probeTimer = setTimeout(() => void this.probeWs(), 5000);
+      };
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("ws timeout")), this.probeMs);
         ws.onopen = () => { clearTimeout(t); resolve(); };
         ws.onerror = () => { clearTimeout(t); reject(new Error("ws error")); };
       });
-      this.ws = ws; this.mode = "ws"; this.needCatchup = true;
-      ws.onmessage = (ev: any) => this.onWsMessage(ev);
-      ws.onclose = () => {
-        this.ws = null; this.mode = "poll";
-        setTimeout(() => void this.probeWs(), 5000);
-      };
+      this.mode = "ws";
+      this.catchUp();                 // 连接建立前的空窗，以及重连期间的缺口
+      this.startPing(ws);
     } catch {
+      if (this.ws === ws) this.ws = null;
       this.mode = "poll";
-      if (this.transport === "ws") throw new Error("transport=ws 但长连接建立失败");
+      if (this.transport === "ws" && !this.stopped) throw new Error("transport=ws 但长连接建立失败");
+    } finally {
+      this.probing = false;
     }
+  }
+
+  private startPing(ws: any): void {
+    this.stopPing();
+    this.pingTimer = setInterval(() => {
+      try { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); } catch {}
+    }, 25_000);
+  }
+
+  private stopPing(): void {
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+    if (this.probeTimer) { clearTimeout(this.probeTimer); this.probeTimer = null; }
   }
 
   private onWsMessage(ev: any): void {
     try {
       const m = JSON.parse(String(ev.data));
       if (m?.type === "msg" && this.c.isForMe(m)) {   // 回声/自广播不进队列
+        const seq = Number(m.seq) || 0;
         if (!this.q.some((x) => x.seq === m.seq)) this.q.push(m);
+        this.c.advanceCursor(seq);                   // 重连补拉不会重复入队
         void this.maybeAck(m);
       }
     } catch { /* 非法帧忽略 */ }
@@ -183,9 +214,11 @@ export class Loop {
   }
 
   close(): void {
-    this.leaveBusy();
+    this.stopped = true;
+    this.stopPing();
     try { this.ws?.close(); } catch {}
     this.ws = null;
+    this.leaveBusy();
     this.c.stop();
   }
 }

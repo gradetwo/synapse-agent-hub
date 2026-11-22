@@ -140,6 +140,11 @@ export class Client {
   /** 自己发出的广播不回收，否则自己回复自己会形成回声风暴 */
   isForMe(m: any): boolean { return !(m?.sender === this.opts.agentId && !m?.to); }
 
+  /** WS 收到并确认要处理后推进游标；重连 catch-up 不会重复投递。 */
+  advanceCursor(seq: number): void {
+    if (Number.isFinite(seq) && seq > 0) this.cursorSave(seq);
+  }
+
   async pollInbox(topics?: string, limit = 50): Promise<any[]> {
     let since = this.cursorLoad();
     const out: any[] = [];
@@ -191,11 +196,22 @@ export class Client {
     return { sha256: sha, name: path.split("/").pop()!, bytes: data.length };
   }
 
-  async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {}) {
+  async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {}, taskId?: string) {
+    const base = baseSha || this.collectEnv().git_head || "";
+    if (!base) throw new Error("base_sha required: pass baseSha or run inside a git repo");
     return this.post(`/p/${this.opts.project}/submissions`, {
       submission_id: `sub-${this.opts.agentId}-${crypto.randomUUID().slice(0, 8)}`,
-      agent_id: this.opts.agentId, kind, title, refs, base_sha: baseSha, checks,
+      agent_id: this.opts.agentId, kind, title, refs, base_sha: base, checks,
+      ...(taskId ? { task_id: taskId } : {}),
     });
+  }
+
+  // ── 任务租约 ────────────────────────────────────────────
+  claimTask(taskId: string) {
+    return this.post(`/p/${this.opts.project}/tasks/claim`, { task_id: taskId });
+  }
+  releaseTask(taskId: string, state: "done" | "open" | "blocked" = "done") {
+    return this.post(`/p/${this.opts.project}/tasks/release`, { task_id: taskId, state });
   }
 
   // ── 内部 ──────────────────────────────────────────────
@@ -281,7 +297,12 @@ export class Client {
   }
 
   private collectEnv() {
-    return { git_head: null, dirty: null };
+    const head = spawnSync("git", ["rev-parse", "--short", "HEAD"], { encoding: "utf8" });
+    const dirty = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8" });
+    return {
+      git_head: head.status === 0 ? head.stdout.trim() || null : null,
+      dirty: dirty.status === 0 ? dirty.stdout.trim().length > 0 : null,
+    };
   }
 
   private async collectLoad() {
@@ -291,5 +312,34 @@ export class Client {
       load.load1 = Number(la[0]);
     } catch { load.degraded = true; }
     return load;
+  }
+}
+
+/** 任务租约：进入即认领，每 4 分钟续租，退出按成功/失败交还。 */
+export class TaskLease {
+  private timer?: any;
+  constructor(private client: Client, public taskId: string, private renewMs = 240_000) {}
+
+  async enter(): Promise<this> {
+    const r = await this.client.claimTask(this.taskId);
+    if (!r?.ok) throw new Error(`claim failed: ${JSON.stringify(r)}`);
+    this.client.setWork({ state: "busy", taskId: this.taskId });
+    this.timer = setInterval(() => {
+      this.client.claimTask(this.taskId).catch(() => {});   // 网络抖动下一轮再续
+    }, this.renewMs);
+    this.timer.unref?.();
+    return this;
+  }
+
+  async release(state: "done" | "open" | "blocked" = "done") {
+    this.stop();
+    const r = await this.client.releaseTask(this.taskId, state);
+    this.client.setWork({ state: "idle" });
+    return r;
+  }
+
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
   }
 }

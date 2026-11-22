@@ -33,6 +33,18 @@ export class Admin {
     return this.c.reqGet(this.p("/tasks")).then((r) => r.tasks ?? []);
   }
 
+  closeTask(taskId: string, reason = ""): Promise<any> {
+    return this.c.reqPost(this.p("/tasks/close"), { task_id: taskId, reason });
+  }
+
+  reclaimTask(taskId: string, reason = ""): Promise<any> {
+    return this.c.reqPost(this.p("/tasks/reclaim"), { task_id: taskId, reason });
+  }
+
+  reassignTask(taskId: string, to: string, reason = ""): Promise<any> {
+    return this.c.reqPost(this.p("/tasks/reassign"), { task_id: taskId, to, reason });
+  }
+
   send(to: string[], title = "", body = "", ack = true, kind = "task"): Promise<any> {
     const who = (to || []).filter(Boolean);
     if (!who.length) return this.broadcast(title, body, ack, kind);

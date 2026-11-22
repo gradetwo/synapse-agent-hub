@@ -53,12 +53,14 @@ export class ProjectRoom implements DurableObject {
       case "tasks/release":return this.release(body);
       case "tasks/submission-settled": return this.submissionSettled(body);
       case "tasks/list":   return this.listTasks();
+      case "tasks/get":    return this.getTask(body);
       case "tasks/create": return this.createTask(body);
       case "tasks/admin-close": return this.adminClose(body);
       case "tasks/admin-reclaim": return this.adminReclaim(body);
       case "tasks/admin-reassign": return this.adminReassign(body);
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
+      case "agent/remove": return this.removeAgent(body);
       case "ws":           return this.ws(req);
       case "wsstat": {
         // 只报"活着的会话"，并按 agent 汇总；sockets 字段保留给旧客户端/提示词
@@ -160,11 +162,12 @@ export class ProjectRoom implements DurableObject {
     // 客户端身份随连接保存，断线重连时管理端能看到"谁连着"
     const me = req.headers.get("x-agent-id") ?? "unknown";
     const role = req.headers.get("x-role") ?? "agent";
-    // 同一 agent 只保留最新一条会话：旧连接先踢掉，避免两个 run 实例同时消费、重复回执
+    // 同一 agent 只保留最新一条会话：旧连接先踢掉，避免两个 run 实例同时消费、重复回执。
+    // 管理台例外：多个标签页/设备可以并存，否则会互相踢成“连接中”循环。
     for (const old of this.state.getWebSockets()) {
       try {
         const att: any = old.deserializeAttachment?.();
-        if (att?.me === me) old.close(4001, "superseded by new connection");
+        if (role !== "admin" && att?.me === me) old.close(4001, "superseded by new connection");
       } catch { /* 旧运行时没有 attachment */ }
     }
     this.state.acceptWebSocket(server, [me]);
@@ -318,6 +321,14 @@ export class ProjectRoom implements DurableObject {
     if (old) return json({ error: "task_exists", task_id: id }, 409);
     const now = Date.now();
     const to = b.to === undefined || b.to === null || String(b.to).trim() === "" ? null : String(b.to).trim();
+    if (to) {
+      const project = String(b.project ?? this.projectName());
+      const active = await this.env.DB.prepare(
+        `SELECT 1 FROM agents WHERE project = ? AND agent_id = ? AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`
+      ).bind(project, to, now).first<any>().catch(() => null);
+      if (!active) return json({ error: "target_not_found", to }, 422);
+    }
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
                      project: b.project ?? this.projectName(),
                      owner: null, lease_until: 0, created_at: now, updated_at: now,
@@ -377,6 +388,8 @@ export class ProjectRoom implements DurableObject {
     if (!t) return json({ error: "not_found" }, 404);
     const now = Date.now();
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
+    if (t.state === "claimed" && t.owner === b.agent_id && Number(t.lease_until ?? 0) > now)
+      return json({ ok: true, lease_until: t.lease_until, already: true });
     if (t.state !== "open" && !(t.state === "claimed" && t.lease_until < now))
       return json({ error: "locked", owner: t.owner, lease_until: t.lease_until }, 409);
     const lease = now + TASK_LEASE_MS;
@@ -404,18 +417,18 @@ export class ProjectRoom implements DurableObject {
     const want = b.state ?? "done";
     if (!["done", "open", "blocked"].includes(want))
       return json({ error: "bad_release_state", allowed: ["done", "open", "blocked"] }, 422);
+    if (t.state === want && !t.owner && t.released_by === b.agent_id)
+      return json({ ok: true, state: t.state, pending_submissions: t.pending_submissions ?? 0, already: true });
     let state = want;
-    let pending = 0;
+    // 所有出口都重算待取数；state=open/blocked 也要保留真实 pending，
+    // 否则 agent 放弃/阻塞后管理台会把“还有交付待取”误显示成 0。
+    const pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
     // 联动：目标是 done 时先看交付——还有没取走的，任务只进 released（已交付待取），
     // 不许直接 done。最后一件被取走时由 submissionSettled 收成 done。
-    // state=open 是 agent 自己放弃 claim：owner 清空，to 保留，交给管理侧决定取回/转派。
-    if (want === "done") {
-      pending = await this.pendingDeliveries(b.project ?? t.project ?? "", b.task_id);
-      if (pending > 0) state = "released";
-    }
+    if (want === "done" && pending > 0) state = "released";
     const now = Date.now();
     const patch: any = { state, owner: null, lease_until: 0, pending_submissions: pending,
-                         updated_at: now };
+                         updated_at: now, released_by: b.agent_id };
     if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
     if (state === "blocked") { patch.blocked_at = now; }
     await this.st.put(`task:${b.task_id}`, { ...t, ...patch });
@@ -440,9 +453,24 @@ export class ProjectRoom implements DurableObject {
       await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task", kind: "done",
                           payload: { task_id: b.task_id, closed_by: "collection" }, dedupe_key: `close:${b.task_id}` });
     } else {
-      await this.st.put(`task:${b.task_id}`, { ...t, pending_submissions: pending });
+      await this.st.put(`task:${b.task_id}`, { ...t, pending_submissions: pending, updated_at: Date.now() });
     }
     return json({ ok: true, task_id: b.task_id, state, pending_submissions: pending });
+  }
+
+  // 单任务元数据：只给交付校验用，不返回正文，避免普通 agent 拉取任务内容。
+  private async getTask(b: any) {
+    const id = this.taskIdOf(b);
+    if (!id) return json({ error: "task_id_required" }, 422);
+    const t: any = await this.st.get(`task:${id}`);
+    if (!t) return json({ error: "not_found", task_id: id }, 404);
+    return json({
+      task_id: t.task_id ?? t.id,
+      state: t.state,
+      owner: t.owner ?? null,
+      to: t.to ?? null,
+      project: t.project ?? this.projectName(),
+    });
   }
 
   private async listTasks() {
@@ -573,6 +601,13 @@ export class ProjectRoom implements DurableObject {
     return json({ seq });
   }
 
+  private async removeAgent(b: any) {
+    const id = String(b?.agent_id ?? "").trim();
+    if (!id) return json({ error: "agent_id_required" }, 422);
+    await this.st.delete(`agent:${id}`);
+    return json({ ok: true });
+  }
+
   private async agents() {
     const now = Date.now();
     const r = await this.st.list<any>({ prefix: "agent:" });
@@ -604,10 +639,13 @@ export class ProjectRoom implements DurableObject {
     const r = await this.st.list<Task>({ prefix: "task:" });
     for (const [k, t] of r) {
       if (t.state === "claimed" && t.lease_until < now) {
-        await this.st.put(k, { ...t, state: "open", owner: null, lease_until: 0 });
+        const prevOwner = t.owner;
+        const draft: any = { ...t, state: "open", owner: null, lease_until: 0,
+                             updated_at: now, reclaimed_at: now, reclaimed_from: prevOwner };
+        await this.st.put(k, draft);
         await this.append({ project: (t as any).project ?? this.projectName(),
                             sender: "system", topic: "task", kind: "reclaimed",
-                            payload: { task_id: (t as any).task_id ?? (t as any).id, prev_owner: t.owner },
+                            payload: { task_id: (t as any).task_id ?? (t as any).id, prev_owner: prevOwner },
                             max_per_min: 1000,
                             dedupe_key: `reclaim:${(t as any).task_id ?? (t as any).id}:${now}` });
         reclaimed++;

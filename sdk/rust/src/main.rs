@@ -1079,12 +1079,37 @@ fn main() {
             }
             return;
         }
+        "task-claim" => {
+            let id = args_map.get("task").or_else(|| args_map.get("task-id")).cloned().unwrap_or_default();
+            if id.trim().is_empty() { eprintln!("task-claim 需要 --task <id>"); std::process::exit(2); }
+            match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/claim", cfg.project),
+                             json!({ "task_id": id })) {
+                Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+                Err(e) => { eprintln!("task-claim 失败：{e}"); std::process::exit(1); }
+            }
+            return;
+        }
+        "task-release" => {
+            let id = args_map.get("task").or_else(|| args_map.get("task-id")).cloned().unwrap_or_default();
+            if id.trim().is_empty() { eprintln!("task-release 需要 --task <id>"); std::process::exit(2); }
+            let state = args_map.get("state").cloned().unwrap_or_else(|| "done".into());
+            if !["done", "open", "blocked"].contains(&state.as_str()) {
+                eprintln!("task-release --state 只能是 done|open|blocked"); std::process::exit(2);
+            }
+            match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/release", cfg.project),
+                             json!({ "task_id": id, "state": state })) {
+                Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+                Err(e) => { eprintln!("task-release 失败：{e}"); std::process::exit(1); }
+            }
+            return;
+        }
         "submit" => {
             let kind = args_map.get("kind").cloned().unwrap_or_else(|| "patch".into());
             let title = args_map.get("title").cloned().unwrap_or_default();
             let base_sha = args_map.get("base-sha").cloned();
             let notes = args_map.get("notes").cloned().unwrap_or_default();
             let sid = args_map.get("sid").cloned();
+            let task = args_map.get("task").or_else(|| args_map.get("task-id")).cloned();
             let checks: Value = args_map.get("checks")
                 .and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}));
             // 支持多个 --ref：--ref <sha256> 或 --ref <sha256>:<name>
@@ -1095,7 +1120,7 @@ fn main() {
                     json!({"sha256": parts[0], "name": parts.get(1).copied().unwrap_or("artifact")})
                 }).collect();
             match artifact_submit(&cfg, &agent, &base, &kind, &title, refs,
-                                  base_sha.as_deref(), checks, &notes, sid.as_deref()) {
+                                  base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref()) {
                 Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
                 Err(e) => { eprintln!("submit 失败：{e}"); std::process::exit(1); }
             }
@@ -1110,6 +1135,7 @@ fn main() {
             let base_sha = args_map.get("base-sha").cloned();
             let notes = args_map.get("notes").cloned().unwrap_or_default();
             let sid = args_map.get("sid").cloned();
+            let task = args_map.get("task").or_else(|| args_map.get("task-id")).cloned();
             let checks: Value = args_map.get("checks")
                 .and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}));
             let up = match artifact_upload(&cfg, &agent, &base, &file) {
@@ -1118,7 +1144,7 @@ fn main() {
             };
             let refs = vec![up["ref"].clone()];
             let sub = match artifact_submit(&cfg, &agent, &base, &kind, &title, refs,
-                                            base_sha.as_deref(), checks, &notes, sid.as_deref()) {
+                                            base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref()) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("deliver/submit 失败（文件已上传，ref={}）：{e}", up["sha256"]); std::process::exit(1); }
             };
@@ -1621,7 +1647,7 @@ fn new_submission_id(agent_id: &str) -> String {
 fn artifact_submit(
     cfg: &Cfg, agent: &Agent, base: &str,
     kind: &str, title: &str, refs: Vec<Value>,
-    base_sha: Option<&str>, checks: Value, notes: &str, sid: Option<&str>,
+    base_sha: Option<&str>, checks: Value, notes: &str, sid: Option<&str>, task_id: Option<&str>,
 ) -> Result<Value, String> {
     if cfg.token.is_empty() { return Err("缺少 --token（submit 需要 submissions.create scope）".into()); }
     let sha = match base_sha {
@@ -1632,7 +1658,7 @@ fn artifact_submit(
         return Err(format!("base_sha 缺失或非法（需 7-64 位 hex，实际: {:?}）；用 --base-sha 指定或确保处于 git 仓库", sha));
     }
     if refs.is_empty() { return Err("refs 为空：先 upload 拿到 ref，再用 --ref 传入".into()); }
-    let body = json!({
+    let mut body = json!({
         "submission_id": sid.map(|s| s.to_string()).unwrap_or_else(|| new_submission_id(&cfg.agent_id)),
         "agent_id": cfg.agent_id,
         "kind": if kind.is_empty() { "patch" } else { kind },
@@ -1642,6 +1668,9 @@ fn artifact_submit(
         "checks": checks,
         "notes": notes,
     });
+    if let Some(t) = task_id.filter(|s| !s.trim().is_empty()) {
+        body["task_id"] = json!(t.trim());
+    }
     let url = format!("{}/p/{}/submissions", base, cfg.project);
     match agent.post(&url)
         .set("authorization", &format!("Bearer {}", cfg.token))

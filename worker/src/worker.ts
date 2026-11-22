@@ -140,8 +140,9 @@ export default {
       if (!raw) { await guardFail(ip, env); await globalFail(env); return err(401, "bad_credentials"); }
       const sha = await sha256(raw);
       const row = await env.DB.prepare(
-        `SELECT agent_id FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL`
-      ).bind(sha).first<any>();
+        `SELECT agent_id FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)`
+      ).bind(sha, Date.now()).first<any>();
       if (!row) { await guardFail(ip, env); await globalFail(env); return err(401, "bad_credentials"); }
       await guardReset(ip, env);
       const cookie = await makeSession(row.agent_id, env.SESSION_SECRET, await sessEpoch(env));
@@ -203,17 +204,26 @@ export default {
       const arm64Key = "bin/synapse-agent-aarch64-linux-musl";
       const x64GnuKey = "bin/synapse-agent-x86_64-linux-gnu";
       const arm64GnuKey = "bin/synapse-agent-aarch64-linux-gnu";
-      const [shaX64, shaArm64, shaX64Gnu, shaArm64Gnu] = await Promise.all([
+      const winX64Key = "bin/synapse-agent-x86_64-windows-msvc.exe";
+      const macX64Key = "bin/synapse-agent-x86_64-apple-darwin";
+      const macArm64Key = "bin/synapse-agent-aarch64-apple-darwin";
+      const [shaX64, shaArm64, shaX64Gnu, shaArm64Gnu, shaWinX64, shaMacX64, shaMacArm64] = await Promise.all([
         r2Sha(env, x64Key),
         r2Sha(env, arm64Key),
         r2Sha(env, x64GnuKey),
         r2Sha(env, arm64GnuKey),
+        r2Sha(env, winX64Key),
+        r2Sha(env, macX64Key),
+        r2Sha(env, macArm64Key),
       ]);
       const binaries: any[] = [];
       if (shaX64) binaries.push({ platform: "linux-x86_64", url: "/dl/synapse-agent-x86_64-linux-musl", sha256: shaX64 });
       if (shaArm64) binaries.push({ platform: "linux-aarch64", url: "/dl/synapse-agent-aarch64-linux-musl", sha256: shaArm64 });
       if (shaX64Gnu) binaries.push({ platform: "linux-x86_64-gnu", url: "/dl/synapse-agent-x86_64-linux-gnu", sha256: shaX64Gnu });
       if (shaArm64Gnu) binaries.push({ platform: "linux-aarch64-gnu", url: "/dl/synapse-agent-aarch64-linux-gnu", sha256: shaArm64Gnu });
+      if (shaWinX64) binaries.push({ platform: "windows-x86_64", url: "/dl/synapse-agent-x86_64-windows-msvc.exe", sha256: shaWinX64 });
+      if (shaMacX64) binaries.push({ platform: "darwin-x86_64", url: "/dl/synapse-agent-x86_64-apple-darwin", sha256: shaMacX64 });
+      if (shaMacArm64) binaries.push({ platform: "darwin-aarch64", url: "/dl/synapse-agent-aarch64-apple-darwin", sha256: shaMacArm64 });
       return json({
         version: SDK_VERSION,
         install_url: "/dl/install.sh",
@@ -288,20 +298,28 @@ export default {
     return out;
   },
 
-  // cron：逐项目回收过期租约（并发限 3）
+  // cron：逐项目回收过期租约 + 归档/心跳历史清理；每个项目独立失败，不中断后续项目
   async scheduled(_ev: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     const rows = await env.DB.prepare(
       "SELECT project, retention_days FROM projects WHERE status='active'"
     ).all<{ project: string; retention_days: number }>();
     ctx.waitUntil((async () => {
       for (const r of rows.results) {
-        const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + r.project));
-        await stub.fetch(new Request("https://do/cron/tick"));
-        // F2 收尾：归档按项目 retention_days 清理，避免无限增长
-        const days = Math.max(1, Number(r.retention_days ?? 30));
-        const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
-        await env.DB.prepare("DELETE FROM archive WHERE project = ? AND ts < ?")
-          .bind(r.project, cutoff).run().catch(() => {});
+        try {
+          const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + r.project));
+          await stub.fetch(new Request("https://do/cron/tick"));
+          // F2 收尾：归档按项目 retention_days 清理，避免无限增长
+          const days = Math.max(1, Number(r.retention_days ?? 30));
+          const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
+          await env.DB.prepare("DELETE FROM archive WHERE project = ? AND ts < ?")
+            .bind(r.project, cutoff).run().catch(() => {});
+          // hb_hist 只保留 14 天（5 分钟一个 bucket，14 天 = 4032 个桶）
+          const hbCutoff = Math.floor(Date.now() / 300_000) - 4032;
+          await env.DB.prepare("DELETE FROM hb_hist WHERE project = ? AND bucket < ?")
+            .bind(r.project, hbCutoff).run().catch(() => {});
+        } catch (e) {
+          console.warn("cron project failed", r.project, e);
+        }
       }
     })());
   },
@@ -456,8 +474,9 @@ function need(action: string) {
   if (action.startsWith("ack")) return "ack";
   if (action.startsWith("report")) return "report";
   if (action.startsWith("inbox")) return "poll";
-  if (action === "tasks/list") return "admin";      // 任务台账含派单对象，不对普通 agent 开放
   if (action.startsWith("tasks/admin-")) return "admin";
+  if (action === "tasks/list" || action === "tasks/get") return "admin"; // 台账/单任务元数据不对普通 agent 开放
+  if (action === "tasks/create") return "admin";                        // 建单只允许管理端
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
 }
@@ -520,7 +539,9 @@ async function artifact(req: Request, env: Env, project: string, action: string)
     const usedBytes = Number(used?.b ?? 0);
     const budget = quota.maxStorageMb * 1024 * 1024;
     const limit = Math.min(hard, budget);
-    const buf = new Uint8Array(await req.arrayBuffer());     // 不看 content-length，chunked 也拦得住
+    const declared = Number(req.headers.get("content-length") ?? 0);
+    if (declared > 0 && declared > limit) return err(413, "too_large");
+    const buf = new Uint8Array(await req.arrayBuffer());     // chunked 仍会在读完后按字节数兜底
     if (buf.byteLength > limit) return err(413, "too_large");
     const got = await sha256Bytes(buf);
     if (got !== sha) return err(422, `hash_mismatch:${got}`);   // 内容寻址完整性：不许覆盖
@@ -548,17 +569,39 @@ async function admin(req: Request, env: Env, url: URL) {
   const path = url.pathname;
   const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
   let authorized = false;
+  let identityEmail = "";
+  let viaSession = false;
 
   if (bearer) {
     const sha = await sha256(bearer);
-    const row = await env.DB.prepare("SELECT role FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL")
-      .bind(sha).first<any>();
+    const row = await env.DB.prepare(
+      `SELECT role FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL
+         AND (expires_at IS NULL OR expires_at > ?)`
+    ).bind(sha, Date.now()).first<any>();
     authorized = !!row;
   } else {
     // 浏览器：Access JWT（验签）/ Access cookie 身份 / HttpOnly 会话 cookie
-    authorized = !!(await verifyAccessJwt(req, env))
-              || !!(await accessIdentityFromCookie(req))
-              || !!(await readSession(req, env));
+    const jwt = await verifyAccessJwt(req, env);
+    if (jwt) { authorized = true; identityEmail = String(jwt.email ?? ""); }
+    if (!authorized) {
+      const cookieEmail = await accessIdentityFromCookie(req);
+      if (cookieEmail) { authorized = true; identityEmail = cookieEmail; }
+    }
+    if (!authorized && await readSession(req, env)) {
+      authorized = true;
+      viaSession = true;      // 会话是 /auth/login 用管理员 token 换的，本身已验角色
+    }
+  }
+  if (authorized && !bearer && !viaSession) {
+    // 第二道门：Access 身份还必须命中管理员邮箱白名单。
+    // 未配置时使用仓库主的默认管理员邮箱；换部署时用 ADMIN_EMAILS 覆盖。
+    const allow = String(env.ADMIN_EMAILS ?? "gradetwo@gmail.com").split(/[,\s]+/).filter(Boolean)
+      .map((e) => e.toLowerCase());
+    if (allow.length && !allow.includes(identityEmail.toLowerCase())) {
+      const r = err(403, "admin_required");
+      r.headers.set("x-hub-auth", "not_admin");
+      return r;
+    }
   }
   if (!authorized) {
     const r = err(403, "admin_required");
@@ -813,6 +856,11 @@ async function admin(req: Request, env: Env, url: URL) {
       for (const id of ids) {
         await env.DB.prepare(`UPDATE agents SET revoked_at=? WHERE project=? AND agent_id=? AND revoked_at IS NULL`)
           .bind(Date.now(), project, id).run();
+        // DO 名册同步清理，避免管理台/转派下拉继续显示已吊销节点
+        await stub.fetch(new Request("https://do/agent/remove", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ agent_id: id }),
+        })).catch(() => {});
         done.push(id);
       }
       return json({ ok: true, revoked: done });
@@ -870,6 +918,7 @@ async function admin(req: Request, env: Env, url: URL) {
     }
 
     if (action === "broadcast") {
+      if (req.method !== "POST") return err(405, "method_not_allowed");
       const b: any = await req.json();
       const quota = await projectQuota(env, project);
       return stub.fetch(new Request("https://do/broadcast", {
@@ -880,34 +929,55 @@ async function admin(req: Request, env: Env, url: URL) {
 
     if (action === "submissions" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
-      if (!b.submission_id || !/^[a-zA-Z0-9._:-]{1,128}$/.test(String(b.submission_id)))
+      if (!b.submission_id || !/^[a-zA-Z0-9._:-]{1,128}$/.test(String(b.submission_id).trim()))
         return err(422, "submission_id_required");
       if (!b.agent_id) return err(422, "agent_id_required");
       if (!b.base_sha) return err(422, "base_sha_required");
       if (!/^[a-f0-9]{7,64}$/.test(String(b.base_sha))) return err(422, "base_sha_not_hex");
+      const agentId = String(b.agent_id).trim();
+      if (!/^[a-zA-Z0-9._:-]{1,80}$/.test(agentId)) return err(422, "bad_agent_id");
+      const activeAgent = await env.DB.prepare(
+        `SELECT 1 FROM agents WHERE project = ? AND agent_id = ? AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`
+      ).bind(project, agentId, Date.now()).first<any>();
+      if (!activeAgent) return err(422, "agent_not_found");
       const scan = JSON.stringify({ title: b.title, refs: b.refs, checks: b.checks });
       if (/(AKIA[0-9A-Z]{16}|-----BEGIN[^"]{0,40}PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[baprs]-)/.test(scan))
         return err(422, "secret_detected");          // DESIGN §7 的第四项检查
-      for (const r of b.refs ?? []) {
-        if (r?.name && (/^\//.test(r.name) || r.name.split("/").includes("..")))
-          return err(422, `bad_ref_name:${r.name}`);
+      const norm = normalizeRefs(b.refs);
+      if (norm.error) return err(422, norm.error);
+      for (const r of norm.refs) {
         const obj = await env.BLOBS.head(`p/${project}/artifacts/${r.sha256}`);
         if (!obj) return err(422, `blob_missing:${r.sha256}`);
       }
-      const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id);
-      if (taskId !== null && !/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
-      await env.DB.prepare(
-        `INSERT OR REPLACE INTO submissions
+      const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id).trim();
+      if (taskId !== null) {
+        if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
+        const t = await taskMeta(env, project, taskId);
+        if (!t) return err(422, `task_not_found:${taskId}`);
+        if (t.state === "done") return err(409, `task_done:${taskId}`);
+      }
+      const sid = String(b.submission_id).trim();
+      const now = Date.now();
+      const res = await env.DB.prepare(
+        `INSERT OR IGNORE INTO submissions
          (project, submission_id, agent_id, task_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
          VALUES (?,?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
-      ).bind(project, b.submission_id, b.agent_id, taskId, b.base_sha, b.kind, b.title ?? "",
-             JSON.stringify(b.refs ?? []), JSON.stringify(b.checks ?? {}), Date.now(), Date.now()).run();
+      ).bind(project, sid, agentId, taskId, b.base_sha, b.kind ?? "patch", b.title ?? "",
+             JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
+      if (res.meta.changes === 0) {
+        const old = await env.DB.prepare(
+          "SELECT agent_id FROM submissions WHERE project = ? AND submission_id = ?"
+        ).bind(project, sid).first<any>();
+        if (old?.agent_id !== agentId) return err(409, "submission_id_conflict");
+        return json({ submission_id: sid, state: "delivered", deduped: true, seq: null });
+      }
       const seq = await stub.fetch(new Request("https://do/publish", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ project, sender: b.agent_id, topic: "artifact", kind: b.kind,
-                               payload: { submission_id: b.submission_id, task_id: taskId }, dedupe_key: `sub:${b.submission_id}` }),
+        body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind: b.kind ?? "patch",
+                               payload: { submission_id: sid, task_id: taskId }, dedupe_key: `sub:${sid}` }),
       }));
-      return Response.json({ submission_id: b.submission_id, state: "delivered", seq: await seq.json() });
+      return Response.json({ submission_id: sid, state: "delivered", seq: await seq.json() });
     }
 
     const bun = action.match(/^submissions\/([^/]+)\/bundle$/);
@@ -1076,6 +1146,11 @@ async function admin(req: Request, env: Env, url: URL) {
     const r = await env.DB.prepare(
       "UPDATE agents SET revoked_at = ? WHERE project = ? AND agent_id = ? AND revoked_at IS NULL"
     ).bind(Date.now(), b.project, b.agent_id).run();
+    const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + b.project));
+    await stub.fetch(new Request("https://do/agent/remove", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent_id: b.agent_id }),
+    })).catch(() => {});
     return Response.json({ ok: true, revoked_keys: r.meta.changes });
   }
 
@@ -1144,18 +1219,29 @@ async function bundleSubmission(env: Env, project: string, id: string) {
   if (!row) return err(404, "submission_not_found");
   let refs: any[] = [];
   try { refs = JSON.parse(row.refs_json ?? "[]"); } catch { refs = []; }
+  if (refs.length > 200) return err(413, "bundle_too_many_files");
+  const maxBundle = 80 * 1024 * 1024;
 
   const files: { name: string; data: Uint8Array }[] = [];
   let total = 0;
-  for (const r of refs) {
-    const sha = String(r.sha256 ?? "");
+  // 先按 R2 元数据估算，避免单个大对象先读进内存再判超限（128MB Worker 很容易 1101）。
+  const normalized = refs.map((r) => typeof r === "string" ? { sha256: r } : r);
+  for (const r of normalized) {
+    const sha = String(r?.sha256 ?? "");
+    if (!/^[a-f0-9]{64}$/.test(sha)) continue;
+    const head = await env.BLOBS.head(`p/${project}/artifacts/${sha}`);
+    if (!head) return err(422, `blob_missing:${sha}`);
+    total += Number(head.size ?? 0);
+    if (total > maxBundle) return err(413, "bundle_too_large");
+  }
+  for (const r of normalized) {
+    const sha = String(r?.sha256 ?? "");
     if (!/^[a-f0-9]{64}$/.test(sha)) continue;
     const obj = await env.BLOBS.get(`p/${project}/artifacts/${sha}`);
     if (!obj) return err(422, `blob_missing:${sha}`);
     const buf = new Uint8Array(await obj.arrayBuffer());
-    total += buf.length;
-    if (total > 80 * 1024 * 1024) return err(413, "bundle_too_large");
-    const safe = String(r.name ?? `${sha.slice(0, 12)}.bin`).replace(/^[^\w.-]+/, "").replace(/[^\w.-]+/g, "_");
+    // 总大小已在上面的 head 阶段校验，这里不再累加，避免误以为读了两次
+    const safe = String(r?.name ?? `${sha.slice(0, 12)}.bin`).replace(/^[^\w.-]+/, "").replace(/[^\w.-]+/g, "_");
     files.push({ name: safe || `${sha.slice(0, 12)}.bin`, data: buf });
   }
 
@@ -1165,7 +1251,7 @@ async function bundleSubmission(env: Env, project: string, id: string) {
     project, submission_id: row.submission_id, agent_id: row.agent_id, base_sha: row.base_sha,
     kind: row.kind, title: row.title, state: row.state, checks,
     created_at: row.created_at, updated_at: row.updated_at,
-    refs: refs.map((r) => ({ sha256: r.sha256, name: r.name, bytes: r.bytes })),
+    refs: normalized.map((r) => ({ sha256: r?.sha256, name: r?.name, bytes: r?.bytes })),
     generated_at: Date.now(), generator: "agent-hub bundle v1",
   };
   files.push({ name: "PROVENANCE.json", data: new TextEncoder().encode(JSON.stringify(prov, null, 2)) });
@@ -1182,49 +1268,92 @@ async function bundleSubmission(env: Env, project: string, id: string) {
 }
 
 // ── 交付创建（Worker 侧：R2 校验 + D1 落库 + 发消息）──────
+type NormalizedRef = { sha256: string; name?: string; bytes?: number };
+
+/** refs 统一归一化：字符串 sha 也要变成对象，否则 bundle 阶段会静默跳过。 */
+function normalizeRefs(raw: unknown): { refs: NormalizedRef[]; error?: string } {
+  if (!Array.isArray(raw) || raw.length === 0) return { refs: [], error: "refs_required" };
+  if (raw.length > 200) return { refs: [], error: "too_many_refs" };
+  const refs: NormalizedRef[] = [];
+  for (const r of raw) {
+    const rr: any = typeof r === "string" ? { sha256: r } : r;
+    if (!rr || typeof rr !== "object" || !/^[a-f0-9]{64}$/.test(String(rr?.sha256 ?? "")))
+      return { refs: [], error: "bad_ref_sha: refs 需要 {sha256:<64位hex>}，也可直接传 sha 字符串" };
+    let name = rr.name === undefined || rr.name === null ? undefined : String(rr.name).trim();
+    if (name) {
+      name = name.replace(/\\/g, "/");
+      if (name.startsWith("/") || name.split("/").includes(".."))
+        return { refs: [], error: `bad_ref_name:${name}` };
+    }
+    const item: NormalizedRef = { sha256: String(rr.sha256) };
+    if (name) item.name = name;
+    if (rr.bytes !== undefined && Number.isFinite(Number(rr.bytes))) item.bytes = Number(rr.bytes);
+    refs.push(item);
+  }
+  return { refs };
+}
+
+/** 读一个任务的元数据；只走 DO 的内部接口，不把任务正文暴露给普通 agent。 */
+async function taskMeta(env: Env, project: string, taskId: string): Promise<any | null> {
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  const r = await stub.fetch(new Request("https://do/tasks/get", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ project, task_id: taskId }),
+  }));
+  if (!r.ok) return null;
+  return r.json<any>().catch(() => null);
+}
+
 async function createSubmission(req: Request, env: Env, project: string, agentId: string) {
   const b: any = await req.json().catch(() => ({}));
   if (!b.base_sha) return err(422, "base_sha_required");
   if (!/^[a-f0-9]{7,64}$/.test(String(b.base_sha))) return err(422, "base_sha_not_hex");
   if (!b.submission_id) return err(422, "submission_id_required");
+  const sid = String(b.submission_id).trim();
+  if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(sid)) return err(422, "bad_submission_id");
   const scan = JSON.stringify({ title: b.title, refs: b.refs, checks: b.checks });
   if (/(AKIA[0-9A-Z]{16}|-----BEGIN[^"]{0,40}PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[baprs]-)/.test(scan))
     return err(422, "secret_detected");            // 交付卫生：不许把密钥带进仓库
-  for (const r of (Array.isArray(b.refs) ? b.refs : [])) {
-    if (r?.name && (/^\//.test(r.name) || r.name.split("/").includes("..")))
-      return err(422, `bad_ref_name:${r.name}`);
+  const norm = normalizeRefs(b.refs);
+  if (norm.error) return err(422, norm.error);
+  for (const r of norm.refs) {
+    const head = await env.BLOBS.head(`p/${project}/artifacts/${r.sha256}`);
+    if (!head) return err(422, `blob_missing:${r.sha256}`);
   }
-  const refs = Array.isArray(b.refs) ? b.refs : [];
-  for (const r of refs) {
-    // 兼容裸 sha 字符串：真实联调时就踩了这个坑——refs 传 ["<sha>"] 会被
-    // 报成含义不明的 bad_ref_sha，调用方根本看不出该传对象。
-    const rr: any = typeof r === "string" ? { sha256: r } : r;
-    if (!/^[a-f0-9]{64}$/.test(String(rr?.sha256 ?? "")))
-      return err(422, "bad_ref_sha: refs 需要 {sha256:<64位hex>}，也可直接传 sha 字符串");
-    const head = await env.BLOBS.head(`p/${project}/artifacts/${rr.sha256}`);
-    if (!head) return err(422, `blob_missing:${rr.sha256}`);
+  const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id).trim();
+  if (taskId !== null) {
+    if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
+    const t = await taskMeta(env, project, taskId);
+    if (!t) return err(422, `task_not_found:${taskId}`);
+    if (t.state === "done") return err(409, `task_done:${taskId}`);
+    if (t.state !== "claimed" || t.owner !== agentId) return err(409, `task_not_claimed:${taskId}`);
   }
-  const taskId = b.task_id === undefined || b.task_id === null || b.task_id === "" ? null : String(b.task_id);
-  if (taskId !== null && !/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
   const now = Date.now();
   const res = await env.DB.prepare(
     `INSERT OR IGNORE INTO submissions
      (project, submission_id, agent_id, task_id, base_sha, kind, title, refs_json, checks_json, state, created_at, updated_at)
      VALUES (?,?,?,?,?,?,?,?,?, 'delivered', ?, ?)`
-  ).bind(project, b.submission_id, agentId, taskId, b.base_sha, b.kind ?? "patch", b.title ?? "",
-         JSON.stringify(refs), JSON.stringify(b.checks ?? {}), now, now).run();
+  ).bind(project, sid, agentId, taskId, b.base_sha, b.kind ?? "patch", b.title ?? "",
+         JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
+  if (res.meta.changes === 0) {
+    // 幂等只对“同一个 agent 的同一份交付”成立；别的 agent 抢了 ID 必须拒绝。
+    const old = await env.DB.prepare(
+      "SELECT agent_id FROM submissions WHERE project = ? AND submission_id = ?"
+    ).bind(project, sid).first<any>();
+    if (old?.agent_id !== agentId) return err(409, "submission_id_conflict");
+    return json({ submission_id: sid, state: "delivered", deduped: true, seq: null });
+  }
 
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
   const seqRes = await stub.fetch(new Request("https://do/publish", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind: b.kind ?? "patch",
-                           payload: { submission_id: b.submission_id, task_id: taskId, base_sha: b.base_sha,
+                           payload: { submission_id: sid, task_id: taskId, base_sha: b.base_sha,
                                       title: b.title ?? "", agent_id: agentId },
-                           dedupe_key: `sub:${b.submission_id}` }),
+                           dedupe_key: `sub:${sid}` }),
   }));
   const seq = await seqRes.json<any>().catch(() => ({}));
-  return json({ submission_id: b.submission_id, state: "delivered",
-                deduped: res.meta.changes === 0, seq: seq.seq ?? null });
+  return json({ submission_id: sid, state: "delivered", seq: seq.seq ?? null });
 }
 
 // ── 会话（HttpOnly cookie + HMAC 签名）─────────────────────
@@ -1239,7 +1368,7 @@ const SEC_HEADERS: Record<string, string> = {
     "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; " +
     "script-src-elem 'self' 'unsafe-inline' https://static.cloudflareinsights.com; " +
     "worker-src 'self'; " +                                                      // 缺这一条 sw.js 会被 CSP 拦死
-    "style-src 'unsafe-inline'; connect-src 'self' wss://synapse.wangda.today ws://synapse.wangda.today https://cloudflareinsights.com; " +
+    "style-src 'unsafe-inline'; connect-src 'self' https://cloudflareinsights.com; " +
     "img-src 'self' data:; manifest-src 'self'; base-uri 'none'; " +
     "form-action 'self'; frame-ancestors 'none'",
 };
@@ -1420,15 +1549,22 @@ async function loadPolicy(env: Env): Promise<{ mode: "all" | "list"; projects: s
   return { mode: row.mode === "list" ? "list" : "all", projects };
 }
 
+const R2_SHA_CACHE = new Map<string, { etag: string; sha: string }>();
+
 async function r2Sha(env: Env, key: string): Promise<string> {
   const obj = await env.BLOBS.get(key);
   if (!obj) return "";
+  const etag = String((obj as any).etag ?? "");
+  const hit = R2_SHA_CACHE.get(key);
+  if (hit && hit.etag === etag) return hit.sha;
   let sha = String((obj as any).customMetadata?.sha256 ?? "");
   if (!sha) {
     const buf = new Uint8Array(await obj.arrayBuffer());
     sha = await sha256Bytes(buf);
     try { await env.BLOBS.put(key, buf, { customMetadata: { sha256: sha } }); } catch {}
   }
+  if (R2_SHA_CACHE.size > 64) R2_SHA_CACHE.delete(R2_SHA_CACHE.keys().next().value as string);
+  R2_SHA_CACHE.set(key, { etag, sha });
   return sha;
 }
 
@@ -1484,7 +1620,12 @@ self.addEventListener("fetch", (e) => {
     return;
   }
   if (u.pathname.startsWith("/dl/")) {
-    e.respondWith(caches.match(e.request).then((r) => r || fetch(e.request)));
+    // 网络优先：二进制/安装脚本会被同名覆盖，cache-first 会长期发旧版本。
+    // 只有离线时才回退缓存。
+    e.respondWith(fetch(e.request).then((r) => {
+      if (r.ok) caches.open("hub-v2").then((c) => c.put(e.request, r.clone())).catch(() => {});
+      return r;
+    }).catch(() => caches.match(e.request).then((r) => r || Response.error())));
     return;
   }
   if (u.pathname === "/console" || u.pathname === "/manifest.webmanifest") {

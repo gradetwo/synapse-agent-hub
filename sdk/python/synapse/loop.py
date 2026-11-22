@@ -54,6 +54,7 @@ class Loop:
         self._q: "queue.Queue[dict]" = queue.Queue()
         self._busy = False
         self._stop = threading.Event()
+        self._catchup_lock = threading.Lock()
         self._poller: threading.Thread | None = None
         self.c.start_heartbeat()          # 心跳从此不用管
         if transport in ("auto", "ws"):
@@ -67,7 +68,7 @@ class Loop:
             self._ws.start()
             if self._ws.connected_once.wait(timeout=self.ws_probe_s):
                 self._mode = "ws"
-                self._catch_up()          # 补上连接建立前的空窗
+                # 补拉在 _on_ws_state("ws:connected") 里统一做；重连也走同一条路径。
         except Exception:                 # noqa: BLE001
             self._ws = None
         if self.transport == "ws" and self._mode != "ws":
@@ -79,6 +80,8 @@ class Loop:
             # 探测窗口内没连上，但后台线程后来连上了：就地升级为 ws，不必等下一轮
             if self._mode != "ws":
                 self._mode = "ws"
+            # 重连后必须补拉断线期间的消息；不补就会永久停在旧游标。
+            self._catch_up()
 
     def _on_ws_msg(self, m: dict) -> None:
         if not self.c.is_for_me(m):
@@ -86,25 +89,29 @@ class Loop:
         seq = int(m.get("seq") or 0)
         if seq and seq <= self.c._cursor_load():
             return                        # 重复帧（重连补拉的重叠）
+        if seq:
+            self.c._cursor_save(seq)      # 先推进游标，重连补拉不会重复投递
         self._q.put(m)
         self._maybe_ack(m)
 
     def _catch_up(self) -> None:
-        try:
-            msgs = self.c.poll_inbox()
-            if not msgs:
-                # 游标可能来自另一个 DO 实例（换命名空间后 seq 归零）→ 复位重拉
-                full = self.c._get(f"/p/{self.c.project}/inbox?since=0&limit=200&agent={self.c.agent_id}")
-                top = max((m["seq"] for m in full.get("messages", [])), default=0)
-                if top and top < self.c._cursor_load():
-                    self.c._cursor_save(0)
-                    msgs = self.c.poll_inbox()
-            for m in msgs:
-                self._q.put(m)
-                self._maybe_ack(m)
-            self._need_catchup = False
-        except Exception:                 # noqa: BLE001
-            pass
+        with self._catchup_lock:
+            try:
+                msgs = self.c.poll_inbox()
+                if not msgs:
+                    # 游标可能来自另一个 DO 实例（换命名空间后 seq 归零）→ 复位重拉
+                    full = self.c._get(f"/p/{self.c.project}/inbox?since=0&limit=200&agent={self.c.agent_id}")
+                    top = max((m["seq"] for m in full.get("messages", [])), default=0)
+                    if top and top < self.c._cursor_load():
+                        self.c._cursor_save(0)
+                        msgs = self.c.poll_inbox()
+                for m in msgs:
+                    self._q.put(m)
+                    self._maybe_ack(m)
+                self._need_catchup = False
+            except Exception:                 # noqa: BLE001
+                # 网络失败不阻塞 WSPump 收包；下次连接/空闲再补
+                pass
 
     @property
     def mode(self) -> str:
@@ -185,6 +192,8 @@ class Loop:
             return leftover[0]
         if self._mode == "ws":
             while deadline is None or time.time() < deadline:
+                if self._need_catchup:
+                    self._catch_up()              # 重连补拉失败时下一轮再试
                 try:
                     m = self._q.get(timeout=1.0)
                 except queue.Empty:

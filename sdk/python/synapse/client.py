@@ -40,15 +40,33 @@ class TaskLease:
 
     def __init__(self, client: "Client", task_id: str):
         self.c, self.task_id = client, task_id
+        self._stop = threading.Event()
+        self._renew: threading.Thread | None = None
+
+    def _renew_loop(self) -> None:
+        # 10 分钟租约，每 4 分钟重认领一次（同 owner 幂等，只续 lease_until）。
+        while not self._stop.wait(240):
+            try:
+                self.c._post(f"/p/{self.c.project}/tasks/claim", {"task_id": self.task_id})
+            except Exception:                      # noqa: BLE001
+                pass                               # 网络抖动下一轮再续
 
     def __enter__(self):
+        # 直接 new Client(...) 而不是 from_config 时也需要心跳续租，否则长任务
+        # 10 分钟租约到期会被别的节点抢走。
+        self.c.start_heartbeat()
         r = self.c._post(f"/p/{self.c.project}/tasks/claim", {"task_id": self.task_id})
         if not r.get("ok"):
             raise RuntimeError(f"claim failed: {r}")
         self.c.work(Work(state="busy", task_id=self.task_id))
+        self._renew = threading.Thread(target=self._renew_loop, daemon=True, name="synapse-task-lease")
+        self._renew.start()
         return self
 
     def __exit__(self, exc_type, *_):
+        self._stop.set()
+        if self._renew and self._renew.is_alive():
+            self._renew.join(timeout=1)
         state = "done" if exc_type is None else "blocked"
         self.c._post(f"/p/{self.c.project}/tasks/release", {"task_id": self.task_id, "state": state})
         self.c.work(Work(state="idle"))
@@ -320,12 +338,15 @@ class Client:
         return {"sha256": sha, "name": p.name, "bytes": len(data), "ref": {"sha256": sha, "name": p.name}}
 
     def submit(self, kind: str, title: str, refs: list[dict], base_sha: str | None = None,
-               checks: dict | None = None, notes: str = "") -> dict:
+               checks: dict | None = None, notes: str = "", task_id: str | None = None) -> dict:
         sid = f"sub-{self.agent_id}-{uuid.uuid4().hex[:8]}"
-        return self._post(f"/p/{self.project}/submissions", {
+        body = {
             "submission_id": sid, "agent_id": self.agent_id, "kind": kind, "title": title,
             "refs": refs, "base_sha": base_sha or self._git_head(), "checks": checks or {}, "notes": notes,
-        })
+        }
+        if task_id:
+            body["task_id"] = task_id
+        return self._post(f"/p/{self.project}/submissions", body)
 
     def task(self, task_id: str) -> TaskLease:
         return TaskLease(self, task_id)
@@ -466,7 +487,7 @@ class Client:
             mem = dict(re.findall(r"(\w+):\s+(\d+)", open("/proc/meminfo").read()))
             cap_mb = int(open("/sys/fs/cgroup/memory.max").read()) // 1048576 if os.path.exists("/sys/fs/cgroup/memory.max") else int(mem["MemTotal"]) // 1024
             used_mb = int(open("/sys/fs/cgroup/memory.current").read()) // 1048576 if os.path.exists("/sys/fs/cgroup/memory.current") else int(mem["MemAvailable"]) // 1024
-            load.update(mem_total_mb=cap_mb, mem_used_mb=used_mb if used_mb < cap_mb else cap_mb - used_mb)
+            load.update(mem_total_mb=cap_mb, mem_used_mb=min(used_mb, cap_mb))
         except Exception:
             pass
         try:

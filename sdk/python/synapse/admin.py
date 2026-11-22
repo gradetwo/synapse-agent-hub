@@ -92,6 +92,15 @@ class Admin:
     def tasks(self) -> list[dict]:
         return self._get("/tasks").get("tasks", [])
 
+    def task_close(self, task_id: str, reason: str = "") -> dict:
+        return self._post("/tasks/close", {"task_id": task_id, "reason": reason})
+
+    def task_reclaim(self, task_id: str, reason: str = "") -> dict:
+        return self._post("/tasks/reclaim", {"task_id": task_id, "reason": reason})
+
+    def task_reassign(self, task_id: str, to: str, reason: str = "") -> dict:
+        return self._post("/tasks/reassign", {"task_id": task_id, "to": to, "reason": reason})
+
     # ── 下发 ────────────────────────────────────────────────
     def send(self, to: Iterable[str], title: str = "", body: str = "",
              ack: bool = True, kind: str = "task") -> dict:

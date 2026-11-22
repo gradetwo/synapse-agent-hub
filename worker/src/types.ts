@@ -5,6 +5,8 @@ export interface Env {
   SESSION_SECRET: string;
   CF_ACCESS_TEAM_DOMAIN?: string;
   CF_ACCESS_AUD?: string;
+  /** 允许直接进入管理台的 Access 邮箱，逗号分隔；留空表示不额外限制。 */
+  ADMIN_EMAILS?: string;
   HEARTBEAT_PERIOD_S: string;
   LEASE_TTL_S: string;
   MAX_SUBMISSION_MB: string;

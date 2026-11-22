@@ -221,16 +221,36 @@ class WSPump(threading.Thread):
             try:
                 ticket = self.ticket_fn()
                 self.ws = WSClient(f"{self.base}/p/{self.project}/ws?ticket={ticket}").connect()
+                # 空闲读不能再用 10s 握手超时：否则每 10s 触发一次 socket.timeout，
+                # 会被外层当成断线。这里改成 ping 周期，读到超时就发应用层 ping。
+                try:
+                    self.ws.sock.settimeout(self.ping_s)
+                except Exception:                 # noqa: BLE001
+                    pass
                 self.connected_once.set()      # 先发信号，避免回调里的网络调用拖住探测
                 self.on_state("ws:connected")
                 backoff = 1.0
                 last_ping = time.time()
                 while not self._stop.is_set():
-                    msg = self.ws.recv_json()
+                    try:
+                        msg = self.ws.recv_json()
+                    except (socket.timeout, TimeoutError):
+                        # 空闲心跳：服务端回 pong 会继续走 recv_json；连续无响应由
+                        # 上层最终超时/关闭触发重连，不在每次 timeout 都重连。
+                        try:
+                            self.ws.send_json({"type": "ping"})
+                        except Exception:         # noqa: BLE001
+                            break
+                        last_ping = time.time()
+                        continue
                     if msg is None:
                         break
                     if msg.get("type") == "msg":
-                        self.on_msg(msg)
+                        try:
+                            self.on_msg(msg)
+                        except Exception as e:     # noqa: BLE001
+                            # 单条坏消息不能把整条连接打断
+                            self.on_state(f"ws:on_msg_error:{type(e).__name__}")
                     if time.time() - last_ping > self.ping_s:
                         self.ws.send_json({"type": "ping"})
                         last_ping = time.time()
