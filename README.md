@@ -50,9 +50,11 @@ sdk/python/yanshi/        旧 import 兼容壳
 sdk/ts/src/               TypeScript SDK（@synapse/agent，构建产物在 dist/）
 sdk/rust/src/             Rust 单二进制 synapse-agent
 sdk/rust/src/winmsg.rs    Windows 窗口桥（枚举/激活/注入文字/读文本）
+sdk/rust/src/tmux.rs      Linux/macOS tmux 投递（pane 发现/注入/标记验证）
 sdk/rust/src/localbus.rs  本机消息总线（命名管道 / Unix socket）
 sdk/rust/BINARIES.md      多平台编译与 R2 发布说明
 docs/WINDOW-BRIDGE.md     Windows 窗口桥 + 本机消息总线接入文档
+docs/TMUX-BRIDGE.md       Linux/macOS tmux/TUI 投递文档
 dist/                     当前 Linux x64/ARM64、Windows x64 二进制 + SHA256SUMS
 spec/openapi.yaml         协议定义（0.5.1）
 spec/conformance/         语言无关一致性用例
@@ -221,7 +223,7 @@ cargo build --release
 
 Rust 的资源采集目前针对 Linux（`/proc`、`df`）；其它平台可编译运行，但 `load` / `disk` 等指标会降级为空，需要按 `BUILD.md` 补平台实现。
 
-**Windows 窗口桥**（本次新增）：Rust 客户端可给本机豆包等第三方窗口发文字、读取窗口新消息，并通过命名管道与配置程序双向通信，可选上报 Hub。详见 [`docs/WINDOW-BRIDGE.md`](./docs/WINDOW-BRIDGE.md)。
+**Windows 窗口桥**：Rust 客户端可给本机豆包等第三方窗口发文字、读取窗口新消息，并通过命名管道与配置程序双向通信，可选上报 Hub。详见 [`docs/WINDOW-BRIDGE.md`](./docs/WINDOW-BRIDGE.md)。
 
 ```bash
 synapse-agent.exe win-list --match 豆包
@@ -229,6 +231,15 @@ synapse-agent.exe win-send --title 豆包 --text "帮我总结今天的日志" -
 synapse-agent.exe win-read --title 豆包 --diff
 synapse-agent.exe bus-serve
 synapse-agent.exe bridge --title 豆包 --hub 1
+```
+
+**Linux/macOS tmux 投递**：Rust 客户端把 Hub 消息注入 tmux pane 中的 agent TUI，看到 `[Synapse #seq]` 标记才 ACK；失败留在 WAL 并每 5 秒重试。详见 [`docs/TMUX-BRIDGE.md`](./docs/TMUX-BRIDGE.md)。
+
+```bash
+synapse-agent tmux-list
+synapse-agent tmux-config --target '%3'
+synapse-agent run --tmux 1
+synapse-agent tmux-send --target '%3' --text "[Synapse #9] git pull" --enter 1 --verify 1
 ```
 
 ---

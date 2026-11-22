@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 mod profile;
 mod winmsg;
+mod tmux;
 mod localbus;
 use std::io::{Write, Read};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,18 @@ struct Cfg {
     window_app: String,
     /// `run --window 1` / config.json 的 window_forward：把收件消息真正注入窗口后才 ACK。
     window_forward: bool,
+    /// 默认 tmux pane（如 `agent:0.0` / `%3`），由 tmux-config 写入 config.json。
+    tmux_target: String,
+    /// `run --tmux ...` / config.json 的 tmux_forward：把收件消息注入 tmux 后才 ACK。
+    tmux_forward: bool,
+}
+
+fn cfg_truthy(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
+}
+
+fn cfg_falsey(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
 }
 
 /// 解析窗口命令的目标：命令行 --app/--title 优先，否则用 config.json 的默认值，再退环境变量。
@@ -56,6 +69,11 @@ fn resolve_target(app: &str, title: &str, default_app: &str) -> Result<winmsg::W
 }
 
 impl Cfg {
+    /// 是否开启了任意外部投递面（Windows 窗口 / Linux-macOS tmux）。
+    fn surface_forward(&self) -> bool {
+        self.window_forward || self.tmux_forward
+    }
+
     /// 复制一份给线程用（Cfg 没有 derive Clone，避免改动对外结构）
     fn clone_lite(&self) -> Cfg {
         Cfg {
@@ -63,6 +81,7 @@ impl Cfg {
             token: self.token.clone(), agent_id: self.agent_id.clone(), dir: self.dir.clone(),
             heartbeat_s: self.heartbeat_s, exec_cmd: self.exec_cmd.clone(),
             window_app: self.window_app.clone(), window_forward: self.window_forward,
+            tmux_target: self.tmux_target.clone(), tmux_forward: self.tmux_forward,
         }
     }
 
@@ -104,7 +123,25 @@ impl Cfg {
             .or_else(|| std::env::var("SYNAPSE_WINDOW_FORWARD").ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true")))
             .unwrap_or(false);
-        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_forward }
+
+        // tmux 目标/开关：--tmux <target> 同时设置目标并开启；--tmux 1 使用已保存/环境变量目标；
+        // --tmux 0 关闭。--tmux-target 等价于 --tmux <target>。
+        let tmux_arg = map.get("tmux").cloned().or_else(|| map.get("tmux-target").cloned());
+        let tmux_target = match tmux_arg.as_deref() {
+            Some(v) if !v.is_empty() && !cfg_truthy(v) && !cfg_falsey(v) => v.to_string(),
+            _ => std::env::var("SYNAPSE_TMUX_TARGET").ok().filter(|s| !s.is_empty())
+                .or_else(|| saved["tmux_target"].as_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        };
+        let tmux_forward = match tmux_arg.as_deref() {
+            Some(v) if cfg_truthy(v) => true,
+            Some(v) if cfg_falsey(v) => false,
+            Some(v) if !v.is_empty() => true,
+            _ => std::env::var("SYNAPSE_TMUX_FORWARD").ok().filter(|s| !s.is_empty()).map(|v| cfg_truthy(&v))
+                .or_else(|| saved["tmux_forward"].as_bool())
+                .unwrap_or(false),
+        };
+        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_forward, tmux_target, tmux_forward }
     }
 }
 
@@ -225,6 +262,20 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) {
     let _ = fs::rename(&tmp, path);
 }
 
+/// 写入可能含 token 的 config.json：临时文件 600 后再原子替换。
+fn write_private_json(path: &std::path::Path, body: &Value) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(body).map_err(|e| format!("序列化配置失败：{e}"))?)
+        .map_err(|e| format!("写临时配置失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("落盘配置失败：{e}"))?;
+    Ok(())
+}
+
 fn journal_path(dir: &PathBuf) -> PathBuf { dir.join("inflight.json") }
 
 /// 已投递但尚未“处理完”的消息（收到即落盘，处理完才删）。
@@ -295,7 +346,7 @@ fn is_task_notice(m: &Value) -> bool {
         (m["topic"].as_str() == Some("task") && m["kind"].as_str() != Some("task"))
 }
 
-/// 窗口只接“点名给本 agent 的消息”和“管理端广播”，不接项目事件流。
+/// 外部投递（窗口/tmux）只接“点名给本 agent 的消息”和“管理端广播”，不接项目事件流。
 ///
 /// 服务端为了管理台能看到完整台账，会把其他 agent 的 artifact 建单、任务
 /// claimed/released/done 以及部分 report 都写成 `to=null` 的项目广播；这些在
@@ -305,7 +356,7 @@ fn is_task_notice(m: &Value) -> bool {
 /// - task 生命周期：不是任务正文；
 /// - 其他 agent 发出的无收件人广播（report/status/announce 等）：不是给本窗口的指令。
 /// 定向消息（to 指向本 agent）仍然放行，管理员广播仍然放行。
-fn is_window_noise(cfg: &Cfg, m: &Value) -> bool {
+fn is_surface_noise(cfg: &Cfg, m: &Value) -> bool {
     if is_noise(cfg, m) || is_task_notice(m) || !addressed_to_me(cfg, m) {
         return true;
     }
@@ -316,6 +367,16 @@ fn is_window_noise(cfg: &Cfg, m: &Value) -> bool {
         return true;
     }
     false
+}
+
+/// 从 `[Synapse #12] ...` 这类正文里取去重标记；没有标记返回 None。
+fn message_marker(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("[Synapse #") {
+        return None;
+    }
+    let end = trimmed.find(']')?;
+    Some(&trimmed[..=end])
 }
 
 /// 把 Hub 消息压成适合粘贴进聊天框的正文：优先 payload.title/body，
@@ -346,20 +407,72 @@ fn format_hub_message(m: &Value) -> Option<String> {
     Some(format!("{seq}{text}"))
 }
 
-/// 窗口注入是全局鼠标/键盘操作，同一时刻只能有一个线程在点/粘贴。
-static WINDOW_SEND_LOCK: Mutex<()> = Mutex::new(());
+/// tmux/TUI 默认压成单行：TUI 的输入框不一定支持 bracketed paste，
+/// 多行正文里的换行可能被当成回车，提前把半条消息提交出去。
+fn flatten_hub_message(text: &str) -> String {
+    text.lines().map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+}
 
-fn window_was_delivered(m: &Value) -> bool {
+/// `run --tmux ...` 的投递端：把消息注入配置好的 TUI pane，并回车提交。
+/// 返回 false 表示 pane 不可用/没看到 `[Synapse #seq]` 标记；调用方保留 WAL、不 ACK。
+fn forward_to_tmux_impl(cfg: &Cfg, m: &Value) -> bool {
+    if surface_was_delivered(m) {
+        return true;
+    }
+    if !cfg.tmux_forward || is_surface_noise(cfg, m) {
+        return true;
+    }
+    let Some(raw) = format_hub_message(m) else { return true; };
+    let text = flatten_hub_message(&raw);
+    let seq = seq_of(m).unwrap_or(0);
+    if cfg.tmux_target.trim().is_empty() {
+        eprintln!("[tmux] seq={seq} 未配置 tmux_target，保留 WAL 且不 ACK");
+        return false;
+    }
+    let marker = format!("[Synapse #{seq}]");
+    match tmux::deliver(&cfg.tmux_target, &text, &marker, true) {
+        Ok(true) => {
+            let pane = tmux::resolve_pane(&cfg.tmux_target)
+                .map(|p| format!("{} ({})", p.pane_id, p.command))
+                .unwrap_or_else(|_| cfg.tmux_target.clone());
+            eprintln!("[tmux] seq={seq} 已注入 {pane} 并回车");
+            true
+        }
+        Ok(false) => {
+            eprintln!("[tmux] seq={seq} pane 中未读到标记，保留 WAL 且不 ACK");
+            false
+        }
+        Err(e) => {
+            eprintln!("[tmux] seq={seq} 投递失败，保留 WAL 且不 ACK：{e}");
+            false
+        }
+    }
+}
+
+/// 按配置选择外部投递面：tmux 优先（Linux/macOS），否则 Windows 窗口。
+fn forward_to_surface_impl(cfg: &Cfg, m: &Value) -> bool {
+    if cfg.tmux_forward {
+        forward_to_tmux_impl(cfg, m)
+    } else {
+        forward_to_window_impl(cfg, m)
+    }
+}
+
+/// 外部投递串行化：Windows 窗口注入是全局鼠标/键盘操作；tmux 投递也共用此锁，
+/// 避免同一 pane 被多个线程同时粘贴/回车。
+static SURFACE_SEND_LOCK: Mutex<()> = Mutex::new(());
+
+fn surface_was_delivered(m: &Value) -> bool {
     m["_window_delivered"].as_bool().unwrap_or(false)
 }
 
-/// 只有真正开了窗口转发，ACK 备注才写“窗口已投递”；普通 run 仍保持旧的 receipt 语义。
+/// 只有真正开了外部投递（窗口/tmux），ACK 备注才写“已投递”；普通 run 仍保持旧的 receipt 语义。
 fn ack_note(cfg: &Cfg, delivered: &'static str, receipt: &'static str) -> &'static str {
-    if cfg.window_forward { delivered } else { receipt }
+    if cfg.surface_forward() { delivered } else { receipt }
 }
 
-/// 在 WAL 里给消息打“窗口已投递”标记；进程崩溃后重放时不会重复往窗口发。
-fn mark_window_delivered(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) {
+/// 在 WAL 里给消息打“已投递到外部面”标记；进程崩溃后重放时不会重复往窗口/tmux 发。
+fn mark_surface_delivered(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) {
     let mut items = journal.lock().unwrap();
     for x in items.iter_mut() {
         if same_message(x, m) {
@@ -392,12 +505,12 @@ fn fallback_clicks(app: &str) -> &'static [(f64, f64)] {
 
 /// `run --window 1` 的投递端：定向消息注入窗口并自动回车。
 /// 返回 false 表示窗口不可用/没有真正上屏；调用方必须保留 WAL、不得 ACK，
-/// 否则服务端会认为已送达，用户窗口却永远看不到。
+/// 否则服务端会认为已送达，用户窗口/tmux 却永远看不到。
 fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
-    if window_was_delivered(m) {
+    if surface_was_delivered(m) {
         return true;
     }
-    if !cfg.window_forward || is_window_noise(cfg, m) {
+    if !cfg.window_forward || is_surface_noise(cfg, m) {
         return true;
     }
     let Some(text) = format_hub_message(m) else { return true; };
@@ -458,50 +571,50 @@ fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
     }
 }
 
-fn forward_to_window(cfg: &Cfg, m: &Value) -> bool {
-    let _gate = WINDOW_SEND_LOCK.lock().unwrap();
-    forward_to_window_impl(cfg, m)
+fn forward_to_surface(cfg: &Cfg, m: &Value) -> bool {
+    let _gate = SURFACE_SEND_LOCK.lock().unwrap();
+    forward_to_surface_impl(cfg, m)
 }
 
 /// WS 收件线程投递失败后，消息留在 WAL 且没有 ACK。主线程空闲时每 5 秒重试一次，
-/// 成功才 ACK + 执行 + 出队。这样窗口晚开、应用切走、composer 暂时隐藏都能自动补发。
-fn retry_pending_windows(cfg: &Cfg, agent: &Agent, base: &str,
-                         journal: &Arc<Mutex<Vec<Value>>>, last_msg: &AtomicU64) -> usize {
-    if !cfg.window_forward { return 0; }
+/// 成功才 ACK + 执行 + 出队。这样窗口晚开、tmux pane 切走、composer/输入框暂时隐藏都能自动补发。
+fn retry_pending_surfaces(cfg: &Cfg, agent: &Agent, base: &str,
+                          journal: &Arc<Mutex<Vec<Value>>>, last_msg: &AtomicU64) -> usize {
+    if !cfg.surface_forward() { return 0; }
     let pending: Vec<Value> = { journal.lock().unwrap().clone() };
     let mut sent = 0usize;
     for m in pending {
-        if window_was_delivered(&m) {
+        if surface_was_delivered(&m) {
             continue;
         }
-        // 旧 WAL 里可能残留被窗口过滤的消息；不要只 continue，否则会永远卡住。
-        // 这类消息不投窗口、不执行 exec，但要补 ACK 并出队。
-        if is_window_noise(cfg, &m) {
+        // 旧 WAL 里可能残留被外部投递过滤的消息；不要只 continue，否则会永远卡住。
+        // 这类消息不投窗口/tmux、不执行 exec，但要补 ACK 并出队。
+        if is_surface_noise(cfg, &m) {
             let seq = seq_of(&m).unwrap_or(0);
             let _ = ack_message(cfg, agent, base, seq, "done",
-                                &json!({"note": "run 窗口过滤（非本窗口消息）"}), ack_required(&m));
+                                &json!({"note": "run 外部投递过滤（非本窗口消息）"}), ack_required(&m));
             dequeue_message(&cfg.dir, journal, &m);
             continue;
         }
         let delivered = {
-            let _gate = WINDOW_SEND_LOCK.lock().unwrap();
+            let _gate = SURFACE_SEND_LOCK.lock().unwrap();
             // pending 是在拿锁前克隆的；deliver_ws 可能已经在这段时间里把这条消息
-            // 投进窗口并打上 _window_delivered。拿到锁后必须重新查当前 WAL，
+            // 投进窗口/tmux 并打上 _window_delivered。拿到锁后必须重新查当前 WAL，
             // 不能再信任旧快照，否则同一条消息会被重试线程再粘贴一遍。
             let already_marked = journal.lock().unwrap().iter()
-                .any(|x| same_message(x, &m) && window_was_delivered(x));
+                .any(|x| same_message(x, &m) && surface_was_delivered(x));
             if already_marked {
                 false
             } else {
-                let ok = forward_to_window_impl(cfg, &m);
-                if ok { mark_window_delivered(&cfg.dir, journal, &m); }
+                let ok = forward_to_surface_impl(cfg, &m);
+                if ok { mark_surface_delivered(&cfg.dir, journal, &m); }
                 ok
             }
         };
         if !delivered { continue; }
         let seq = seq_of(&m).unwrap_or(0);
         let _ = ack_message(cfg, agent, base, seq, "done",
-                            &json!({"note": "run 重试后窗口已投递"}), ack_required(&m));
+                            &json!({"note": "run 重试后已投递"}), ack_required(&m));
         let text = serde_json::to_string(&m).unwrap_or_default();
         if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
         dequeue_message(&cfg.dir, journal, &m);
@@ -649,7 +762,7 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1] [--proxy <url>|off]\n        --window 1：收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
+        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -657,6 +770,16 @@ fn main() {
         return;
     }
     let cfg = Cfg::from_args();
+    if matches!(cfg.cmd.as_str(), "run" | "ws") {
+        if cfg.window_forward && cfg.tmux_forward {
+            eprintln!("window_forward 与 tmux_forward 不能同时开启；Linux/macOS 用 --tmux <target>，Windows 用 --window 1");
+            std::process::exit(2);
+        }
+        if cfg.tmux_forward && cfg.tmux_target.trim().is_empty() {
+            eprintln!("tmux_forward 已开启但未配置 tmux_target：请用 --tmux <target> 或先运行 tmux-config --target <session:window.pane>");
+            std::process::exit(2);
+        }
+    }
     if cfg.endpoint.starts_with("http://")
         && !cfg.endpoint.contains("127.0.0.1") && !cfg.endpoint.contains("localhost") {
         eprintln!("refuse plaintext http; use https");
@@ -769,6 +892,8 @@ fn main() {
                 "pid": pid,
                 "alive": alive,
                 "stale": alive.map(|a| !a),
+                "window_forward": cfg.window_forward, "window_app": cfg.window_app,
+                "tmux_forward": cfg.tmux_forward, "tmux_target": cfg.tmux_target,
                 "config": cfg.dir.join("config.json").display().to_string(),
             }));
             return;
@@ -1001,6 +1126,107 @@ fn main() {
                 "ok": true, "sha256": up["sha256"], "bytes": up["bytes"],
                 "submission_id": sub["submission_id"], "state": sub["state"], "seq": sub["seq"]
             })).unwrap_or_default());
+            return;
+        }
+
+        // ── Linux/macOS tmux 投递（TUI） ───────────────────────
+        "tmux-config" | "tui-config" => {
+            let cfg_path = cfg.dir.join("config.json");
+            let mut saved: Value = fs::read_to_string(&cfg_path)
+                .ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
+            let target = args_map.get("target").cloned()
+                .or_else(|| args_map.get("tmux").cloned());
+            let enable = args_map.get("enable").map(|v| cfg_truthy(v));
+            if let Some(t) = target {
+                if t.trim().is_empty() {
+                    eprintln!("tmux-config 的 target 不能为空"); std::process::exit(2);
+                }
+                saved["tmux_target"] = json!(t);
+                saved["tmux_forward"] = json!(enable.unwrap_or(true));
+                if let Err(e) = write_private_json(&cfg_path, &saved) {
+                    eprintln!("{e}"); std::process::exit(1);
+                }
+                println!("{}", json!({
+                    "ok": true, "op": "tmux-config-set", "tmux_target": t,
+                    "tmux_forward": saved["tmux_forward"], "config": cfg_path.to_string_lossy()
+                }));
+            } else if flags.contains("clear") {
+                if let Some(o) = saved.as_object_mut() {
+                    o.remove("tmux_target");
+                    o.remove("tmux_forward");
+                }
+                if let Err(e) = write_private_json(&cfg_path, &saved) {
+                    eprintln!("{e}"); std::process::exit(1);
+                }
+                println!("{}", json!({"ok": true, "op": "tmux-config-clear"}));
+            } else if let Some(en) = enable {
+                saved["tmux_forward"] = json!(en);
+                if let Err(e) = write_private_json(&cfg_path, &saved) {
+                    eprintln!("{e}"); std::process::exit(1);
+                }
+                println!("{}", json!({
+                    "ok": true, "op": "tmux-config-enable", "tmux_forward": en,
+                    "tmux_target": saved["tmux_target"].clone(), "config": cfg_path.to_string_lossy()
+                }));
+            } else {
+                println!("{}", json!({
+                    "op": "tmux-config-show",
+                    "tmux_target": saved["tmux_target"].as_str().unwrap_or(""),
+                    "tmux_forward": saved["tmux_forward"].as_bool().unwrap_or(false),
+                    "from_env_target": std::env::var("SYNAPSE_TMUX_TARGET").unwrap_or_default(),
+                    "from_env_forward": std::env::var("SYNAPSE_TMUX_FORWARD").unwrap_or_default(),
+                    "config": cfg_path.to_string_lossy()
+                }));
+            }
+            return;
+        }
+        "tmux-list" => {
+            match tmux::list_panes() {
+                Ok(panes) => {
+                    let arr: Vec<Value> = panes.iter().map(|p| json!({
+                        "target": p.target, "pane_id": p.pane_id,
+                        "command": p.command, "path": p.path
+                    })).collect();
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "count": arr.len(), "panes": arr
+                    })).unwrap_or_default());
+                }
+                Err(e) => { eprintln!("tmux-list 失败：{e}"); std::process::exit(1); }
+            }
+            return;
+        }
+        "tmux-send" => {
+            let target = args_map.get("target").cloned()
+                .or_else(|| args_map.get("tmux").cloned())
+                .unwrap_or_else(|| cfg.tmux_target.clone());
+            let text = resolve_send_text(&args_map, &flags);
+            if text.is_empty() {
+                eprintln!("tmux-send 需要正文：--text <文字> 或 --file <文件> 或 --stdin；目标用 --target <session:window.pane> 或 tmux-config 设置");
+                std::process::exit(2);
+            }
+            let enter = args_map.get("enter").map(|v| cfg_truthy(v)).unwrap_or(true);
+            let verify = args_map.get("verify").map(|v| cfg_truthy(v)).unwrap_or(false);
+            let pane = match tmux::resolve_pane(&target) {
+                Ok(p) => p, Err(e) => { eprintln!("tmux-send 目标无效：{e}"); std::process::exit(1); }
+            };
+            let result = if verify {
+                let marker = message_marker(&text)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| text.lines().next().unwrap_or("").chars().take(80).collect());
+                tmux::deliver(&target, &text, &marker, enter)
+            } else {
+                tmux::send_text(&target, &text, enter).map(|_| true)
+            };
+            match result {
+                Ok(verified) => {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "ok": verified, "target": target, "pane_id": pane.pane_id,
+                        "command": pane.command, "verified": verified
+                    })).unwrap_or_default());
+                    if !verified { std::process::exit(1); }
+                }
+                Err(e) => { eprintln!("tmux-send 失败：{e}"); std::process::exit(1); }
+            }
             return;
         }
 
@@ -1760,24 +1986,24 @@ fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
               tx: &mpsc::Sender<(String, bool)>, queue: &AtomicUsize, last_msg: &AtomicU64) {
     if is_noise(cfg, m) || !for_me(cfg, m) { return; }
     if !enqueue_message(cfg, journal, m) { return; }
-    // 关键顺序：先真的把消息送进窗口，再 ACK。以前这里先 ACK，窗口投递失败时
+    // 关键顺序：先真的把消息送进目标窗口/tmux，再 ACK。以前这里先 ACK，投递失败时
     // 服务端仍显示已送达，用户只看到 ACK、看不到消息。
     let delivered = {
-        let _gate = WINDOW_SEND_LOCK.lock().unwrap();
-        let ok = forward_to_window_impl(cfg, m);
-        if ok && cfg.window_forward && addressed_to_me(cfg, m) {
-            mark_window_delivered(&cfg.dir, journal, m);
+        let _gate = SURFACE_SEND_LOCK.lock().unwrap();
+        let ok = forward_to_surface_impl(cfg, m);
+        if ok && cfg.surface_forward() && addressed_to_me(cfg, m) {
+            mark_surface_delivered(&cfg.dir, journal, m);
         }
         ok
     };
     if !delivered {
-        eprintln!("[ws] seq={} 窗口投递未确认，保留 WAL、不 ACK；等待重投/重连重放",
+        eprintln!("[ws] seq={} 外部投递未确认，保留 WAL、不 ACK；等待重投/重连重放",
                   seq_of(m).unwrap_or(0));
         return;
     }
     let seq = seq_of(m).unwrap_or(0);
     let _ = ack_message(cfg, agent, base, seq, "done",
-                        &json!({"note": ack_note(cfg, "run 收到（窗口已投递）", "run 收到（receipt）")}), ack_required(m));
+                        &json!({"note": ack_note(cfg, "run 收到（已投递）", "run 收到（receipt）")}), ack_required(m));
     let text = serde_json::to_string(m).unwrap_or_default();
     // 先加计数再入队：主线程可能在 send 返回前就取走并减计数，顺序反了会把 queue 卡在虚高值
     queue.fetch_add(1, Ordering::Relaxed);
@@ -1835,18 +2061,18 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
     // 先启动心跳，再重放 WAL：重放里的 exec 任务再慢，也不会让心跳停摆。
     let replay: Vec<Value> = if hb_only_poll { Vec::new() } else { journal.lock().unwrap().clone() };
     for m in replay {
-        // 窗口投递成功之前绝不 ACK；失败就继续留在 WAL，下一轮重试。
-        if !forward_to_window(cfg, &m) {
+        // 外部投递成功之前绝不 ACK；失败就继续留在 WAL，下一轮重试。
+        if !forward_to_surface(cfg, &m) {
             eprintln!("[poll] seq={} 重放投递失败，保留 WAL、不 ACK",
                       seq_of(&m).unwrap_or(0));
             continue;
         }
-        if cfg.window_forward && addressed_to_me(cfg, &m) {
-            mark_window_delivered(&cfg.dir, &journal, &m);
+        if cfg.surface_forward() && addressed_to_me(cfg, &m) {
+            mark_surface_delivered(&cfg.dir, &journal, &m);
         }
         if let Some(seq) = seq_of(&m) {
             let _ = ack_message(cfg, agent, base, seq, "done",
-                                &json!({"note": ack_note(cfg, "poll 启动重放（窗口已投递）", "poll 启动重放（receipt）")}), ack_required(&m));
+                                &json!({"note": ack_note(cfg, "poll 启动重放（已投递）", "poll 启动重放（receipt）")}), ack_required(&m));
         }
         let text = serde_json::to_string(&m).unwrap_or_default();
         if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
@@ -1865,22 +2091,22 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
         if let Some(limit) = max_duration {
             if started.elapsed() >= limit { break; }
         }
-        let retried = retry_pending_windows(cfg, agent, base, &journal, &last_msg);
-        if retried > 0 { eprintln!("[poll] 重试补发 {retried} 条窗口消息"); }
+        let retried = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
+        if retried > 0 { eprintln!("[poll] 重试补发 {retried} 条外部投递消息"); }
         if let Some(msgs) = fetch_inbox(&cfg, &agent, &base, cursor_get(&cfg.dir), 5, Some(&journal), true) {
             for m in msgs {
                 if is_noise(&cfg, &m) || !for_me(&cfg, &m) { continue; }
                 if !enqueue_message(&cfg, &journal, &m) { continue; }
                 let seq = seq_of(&m).unwrap_or(0);
-                if !forward_to_window(cfg, &m) {
-                    eprintln!("[poll] seq={seq} 窗口投递失败，保留 WAL、不 ACK");
+                if !forward_to_surface(cfg, &m) {
+                    eprintln!("[poll] seq={seq} 外部投递失败，保留 WAL、不 ACK");
                     continue;
                 }
-                if cfg.window_forward && addressed_to_me(cfg, &m) {
-                    mark_window_delivered(&cfg.dir, &journal, &m);
+                if cfg.surface_forward() && addressed_to_me(cfg, &m) {
+                    mark_surface_delivered(&cfg.dir, &journal, &m);
                 }
                 let _ = ack_message(&cfg, &agent, &base, seq, "done",
-                                    &json!({"note": ack_note(cfg, "poll 收到（窗口已投递）", "poll 收到（receipt）")}), ack_required(&m));
+                                    &json!({"note": ack_note(cfg, "poll 收到（已投递）", "poll 收到（receipt）")}), ack_required(&m));
                 let text = serde_json::to_string(&m).unwrap_or_default();
                 if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
                 dequeue_message(&cfg.dir, &journal, &m);
@@ -2112,8 +2338,8 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         let (task, replay) = match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(x) => x,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let n = retry_pending_windows(cfg, agent, base, &journal, &last_msg);
-                if n > 0 { eprintln!("[ws] 空闲重试补发 {n} 条窗口消息"); }
+                let n = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
+                if n > 0 { eprintln!("[ws] 空闲重试补发 {n} 条外部投递消息"); }
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2125,18 +2351,18 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         { let mut g = state.lock().unwrap(); g.0 = "busy".into(); g.1 = title.clone(); }
         let mut delivered = true;
         if replay {
-            // 重放消息尚未经过 deliver_ws 的窗口投递；先投窗口，再补 ACK。
+            // 重放消息尚未经过 deliver_ws 的外部投递；先投窗口/tmux，再补 ACK。
             if let Some(v) = &parsed {
-                if !forward_to_window(cfg, v) { delivered = false; }
-                else if cfg.window_forward && addressed_to_me(cfg, v) {
-                    mark_window_delivered(&cfg.dir, &journal, v);
+                if !forward_to_surface(cfg, v) { delivered = false; }
+                else if cfg.surface_forward() && addressed_to_me(cfg, v) {
+                    mark_surface_delivered(&cfg.dir, &journal, v);
                 }
             }
             if delivered {
                 if let Some(v) = &parsed {
                     if let Some(seq) = seq_of(v) {
                         let _ = ack_message(cfg, agent, base, seq, "done",
-                                            &json!({"note": ack_note(cfg, "run 启动重放（窗口已投递）", "run 启动重放（receipt）")}), ack_required(v));
+                                            &json!({"note": ack_note(cfg, "run 启动重放（已投递）", "run 启动重放（receipt）")}), ack_required(v));
                     }
                 }
             }
@@ -2181,6 +2407,8 @@ mod tests {
             exec_cmd: None,
             window_app: String::new(),
             window_forward: false,
+            tmux_target: String::new(),
+            tmux_forward: false,
         }
     }
 
@@ -2270,38 +2498,46 @@ mod tests {
             "seq": 99, "sender": "b2", "to": null, "topic": "artifact",
             "kind": "report", "payload": {"title": "T-FIX done"}
         });
-        assert!(is_window_noise(&cfg, &artifact));
+        assert!(is_surface_noise(&cfg, &artifact));
 
         // 其他 agent 的任务板生命周期事件，不是任务正文
         let released = json!({
             "seq": 100, "sender": "b2", "to": null, "topic": "task",
             "kind": "released", "payload": {"task_id": "T-1"}
         });
-        assert!(is_window_noise(&cfg, &released));
+        assert!(is_surface_noise(&cfg, &released));
 
         // 其他 agent 发出的项目广播（报告/状态），不是给本窗口的指令
         let report = json!({
             "sender": "b2", "to": null, "topic": "report",
             "kind": "report", "payload": {"text": "done"}
         });
-        assert!(is_window_noise(&cfg, &report));
+        assert!(is_surface_noise(&cfg, &report));
 
         // 管理端广播、管理端定向任务、其他 agent 点名的消息仍然放行
         let admin_bc = json!({
             "sender": "admin", "to": null, "topic": "announce",
             "kind": "broadcast", "payload": {"title": "git pull"}
         });
-        assert!(!is_window_noise(&cfg, &admin_bc));
+        assert!(!is_surface_noise(&cfg, &admin_bc));
         let admin_dm = json!({
             "sender": "admin", "to": "a1", "topic": "task",
             "kind": "task", "payload": {"title": "do it"}
         });
-        assert!(!is_window_noise(&cfg, &admin_dm));
+        assert!(!is_surface_noise(&cfg, &admin_dm));
         let agent_dm = json!({
             "sender": "b2", "to": "a1", "topic": "task",
             "kind": "task", "payload": {"title": "review"}
         });
-        assert!(!is_window_noise(&cfg, &agent_dm));
+        assert!(!is_surface_noise(&cfg, &agent_dm));
+    }
+
+    #[test]
+    fn tmux_message_flat_and_marker() {
+        let raw = "[Synapse #12] 定向\ngit pull\n第二段";
+        assert_eq!(flatten_hub_message(raw), "[Synapse #12] 定向 git pull 第二段");
+        assert_eq!(message_marker(raw), Some("[Synapse #12]"));
+        assert_eq!(message_marker("plain text"), None);
     }
 
     #[test]

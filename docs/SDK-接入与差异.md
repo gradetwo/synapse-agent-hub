@@ -128,7 +128,7 @@ RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
 | 管理面 | ✅ `as_admin` | ✅ `asAdmin` | 部分 CLI（agents/subs/send/broadcast/get） |
 | 自检/升级 | ✅ `update-check` / `upgrade` | ✅ `checkUpdate` / `upgrade` | ✅ `upgrade --check/--apply` |
 | 状态目录 | `~/.synapse-agent`；`SYNAPSE_STATE_DIR` 可覆盖 | 同左；`stateDir` 可覆盖 | `~/.synapse-agent`；只有 `HOME` 可隔离 |
-| 本机窗口消息桥 | ❌ | ❌ | ✅ Windows：`win-send`/`win-read`/`bus-serve`/`bridge`（详见 `docs/WINDOW-BRIDGE.md`） |
+| 本机窗口消息桥 | ❌ | ❌ | ✅ Windows：`win-send`/`win-read`/`bus-serve`/`bridge`（详见 `docs/WINDOW-BRIDGE.md`）；Linux/macOS：`run --tmux`/`tmux-send`/`tmux-config`（详见 `docs/TMUX-BRIDGE.md`） |
 
 ## 4. 长连接 → 轮询的回退顺序
 

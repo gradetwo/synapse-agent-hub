@@ -1,5 +1,7 @@
 # Windows 窗口桥 + 本机消息总线（Rust 客户端）
 
+> Linux/macOS 的 tmux/TUI 投递见 [`TMUX-BRIDGE.md`](./TMUX-BRIDGE.md)。
+
 > 适用版本：synapse-agent 0.5.2+（本次在 0.5.1 基础上新增）。
 > 目的：让本机的「配置程序 / 豆包等第三方窗口」与 Rust agent 之间能**双向传递文字消息**：
 > - agent 读取新消息：配置程序写入 → agent 收到。
