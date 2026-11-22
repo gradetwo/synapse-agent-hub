@@ -247,10 +247,16 @@ class Client:
                     continue
                 break
             raw = r.get("messages", [])
+            next_cursor = int(r.get("next_cursor") or since)
             if not raw:
+                # 服务端可能把整页都过滤成项目事件（announce/artifact/task 生命周期）；
+                # 此时 messages 为空但 next_cursor 已越过这些噪音，不能停在旧 since。
+                if next_cursor > since:
+                    self._cursor_save(next_cursor)
                 break
             out.extend(raw)
-            since = raw[-1]["seq"]
+            # next_cursor 可能大于本页最后一条（本页尾部全是不可见项目事件）。
+            since = max(since, next_cursor, int(raw[-1].get("seq") or 0))
             self._cursor_save(since)
             pages += 1
             if not r.get("has_more") or pages >= 5:

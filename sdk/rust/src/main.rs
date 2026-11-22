@@ -1561,16 +1561,19 @@ fn main() {
                         let fresh = winmsg::diff_new_lines(&prev, &cur, true);
                         if !fresh.is_empty() {
                             let _ = fs::write(&state_path, &cur);
-                            for line in fresh {
-                                let msg = localbus::make_msg("in", &w.title, "announce", &line, json!({}));
+                            for line in &fresh {
+                                let msg = localbus::make_msg("in", &w.title, "announce", line, json!({}));
                                 println!("{}", json!({
                                     "module": "bridge", "from": "window", "text": line
                                 }));
                                 let _ = localbus::send_one(&name, &msg, false);
-                                if to_hub {
-                                    if let Err(e) = publish_to_hub(&cfg, &agent, &base, "announce", &line, json!({})) {
-                                        eprintln!("[bridge] 上报 Hub 失败：{e}");
-                                    }
+                            }
+                            if to_hub {
+                                // 一个轮询窗口只上报一条，避免窗口逐行输出把管理台消息流刷成 29 条。
+                                let batch = fresh.join("\n");
+                                if let Err(e) = publish_to_hub(&cfg, &agent, &base, "announce", &batch,
+                                                              json!({"lines": fresh.len()})) {
+                                    eprintln!("[bridge] 上报 Hub 失败：{e}");
                                 }
                             }
                         }
@@ -1742,6 +1745,8 @@ fn publish_to_hub(cfg: &Cfg, agent: &Agent, base: &str, topic: &str, text: &str,
     let body = json!({
         "topic": topic,
         "kind": "text",
+        // 窗口逐行输出是给管理端看的，不是项目广播；否则每个 agent 的 inbox 都会被刷屏。
+        "to": "admin",
         "dedupe_key": format!("winbridge-{}-{}", cfg.agent_id, now_ms()),
         "payload": {"text": text, "source": "win_bridge", "meta": meta},
     });
@@ -1794,11 +1799,17 @@ fn fetch_inbox(cfg: &Cfg, agent: &Agent, base: &str, mut since: u64, max_pages: 
         }
         if page == 0 && !ep.is_empty() { epoch_set(&cfg.dir, &ep); }
         let arr: Vec<Value> = v["messages"].as_array().cloned().unwrap_or_default();
-        if arr.is_empty() { break; }
+        let next_cursor = v["next_cursor"].as_u64().unwrap_or(since);
+        if arr.is_empty() {
+            // 整页都是被服务端过滤掉的项目事件（announce/artifact/task 生命周期），
+            // next_cursor 已经越过它们；不推进的话 wait 会每轮重拉同一段噪音。
+            last_seen = next_cursor;
+            break;
+        }
         let last = arr.last().and_then(seq_of)?;
-        last_seen = last;
+        last_seen = last.max(next_cursor);
         out.extend(arr);
-        since = last;
+        since = last_seen;
         page += 1;
         if !v["has_more"].as_bool().unwrap_or(false) || page >= max_pages { break; }
     }

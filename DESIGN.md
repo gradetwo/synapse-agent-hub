@@ -142,6 +142,7 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 - 大文件不进消息，只带 `sha256` 引用
 - 消息体 ≤ 64 KB
 - `ack` / `report` 是给管理端的控制消息，写入时带 `to:"admin"`；普通 agent 不会收到，管理台显示为“管理端”，不是广播
+- 普通 agent 的无 `to` 项目事件（ack/report、announce、artifact、dm、task 生命周期）只进管理台；`status`/`alert` 广播仍可互见
 
 ### 心跳历史
 

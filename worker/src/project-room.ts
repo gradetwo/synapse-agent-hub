@@ -81,6 +81,20 @@ export class ProjectRoom implements DurableObject {
     return to === me;
   }
 
+  // 普通 agent 的收件箱只接：定向给它的消息、管理端广播，以及 agent 之间的
+  // status/alert 广播。ack/report、announce、artifact 和 task 生命周期属于项目事件，
+  // 只给管理台看；否则 win_bridge 逐行上报会把所有 agent 的 inbox 刷成噪音。
+  private agentCanSee(m: Msg, me: string | null): boolean {
+    if (!me || me === "*") return true;
+    if (m.to) return this.isToMe(m.to, me);
+    const topic = m.topic ?? "";
+    // 管理端广播照常下发；但 task 生命周期（claimed/released/done/reclaimed）只进管理台。
+    if (m.sender === "admin") return !(topic === "task" && m.kind !== "task");
+    if (["ack", "report", "announce", "artifact", "dm"].includes(topic)) return false;
+    if (topic === "task" && m.kind !== "task") return false;
+    return true;
+  }
+
   private projectName(): string {
     try { return String((this.state.id as any).name ?? ""); } catch { return ""; }
   }
@@ -193,12 +207,8 @@ export class ProjectRoom implements DurableObject {
       try { att = ws.deserializeAttachment?.(); } catch { att = null; }
       const me = att?.me ?? "unknown";
       const isAdmin = att?.role === "admin";
-      // 与 HTTP inbox 使用同一套可见性：管理端看全量；定向只给收件人；
-      // ack/report 是给管理端的，不能因为走 WebSocket 就漏给其他 agent。
-      if (!isAdmin) {
-        if (msg.to && !this.isToMe(msg.to, me)) continue;
-        if (!msg.to && ["ack", "report"].includes(msg.topic ?? "")) continue;
-      }
+      // 与 HTTP inbox 使用同一套可见性：管理端看全量；普通 agent 只看定向消息和管理端广播。
+      if (!isAdmin && !this.agentCanSee(msg, me)) continue;
       try { ws.send(payload); } catch { /* 单条连接坏了就跳过 */ }
     }
   }
@@ -248,22 +258,21 @@ export class ProjectRoom implements DurableObject {
       const t = topics.split(",").map((x) => x.trim()).filter(Boolean);
       messages = messages.filter((m) => t.includes(m.topic));
     }
-    // 定向消息：带 to 的只投给收件人；其余是项目内广播
-    // me="*" 是管理员视角：不做定向过滤，看全量
-    messages = messages.filter((m: any) => {
-      // 1) 定向消息只给收件人；广播给所有人；me="*" 是管理员视角
-      const directedOk = !m.to || me === "*" || (!!me && this.isToMe(m.to, me));
-      if (!directedOk) return false;
-      // 2) ack/report 默认是「发给管理端看的」，不进任何 agent 的收件箱（含自己的）
-      if (me && me !== "*" && !m.to && ["ack", "report"].includes(m.topic)) return false;
-      return true;
-    });
-    messages = desc ? messages.slice(-limit) : messages.slice(0, limit);
-    const next = messages.length ? messages[messages.length - 1].seq : since;
+    // 普通 agent 只看定向消息和管理端广播；项目事件（announce/artifact/task 生命周期）只进管理台。
+    // me="*" 是管理员视角：不做过滤，看全量。
+    const rawMessages = messages;
+    const visible = messages.filter((m: any) => this.agentCanSee(m, me));
+    const page = desc ? visible.slice(-limit) : visible.slice(0, limit);
+    // 游标必须推进到“已扫描的原始消息”末条：如果这一页全被过滤掉，
+    // 还停在 since 会让客户端每次轮询都重复拉同一段噪音。
+    const lastRawSeq = rawMessages.length ? rawMessages[rawMessages.length - 1].seq : since;
+    const next = desc
+      ? (page.length ? page[page.length - 1].seq : lastRawSeq)
+      : (page.length < limit ? lastRawSeq : page[page.length - 1].seq);
     // 房间被重建（换命名空间）时 seq 会从头开始，客户端靠 epoch 判断要重置游标
     const epoch = await this.room();
-    return json({ messages, next_cursor: next, epoch,
-                  has_more: archived.length + padded.size + legacy.size > messages.length });
+    return json({ messages: page, next_cursor: next, epoch,
+                  has_more: rawMessages.length > page.length });
   }
 
   // ── 心跳：覆盖写 + 顺带续租 + 每 5 分钟落一行历史 ──────────
