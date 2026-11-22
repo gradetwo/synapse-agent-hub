@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator
 
 import requests
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 def _state_dir() -> Path:
     new = os.environ.get("SYNAPSE_STATE_DIR") or os.environ.get("YANSHI_STATE_DIR")
     if new: return Path(new)

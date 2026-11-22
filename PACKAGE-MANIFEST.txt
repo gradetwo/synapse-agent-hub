@@ -2,7 +2,7 @@ Synapse agent-hub 完整源码 / 提示词模板 / 文档包
 =================================================
 
 build:        functional-multiproject2-20261120
-sdk_version:  0.5.1
+sdk_version:  0.5.2
 snapshot:     2026-11-20
 
 包含
@@ -17,7 +17,7 @@ snapshot:     2026-11-20
 - scripts/deploy.sh 自动化部署：bootstrap（空账号）/ release（线上增量）
 - scripts/hubctl 管理 CLI（含 agent-move）
 - sdk/python、sdk/ts、sdk/rust 三端源码与构建产物
-- spec/openapi.yaml（0.5.1，31 paths）、conformance、mock_hub
+- spec/openapi.yaml（0.5.2，31 paths）、conformance、mock_hub
 - dist/ 当前 Linux x64 / ARM64 / Windows x64 预编译二进制 + SHA256SUMS
 
 未包含
