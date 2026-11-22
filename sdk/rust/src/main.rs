@@ -43,6 +43,11 @@ struct Cfg {
     tmux_target: String,
     /// `run --tmux ...` / config.json 的 tmux_forward：把收件消息注入 tmux 后才 ACK。
     tmux_forward: bool,
+    /// tmux 投递是否要求 pane 回显 `[Synapse #seq]` 标记才 ACK。
+    /// alternate-screen TUI（CodeBuddy/Claude 等）不回显注入文字，须设为 false，
+    /// 否则 deliver() 永远读不到标记、WAL 每 5 秒重投造成同一条消息被反复粘贴。
+    /// 默认 true 保持旧行为；可用 `--tmux-verify 0` / `SYNAPSE_TMUX_VERIFY=0` / config.json 关闭。
+    tmux_verify: bool,
 }
 
 fn cfg_truthy(v: &str) -> bool {
@@ -82,6 +87,7 @@ impl Cfg {
             heartbeat_s: self.heartbeat_s, exec_cmd: self.exec_cmd.clone(),
             window_app: self.window_app.clone(), window_forward: self.window_forward,
             tmux_target: self.tmux_target.clone(), tmux_forward: self.tmux_forward,
+            tmux_verify: self.tmux_verify,
         }
     }
 
@@ -141,7 +147,15 @@ impl Cfg {
                 .or_else(|| saved["tmux_forward"].as_bool())
                 .unwrap_or(false),
         };
-        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_forward, tmux_target, tmux_forward }
+        // tmux 标记验证：默认开启（旧行为）。alternate-screen TUI 不回显注入文字，
+        // 关掉后改用 deliver_no_verify（注入即 ACK），避免 WAL 重投风暴。
+        // 优先级：--tmux-verify > SYNAPSE_TMUX_VERIFY > config.json > 默认 true。
+        let tmux_verify = map.get("tmux-verify")
+            .map(|v| cfg_truthy(v))
+            .or_else(|| std::env::var("SYNAPSE_TMUX_VERIFY").ok().filter(|s| !s.is_empty()).map(|v| cfg_truthy(&v)))
+            .or_else(|| saved["tmux_verify"].as_bool())
+            .unwrap_or(true);
+        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_forward, tmux_target, tmux_forward, tmux_verify }
     }
 }
 
@@ -430,12 +444,21 @@ fn forward_to_tmux_impl(cfg: &Cfg, m: &Value) -> bool {
         return false;
     }
     let marker = format!("[Synapse #{seq}]");
-    match tmux::deliver(&cfg.tmux_target, &text, &marker, true) {
+    // 标记验证对 alternate-screen TUI（CodeBuddy/Claude）无效：注入文字不回显到
+    // capture-pane，deliver() 永远读不到标记 → WAL 每 5 秒重投、同一条消息被反复粘贴。
+    // tmux_verify=false 时改用 deliver_no_verify：注入命令成功即 ACK，靠 WAL 防重。
+    let delivered = if cfg.tmux_verify {
+        tmux::deliver(&cfg.tmux_target, &text, &marker, true)
+    } else {
+        tmux::deliver_no_verify(&cfg.tmux_target, &text, true)
+    };
+    match delivered {
         Ok(true) => {
             let pane = tmux::resolve_pane(&cfg.tmux_target)
                 .map(|p| format!("{} ({})", p.pane_id, p.command))
                 .unwrap_or_else(|_| cfg.tmux_target.clone());
-            eprintln!("[tmux] seq={seq} 已注入 {pane} 并回车");
+            let mode = if cfg.tmux_verify { "" } else { "（无标记验证）" };
+            eprintln!("[tmux] seq={seq} 已注入 {pane} 并回车{mode}");
             true
         }
         Ok(false) => {
@@ -762,7 +785,7 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
+        println!("synapse-agent 0.5.1\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：--proxy <url> 显式开启，--proxy off 强制直连；缺省自动检测 HTTPS_PROXY/ALL_PROXY 环境变量，NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get | upgrade\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。");
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -1163,6 +1186,19 @@ fn main() {
             let target = args_map.get("target").cloned()
                 .or_else(|| args_map.get("tmux").cloned());
             let enable = args_map.get("enable").map(|v| cfg_truthy(v));
+            let verify = args_map.get("verify").map(|v| cfg_truthy(v));
+            if let Some(v) = verify {
+                saved["tmux_verify"] = json!(v);
+                if let Err(e) = write_private_json(&cfg_path, &saved) {
+                    eprintln!("{e}"); std::process::exit(1);
+                }
+                println!("{}", json!({
+                    "ok": true, "op": "tmux-config-verify", "tmux_verify": v,
+                    "note": "alternate-screen TUI（CodeBuddy/Claude）用 0：注入即 ACK，避免标记读不到导致重投风暴",
+                    "config": cfg_path.to_string_lossy()
+                }));
+                return;
+            }
             if let Some(t) = target {
                 if t.trim().is_empty() {
                     eprintln!("tmux-config 的 target 不能为空"); std::process::exit(2);
@@ -1180,6 +1216,7 @@ fn main() {
                 if let Some(o) = saved.as_object_mut() {
                     o.remove("tmux_target");
                     o.remove("tmux_forward");
+                    o.remove("tmux_verify");
                 }
                 if let Err(e) = write_private_json(&cfg_path, &saved) {
                     eprintln!("{e}"); std::process::exit(1);
@@ -1199,6 +1236,7 @@ fn main() {
                     "op": "tmux-config-show",
                     "tmux_target": saved["tmux_target"].as_str().unwrap_or(""),
                     "tmux_forward": saved["tmux_forward"].as_bool().unwrap_or(false),
+                    "tmux_verify": saved["tmux_verify"].as_bool().unwrap_or(true),
                     "from_env_target": std::env::var("SYNAPSE_TMUX_TARGET").unwrap_or_default(),
                     "from_env_forward": std::env::var("SYNAPSE_TMUX_FORWARD").unwrap_or_default(),
                     "config": cfg_path.to_string_lossy()
@@ -2438,6 +2476,7 @@ mod tests {
             window_forward: false,
             tmux_target: String::new(),
             tmux_forward: false,
+            tmux_verify: true,
         }
     }
 
@@ -2515,6 +2554,16 @@ mod tests {
         assert!(!for_me(&cfg, &json!({"topic": "task", "to": "b2"})));
         assert!(for_me(&cfg, &json!({"topic": "task", "to": ["b2", "a1"]})));
         assert!(!for_me(&cfg, &json!({"topic": "task", "to": ["b2", "c3"]})));
+    }
+
+    #[test]
+    fn tmux_verify_flag_parses_truthy_values() {
+        // --tmux-verify 0 必须解析为 false（alternate-screen TUI 关标记验证）
+        assert!(cfg_truthy("1"));
+        assert!(cfg_truthy("true"));
+        assert!(!cfg_truthy("0"));
+        assert!(!cfg_truthy("false"));
+        assert!(!cfg_truthy("off"));
     }
 
     #[test]

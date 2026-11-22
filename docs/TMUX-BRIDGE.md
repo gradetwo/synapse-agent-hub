@@ -65,6 +65,24 @@ SYNAPSE_TMUX_BIN=/opt/homebrew/bin/tmux synapse-agent run --tmux 1
 
 `--tmux 0` 可显式关闭本次投递。`--window 1` 和 `--tmux ...` 不能同时开启；Linux/macOS 用 tmux，Windows 用窗口桥。
 
+### alternate-screen TUI：关闭标记验证（避免重投风暴）
+
+`deliver` 靠 `capture-pane` 读到 `[Synapse #seq]` 才认为投递成功并 ACK。但 CodeBuddy / Claude 这类
+**alternate-screen TUI** 用自绘输入框，`send-keys` 的文字不回显到 tmux pane 缓冲区 → 永远读不到标记 →
+WAL 不 ACK、每 5 秒重投 → **同一条消息被反复粘贴进输入框**。表现就是 pane 里同一条消息刷十几遍。
+
+对这类 TUI 关闭标记验证，改为「tmux 注入命令成功即 ACK」，靠 WAL `_window_delivered` + `dedupe_key` 防重：
+
+```bash
+synapse-agent tmux-config --verify 0        # 写入 config.json 的 tmux_verify:false，永久生效
+# 或临时覆盖：SYNAPSE_TMUX_VERIFY=0 synapse-agent run --tmux 1
+# 或单次：synapse-agent run --tmux-verify 0 --tmux 1
+synapse-agent tmux-config --show            # 确认 tmux_verify:false
+```
+
+代价：不再确认 TUI 真的把文字上屏（只确认 tmux 命令执行成功）。仅用于不回显的 TUI；普通 shell/回显型
+TUI 保持默认 `verify=true` 更安全。
+
 ---
 
 ## 3. 单次诊断

@@ -176,6 +176,29 @@ pub fn send_text(target: &str, text: &str, enter: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 无标记验证的投递：注入命令成功即视为送达，返回 Ok(true)。
+///
+/// 用于 alternate-screen TUI（CodeBuddy/Claude 等）：这类程序用自绘输入框，
+/// `send-keys` 的文字不会回显到 `capture-pane`，导致 `deliver()` 的标记轮询永远
+/// 读不到 `[Synapse #seq]` → 调用方保留 WAL、每 5 秒重投 → 同一条消息被重复粘贴。
+/// 本函数不做 capture 回读：tmux 命令本身成功（pane 存在、文字已注入）就返回成功，
+/// 由调用方 mark_surface_delivered + dedupe 防止重复。
+pub fn deliver_no_verify(target: &str, text: &str, enter: bool) -> Result<bool, String> {
+    let _pane = resolve_pane(target)?;
+    if text.is_empty() {
+        return Err("发送正文为空".into());
+    }
+    if text.contains('\n') {
+        paste_multiline(target, text)?;
+    } else {
+        send_literal(target, text)?;
+    }
+    if enter {
+        run(&["send-keys", "-t", target, "Enter"])?;
+    }
+    Ok(true)
+}
+
 /// 带标记验证的投递：用于 `run --tmux` 和 `tmux-send --verify 1`。
 ///
 /// 返回 Ok(true) 表示 pane 里已经看到标记（已投递/本次已上屏）；
