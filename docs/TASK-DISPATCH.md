@@ -97,8 +97,8 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 
 ## 4. 租约与续租
 
-- `claim` 租约统一为 `TASK_LEASE_MS = 10 分钟`（原 120 秒过短）。
-- `heartbeat` 会为 `owner=该 agent && state=claimed` 的任务续租到 `now + TASK_LEASE_MS`；agent 心跳正常时不会因执行时间长而被误回收。
+- `claim` 租约默认 **12 小时**（`LEASE_TTL_S=43200` 秒，可按部署调整）。
+- `heartbeat` 会为 `owner=该 agent && state=claimed` 的任务续租到 `now + LEASE_TTL_S`；agent 心跳正常时不会因执行时间长而被误回收。
 - `cron/tick` 只回收真正过期且心跳也没续上的 `claimed`，转为 `open` 并写 `reclaimed` 事件。
 - 管理台任务行显示「租约剩余」；剩余 ≤60 秒标黄，≤0 标红。
 
@@ -182,7 +182,7 @@ Muse 管理侧提交的 `docs/REQUIREMENTS-20261122.md` 按 ROI 列了 R1–R10�
 | R2 交付格式门 | **已实现（文件+checks）** | 补丁/回执/报告正文 + 结构化自测计数；缺项 422 并写 `missing` |
 | R3 管理员关单与状态纠错 | **已实现** | `tasks/close`、`tasks/reclaim`、`tasks/reassign`，写任务事件审计 |
 | R4 队列顺序/优先级/按节点视图 | 未开始 | 需要 `priority`、`after`、`repo` 字段与领取约束 |
-| R5 租约与在岗状态 | **部分实现** | 租约 10 分钟 + heartbeat 续租；台账显示剩余租约与 owner/定向目标在线状态 |
+| R5 租约与在岗状态 | **部分实现** | 租约默认 12 小时 + heartbeat 续租；台账显示剩余租约与 owner/定向目标在线状态 |
 | R6 派单唤醒 | **已实现 inbox 通道** | 定向任务消息即唤醒；离线目标在台账标红；webhook/推送留作可选增强 |
 | R7 任务与仓库绑定 | 未开始 | 依赖 R4 的 `repo` 字段 |
 | R8 合入/CI 回写 | 未开始 | 需要新增 task 下游状态字段与详情页 |

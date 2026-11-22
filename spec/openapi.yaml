@@ -293,7 +293,7 @@ paths:
         '200': { description: ok }
   /p/{project}/tasks/claim:
     post:
-      summary: 认领任务（租约 120s，心跳续租）
+      summary: 认领任务（租约默认 12h，心跳续租）
       parameters:
         - $ref: '#/components/parameters/Project'
       requestBody:

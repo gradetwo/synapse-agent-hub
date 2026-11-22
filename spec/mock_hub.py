@@ -4,7 +4,7 @@
 刻意与 worker 语义保持一致：
   · seq 每项目单调递增；dedupe_key 幂等
   · 心跳覆盖写、alive/late/offline 判定、采样桶
-  · 任务租约（默认 3 秒，便于测试；生产 120 秒）
+  · 任务租约（mock 默认 3 秒，便于测试；生产默认 12 小时）
   · 交付三态 delivered/collected/archived
   · blob 内容寻址（sha256 即 key）
 

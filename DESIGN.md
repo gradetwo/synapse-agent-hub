@@ -165,7 +165,7 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | POST | `/p/{p}/heartbeat` | heartbeat | 覆盖写 + 顺带续租 + 5 分钟采样 |
 | POST | `/p/{p}/ack` | ack | `status: done \| refused \| blocked \| stale` |
 | POST | `/p/{p}/report` | report | 任务 + 资源详单 |
-| POST | `/p/{p}/tasks/claim` | publish | 租约 120s |
+| POST | `/p/{p}/tasks/claim` | publish | 租约默认 12h（`LEASE_TTL_S`） |
 | POST | `/p/{p}/tasks/release` | publish | `done \| blocked`；目标 done 且该任务仍有待取交付时只进 `released`（见 §7 联动） |
 | PUT | `/p/{p}/artifact/{sha256}` | artifact.write | 流式直传 R2 |
 | GET | `/p/{p}/artifact/{sha256}` | poll | 下载 |
@@ -338,7 +338,7 @@ delivered ──▶ collected ──▶ archived
 
 - 心跳 **60s ± 15s 抖动**，不因 idle 降频（失联发现优先于省写）
 - 服务端**覆盖写**一份 agent 记录（永远一行）；D1 每 5 分钟一行
-- 任务租约**挂心跳续租**（120s），agent 一死自动可被接手，不需要独立检测器
+- 任务租约**挂心跳续租**（默认 12h，`LEASE_TTL_S` 可调），agent 一死到期自动可被接手，不需要独立检测器
 
 ### 告警（自动上/自动下）
 
@@ -492,7 +492,7 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 
 | 场景 | 后果 | 对策 |
 |---|---|---|
-| agent 崩溃在任务中 | 任务永锁 | 120s 租约 + cron 回收 + `task.reclaimed` |
+| agent 崩溃在任务中 | 任务永锁 | 默认 12h 租约 + cron 回收 + `task.reclaimed` |
 | 消息重复投递 | 重复产出 | `dedupe_key` 双端去重 |
 | 处理一半崩溃 | 产出残缺 | 游标只在成功后前移 |
 | 长任务漏拍 | 假 offline | `late` 中间档 + 抖动 |
@@ -514,7 +514,7 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 5. 含 `AKIA…` 的补丁 ⇒ 422 + 告警
 6. 广播后 30s 内三 agent ack 变绿；离线者 10 分钟后被催
 7. 心跳 60s 一拍，名册从 `unknown` 60s 内变 `alive`
-8. 停掉一个 agent，120s 后其任务可被他人 claim
+8. 停掉一个 agent，租约到期后其任务可被他人 claim
 9. `visibility.mode=list` 时，越界项目在面板与 CLI 均 403
 10. Python/TS/Rust 三 SDK 均通过 7 个一致性用例（`spec/conformance/run.py`）
 

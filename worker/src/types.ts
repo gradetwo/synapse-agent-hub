@@ -8,6 +8,7 @@ export interface Env {
   /** 允许直接进入管理台的 Access 邮箱，逗号分隔；留空时使用内置默认管理员。 */
   ADMIN_EMAILS?: string;
   HEARTBEAT_PERIOD_S: string;
+  /** claim 租约秒数；缺省/非法时 12h；旧部署遗留值 120 按 12h 处理。 */
   LEASE_TTL_S: string;
   MAX_SUBMISSION_MB: string;
 }

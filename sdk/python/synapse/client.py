@@ -44,7 +44,7 @@ class TaskLease:
         self._renew: threading.Thread | None = None
 
     def _renew_loop(self) -> None:
-        # 10 分钟租约，每 4 分钟重认领一次（同 owner 幂等，只续 lease_until）。
+        # 默认 12h 租约，每 4 分钟重认领一次（同 owner 幂等，只续 lease_until）。
         while not self._stop.wait(240):
             try:
                 self.c._post(f"/p/{self.c.project}/tasks/claim", {"task_id": self.task_id})
@@ -53,7 +53,7 @@ class TaskLease:
 
     def __enter__(self):
         # 直接 new Client(...) 而不是 from_config 时也需要心跳续租，否则长任务
-        # 10 分钟租约到期会被别的节点抢走。
+        # 租约到期会被别的节点抢走。
         self.c.start_heartbeat()
         r = self.c._post(f"/p/{self.c.project}/tasks/claim", {"task_id": self.task_id})
         if not r.get("ok"):

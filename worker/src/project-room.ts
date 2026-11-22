@@ -3,7 +3,7 @@
 import { Env, Msg, Task } from "./types";
 
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
-const TASK_LEASE_MS = 10 * 60_000; // 任务 claim 租约：心跳会续，不用 2 分钟卡死长任务
+const DEFAULT_TASK_LEASE_MS = 12 * 60 * 60_000; // 任务 claim 默认租约 12h；心跳会续，LEASE_TTL_S 可调
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
@@ -23,6 +23,14 @@ export class ProjectRoom implements DurableObject {
   private st: DurableObjectStorage;
   constructor(private state: DurableObjectState, private env: Env) {
     this.st = state.storage;
+  }
+
+  /** claim 租约：优先读 LEASE_TTL_S（秒），缺省/非法时 12 小时。 */
+  private taskLeaseMs(): number {
+    const sec = Number(this.env.LEASE_TTL_S);
+    // 120 是旧部署未生效的遗留值；别让它把默认 12h 降回 2 分钟。
+    if (sec === 120) return DEFAULT_TASK_LEASE_MS;
+    return Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : DEFAULT_TASK_LEASE_MS;
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -295,11 +303,11 @@ export class ProjectRoom implements DurableObject {
     };
     await this.st.put(key, rec);
 
-    // 任务租约挂心跳：持有者活着就续，共 120s
+    // 任务租约挂心跳：持有者活着就续，TTL = LEASE_TTL_S（默认 12h）
     const tasks = await this.st.list<Task>({ prefix: "task:" });
     for (const [k, t] of tasks) {
       if (t.owner === b.agent_id && t.state === "claimed") {
-        await this.st.put(k, { ...t, lease_until: now + TASK_LEASE_MS });
+        await this.st.put(k, { ...t, lease_until: now + this.taskLeaseMs() });
       }
     }
 
@@ -408,7 +416,7 @@ export class ProjectRoom implements DurableObject {
       return json({ ok: true, lease_until: t.lease_until, already: true });
     if (t.state !== "open" && !(t.state === "claimed" && t.lease_until < now))
       return json({ error: "locked", owner: t.owner, lease_until: t.lease_until }, 409);
-    const lease = now + TASK_LEASE_MS;
+    const lease = now + this.taskLeaseMs();
     await this.st.put(`task:${b.task_id}`, { ...t, state: "claimed", owner: b.agent_id,
                                              lease_until: lease, updated_at: now });
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "claimed",
