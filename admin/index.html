@@ -738,40 +738,51 @@ function taskStateLabel(s) {
 }
 
 async function loadTasks() {
-  if (current === "*") {
-    TASK_ROWS = [];
-    $("taskStat").textContent = "全部项目视图不汇总";
-    $("tasks").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看任务</td></tr>`;
-    BADGES.task = 0;
-    updateBadges();
-    return;
+  const isAll = current === "*";
+  let rows = [];
+  if (isAll) {
+    const projects = (allProjects || []).filter((p) => p.project !== "*");
+    const got = await Promise.allSettled(projects.map((p) => api(`/admin/p/${p.project}/tasks`)));
+    got.forEach((r, i) => {
+      if (r.status !== "fulfilled") { console.warn("[hub] task list failed", projects[i]?.project, r.reason); return; }
+      const raw = r.value;
+      const list = Array.isArray(raw) ? raw : (raw.tasks || []);
+      rows.push(...list.map((t) => ({ ...t, project: t.project || projects[i].project })));
+    });
+  } else {
+    const raw = await api(`/admin/p/${current}/tasks`);
+    rows = Array.isArray(raw) ? raw : (raw.tasks || []);
   }
-  const raw = await api(`/admin/p/${current}/tasks`);
-  const d = Array.isArray(raw) ? raw : (raw.tasks || []);
-  TASK_ROWS = d;
-  const active = d.filter((t) => t.state !== "done").length;
-  $("taskStat").textContent = `${active} 活跃 / 共 ${d.length}`;
+  const rank = (st) => st === "claimed" ? 0 : st === "open" ? 1 : st === "released" ? 2 : st === "blocked" ? 3 : 4;
+  rows.sort((a, b) => rank(a.state) - rank(b.state)
+    || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
+  TASK_ROWS = rows;
+  const active = rows.filter((t) => t.state !== "done").length;
+  $("taskStat").textContent = isAll
+    ? `${active} 活跃 / 共 ${rows.length} · 全部项目（只读）`
+    : `${active} 活跃 / 共 ${rows.length}`;
   BADGES.task = active;
   updateBadges();
   const keepTo = $("taskTo").value;
   $("taskTo").innerHTML = taskAgentOptions(keepTo);
   if (keepTo) $("taskTo").value = keepTo;
-  $("tasks").innerHTML = d.length ? d.map((t) => {
+  $("tasks").innerHTML = rows.length ? rows.map((t) => {
     const id = t.task_id || t.id || "";
     const st = t.state || "open";
     const owner = t.owner ? `<span class="mono">${t.owner}</span>` :
       (t.to ? `<span class="muted">→ <span class="mono">${t.to}</span></span>` : "—");
     const pending = Number(t.pending_submissions ?? 0);
     const assigned = t.to || t.owner || "";
-    const acts = st === "done" ? `<span class="muted">已结</span>` : `
+    const projectTag = isAll ? `<span class="muted" style="font-size:10px">${t.project || "—"}</span><br>` : "";
+    const acts = isAll ? `<span class="muted">切到项目</span>` : (st === "done" ? `<span class="muted">已结</span>` : `
       <button class="ghost mini" data-task-close="${id}">完成</button>
       <button class="ghost mini" data-task-reclaim="${id}">取回</button>
       <select class="mini taskRow" data-task-assignee="${id}">${taskAgentOptions(assigned)}</select>
-      <button class="ghost mini" data-task-reassign="${id}">转派</button>`;
+      <button class="ghost mini" data-task-reassign="${id}">转派</button>`);
     const pendingCell = pending > 0
-      ? `<button class="ghost mini" data-goto-delivery="1" title="去交付箱取走">${pending}</button>` : "—";
-    return `<tr data-task-id="${id}" data-state="${st}">
-      <td><span class="mono">${id}</span><div class="muted" style="white-space:normal;max-width:240px">${t.title || ""}</div></td>
+      ? (isAll ? `<span class="warnv">${pending}</span>` : `<button class="ghost mini" data-goto-delivery="1" title="去交付箱取走">${pending}</button>`) : "—";
+    return `<tr data-task-id="${id}" data-state="${st}" data-project="${t.project || current}">
+      <td>${projectTag}<span class="mono">${id}</span><div class="muted" style="white-space:normal;max-width:240px">${t.title || ""}</div></td>
       <td><span class="badge ${st}">${taskStateLabel(st)}</span></td>
       <td>${owner}</td>
       <td>${taskLease(t)}</td>
@@ -779,7 +790,7 @@ async function loadTasks() {
       <td class="muted">${t.updated_at ? ago((Date.now() - t.updated_at) / 1000) + "前" : "—"}</td>
       <td style="white-space:nowrap">${acts}</td>
     </tr>`;
-  }).join("") : `<tr><td colspan="7" class="empty">当前项目还没有任务，先在上面派一件</td></tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">${isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件"}</td></tr>`;
   reapplyFilters();
 }
 
@@ -1667,8 +1678,8 @@ function setProjectPanels(enabled) {
     return;
   }
   // 全部项目只做聚合总览；涉及写操作/交付/消息的卡片必须回到具体项目。
-  $("taskStat").textContent = "全部项目视图不汇总";
-  $("tasks").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看任务</td></tr>`;
+  $("taskStat").textContent = "加载全部项目任务…";
+  $("tasks").innerHTML = `<tr><td colspan="7" class="empty">加载全部项目任务…</td></tr>`;
   $("subStat").textContent = "全部项目视图不汇总";
   $("subs").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看交付箱</td></tr>`;
   $("msgStat").textContent = "";
@@ -1705,6 +1716,7 @@ async function refresh() {
   });
   if (current === "*") {
     setProjectPanels(false);
+    try { await loadTasks(); } catch (e) { console.warn("[hub] loadTasks failed", e); }
     return;
   }
   setProjectPanels(true);
