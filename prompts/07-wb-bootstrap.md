@@ -120,6 +120,7 @@ project, agent_id, token_sha, machine = sys.argv[1:5]
 print(json.dumps({
     "project": project, "agent_id": agent_id, "token_sha": token_sha,
     "scopes": ["heartbeat","poll","publish","report","ack",
+               "tasks.claim","tasks.release",
                "submissions.create","artifact.write","artifact.read"],
     "machine": machine
 }))

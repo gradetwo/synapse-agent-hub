@@ -4,12 +4,13 @@ import { Env } from "./types";
 import CONSOLE_HTML from "../../admin/index.html";
 export { ProjectRoom } from "./project-room";
 
-const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "artifact.write", "submissions.create"];
+const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "tasks.claim", "tasks.release",
+                      "artifact.write", "submissions.create"];
 const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "task-ux-20261122b";
+const BUILD_TAG = "task-scope-20261122";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.1";
 
@@ -420,12 +421,13 @@ async function enroll(req: Request, env: Env, url: URL, path: string) {
     ? rawScopes.map((x: any) => String(x).trim())
     : String(rawScopes ?? "").split(",").map((x) => x.trim());
   const allowed = ["heartbeat", "poll", "publish", "report", "ack",
+                   "tasks.claim", "tasks.release",
                    "submissions.create", "artifact.write", "artifact.read"];
   const bad = listScopes.filter((x) => x && !allowed.includes(x));
   if (bad.length) return err(422, `bad_scope:${bad.join(",")}`);
   const scopes = listScopes.filter(Boolean).length
     ? [...new Set(listScopes.filter(Boolean))].join(",")
-    : "heartbeat,poll,publish";
+    : allowed.join(",");
   await env.DB.prepare(
     `INSERT INTO enrollments (id, project, agent_id, token_sha, code, scopes, machine, ip,
                               created_at, expires_at, status)
@@ -502,13 +504,18 @@ function need(action: string) {
   if (action.startsWith("ack")) return "ack";
   if (action.startsWith("report")) return "report";
   if (action.startsWith("inbox")) return "poll";
+  if (action === "tasks/claim") return "tasks.claim";
+  if (action === "tasks/release") return "tasks.release";
   if (action.startsWith("tasks/admin-")) return "admin";
   if (action === "tasks/list" || action === "tasks/get") return "admin"; // 台账/单任务元数据不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
 }
-const inScope = (s: string[], n: string) => s.includes(n) || s.includes("admin");
+const inScope = (s: string[], n: string) =>
+  s.includes(n) || s.includes("admin") ||
+  // 兼容：存量 token 只有 publish，给它们继续走 claim/release 的过渡期。
+  ((n === "tasks.claim" || n === "tasks.release") && s.includes("publish"));
 
 async function projectQuota(env: Env, project: string) {
   const r = await env.DB.prepare(
@@ -969,7 +976,8 @@ async function admin(req: Request, env: Env, url: URL) {
       ).bind(project, id).all();
       const ag = await env.DB.prepare(
         `SELECT agent_id,role,scopes,created_at,expires_at,revoked_at FROM agents
-         WHERE project=? AND agent_id=?`).bind(project, id).first();
+         WHERE project=? AND agent_id=? AND revoked_at IS NULL
+         ORDER BY created_at DESC LIMIT 1`).bind(project, id).first();
       const inbox: any = await (await stub.fetch(new Request(
         `https://do/inbox?since=0&limit=200&agent=*&desc=1`))).json().catch(() => ({ messages: [] }));
       const msgs = (inbox.messages ?? []).filter((m: any) =>
@@ -1227,6 +1235,48 @@ async function admin(req: Request, env: Env, url: URL) {
       `INSERT INTO agents (project, agent_id, role, scopes, token_sha, created_at, expires_at) VALUES (?,?,?,?,?,?,?)`
     ).bind(b.project, b.agent_id, role, list.join(","), await sha256(plain), Date.now(), expiresAt).run();
     return Response.json({ token: plain, agent_id: b.agent_id, role, scopes: list.join(","), expires_at: expiresAt, ttl_days: ttlDays });
+  }
+
+  // 只改权限，不重签 token：同一 agent 的所有活跃 token 行同步更新。
+  // 现有 POST /admin/agents 会生成新 token 并吊销旧 token，不适合做权限编辑。
+  if (p === "/admin/agents" && req.method === "PATCH") {
+    const b: any = await req.json().catch(() => null);
+    if (!b || typeof b !== "object") return err(400, "bad_json");
+    if (!/^[a-z0-9-]{2,40}$/.test(String(b.project ?? ""))) return err(422, "bad_project_name");
+    if (!/^[a-zA-Z0-9._-]{2,40}$/.test(String(b.agent_id ?? ""))) return err(422, "bad_agent_id");
+
+    const ag = await env.DB.prepare(
+      `SELECT role, scopes FROM agents
+       WHERE project=? AND agent_id=? AND revoked_at IS NULL
+         AND (expires_at IS NULL OR expires_at > ?)
+       ORDER BY created_at DESC LIMIT 1`
+    ).bind(b.project, b.agent_id, Date.now()).first<any>();
+    if (!ag) return err(404, "agent_not_found");
+
+    let list: string[];
+    if (b.scopes === undefined || b.scopes === null || b.scopes === "") {
+      return err(422, "bad_scopes");
+    } else if (typeof b.scopes === "string") {
+      list = b.scopes.split(",").map((x: string) => x.trim()).filter(Boolean);
+    } else if (Array.isArray(b.scopes)) {
+      list = b.scopes.map((x: any) => String(x).trim()).filter(Boolean);
+    } else {
+      return err(422, "bad_scopes");
+    }
+    list = [...new Set(list)];
+    const unknown = list.filter((x) => !ALL_SCOPES.has(x));
+    if (unknown.length) return err(422, `unknown_scopes:${unknown.join(",")}`);
+    if (!list.length) return err(422, "empty_scopes");
+    if (ag.role !== "admin" && list.includes("admin")) return err(422, "admin_scope_requires_admin");
+    if (ag.role === "admin" && !list.includes("admin")) list.unshift("admin");
+
+    const r = await env.DB.prepare(
+      "UPDATE agents SET scopes = ? WHERE project = ? AND agent_id = ? AND role = ? AND revoked_at IS NULL"
+    ).bind(list.join(","), b.project, b.agent_id, ag.role).run();
+    return Response.json({
+      ok: true, agent_id: b.agent_id, role: ag.role,
+      scopes: list.join(","), updated: r.meta.changes,
+    });
   }
 
   // 吊销：某 agent 名下所有未吊销 token 全失效

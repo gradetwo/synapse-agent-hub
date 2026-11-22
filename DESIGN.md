@@ -52,7 +52,7 @@
 ### agent 默认 scope（签发时可增减，但**不可**含 `admin`）
 
 ```
-poll, ack, report, heartbeat, publish, artifact.write, submissions.create
+poll, ack, report, heartbeat, publish, tasks.claim, tasks.release, artifact.write, submissions.create
 ```
 
 管理员默认 scope 在上面基础上加 `artifact.read` 与 `admin`。普通 agent 不允许携带 `admin`；
@@ -64,6 +64,7 @@ poll, ack, report, heartbeat, publish, artifact.write, submissions.create
 |---|---|---|
 | poll / inbox / ack / report / heartbeat | ✅ | ✅ |
 | publish 普通消息 | ✅ | ✅ |
+| 领取 / 完成任务（tasks/claim、tasks/release） | ✅ | ✅ |
 | 上传产物 + 建 submission | ✅ | ✅ |
 | 标记 collected / archived、写 result | ✗ | ✅ |
 | 广播（含 git_pull） | ✗ | ✅ |

@@ -36,7 +36,7 @@
 参数：
 ENDPOINT=https://synapse.wangda.today
 PROJECT=yeban
-AGENT_ID=doubao-dev-001
+AGENT_ID=<例如doubao-dev-001>
 
 阶段 1：本地生成 token
 
@@ -94,6 +94,7 @@ print(json.dumps({
     "token_sha": token_sha,
     "scopes": [
         "heartbeat", "poll", "publish", "report", "ack",
+        "tasks.claim", "tasks.release",
         "submissions.create", "artifact.write", "artifact.read"
     ],
     "machine": machine

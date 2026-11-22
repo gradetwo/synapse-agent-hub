@@ -195,6 +195,14 @@ if (location.search.includes("reset=1")) {
   .permBar .permActions{display:flex;gap:6px;margin-left:auto}
   .permBar .permActions button{min-height:32px;padding:4px 10px;font-size:12.5px;white-space:nowrap}
   @media(max-width:520px){.permBar .permActions{margin-left:0;width:100%}.permBar .permActions button{flex:1}}
+  /* 详情页细粒度权限：一行可勾选的 chip，保存只改 scopes、不重签 token */
+  .scopeGrid{display:flex;flex-wrap:wrap;gap:6px}
+  .scopeGrid label{display:flex;align-items:center;gap:5px;padding:5px 8px;border:1px solid #232a33;
+    border-radius:7px;background:#151b23;font-size:12px;cursor:pointer;user-select:none}
+  .scopeGrid label.on{border-color:#3b5b86;background:#172234}
+  .scopeGrid label .cap{display:inline;margin:0;font-size:10.5px;text-transform:none;letter-spacing:0}
+  .scopeGrid input{width:auto;height:14px;min-height:0;margin:0;flex:0 0 auto}
+  .scopeHint{font-size:11px;color:#7d8798}
   .cap{font-size:11px;color:#7d8798;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
   .list{font-size:12.5px}
   .list .row{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid #151b23}
@@ -583,6 +591,12 @@ if (location.search.includes("reset=1")) {
         <button id="dDemote">收回管理</button>
         <button id="dRevoke">吊销 token</button>
       </div>
+    </div>
+    <div class="cap" style="margin-top:10px">细粒度权限 <span class="scopeHint">只改权限，不重签 token</span></div>
+    <div id="dScopes" class="scopeGrid"></div>
+    <div class="permBar" style="margin-top:8px">
+      <span class="scopeHint">勾选后点保存；对同一 agent 的所有活跃 token 生效。</span>
+      <div class="permActions"><button class="primary" id="dSaveScopes">保存权限</button></div>
     </div>
     <div class="cap" style="margin-top:10px">项目参与</div>
     <div class="permBar">
@@ -1431,7 +1445,42 @@ function drawLine(cv, vals, color) {
 let detailAgent = null;
 let detailRole = "agent";
 let detailReady = false;
-const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject"];
+const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes"];
+const TASK_SCOPES = ["tasks.claim", "tasks.release"];
+const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TASK_SCOPES,
+                      "artifact.read","artifact.write","submissions.create"];
+const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",...TASK_SCOPES,
+                           "artifact.read","artifact.write","submissions.create"];
+// 详情页可编辑的权限：管理员身份本身用“授予/收回管理”切换，不混进这里。
+const SCOPE_OPTIONS = [...TASK_SCOPES, "heartbeat", "poll", "report", "ack", "publish",
+                       "submissions.create", "artifact.write", "artifact.read"];
+const SCOPE_LABELS = {
+  "tasks.claim": "领取任务", "tasks.release": "完成任务",
+  heartbeat: "心跳", poll: "收件", report: "上报", ack: "回执",
+  publish: "广播（旧任务权限）", "submissions.create": "创建交付",
+  "artifact.write": "上传产物", "artifact.read": "读取产物",
+};
+function scopeList(raw) {
+  return (Array.isArray(raw) ? raw : String(raw || "").split(","))
+    .map((x) => String(x).trim()).filter(Boolean);
+}
+function renderScopeEditor(scopes) {
+  const box = $("dScopes");
+  if (!box) return;
+  const now = new Set(scopes);
+  if (!scopes.length && detailRole === "admin") {
+    box.innerHTML = `<div class="scopeHint">管理身份已包含全部权限；留空保存即可，也可额外勾选。</div>`;
+    return;
+  }
+  box.innerHTML = SCOPE_OPTIONS.map((s) => `
+    <label class="${now.has(s) ? "on" : ""}" title="${esc(s)}">
+      <input type="checkbox" value="${esc(s)}" ${now.has(s) ? "checked" : ""}>
+      <span class="mono">${esc(s)}</span><span class="cap">${esc(SCOPE_LABELS[s] || "")}</span>
+    </label>`).join("");
+  box.querySelectorAll("input").forEach((el) => {
+    el.onchange = () => el.closest("label")?.classList.toggle("on", el.checked);
+  });
+}
 function setDetailReady(on) {
   detailReady = on;
   for (const id of DETAIL_ACTIONS) {
@@ -1457,15 +1506,18 @@ function openAgent(id, project) {
   $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
   if (!sameAgentRefresh) $("dToken").innerHTML = "";
   $("dRole").textContent = "加载中…";
+  if (!sameAgentRefresh) $("dScopes").innerHTML = "";
   setDetailReady(false);
   api(`/admin/p/${current}/agent/${encodeURIComponent(id)}`).then((d) => {
     setDetailReady(true);
     const hb = (d.hb || []).slice().reverse();
-    $("dMeta").textContent = `${d.agent?.role || "agent"} · ${(d.agent?.scopes || []).length} 项权限 · ${hb.length} 个采样`;
     const role = d.agent?.role || "agent";
+    const scopes = scopeList(d.agent?.scopes);
+    $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样`;
     detailRole = role;
-    $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 只能收件与上报";
+    $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 收件 / 接任务 / 上报";
     $("dRole").classList.toggle("admin", role === "admin");
+    renderScopeEditor(scopes);
     fillDetailProjects();
     drawLine($("cCpu"), hb.map((x) => x.cpu_pct ?? 0), "#6aa9ff");
     drawLine($("cMem"), hb.map((x) => x.mem_used_mb ?? 0), "#8ee08e");
@@ -1498,10 +1550,6 @@ function openAgent(id, project) {
   }).catch((e) => { $("dMeta").textContent = "加载失败：" + e.message; setDetailReady(false); });
 }
 
-const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",
-                      "artifact.read","artifact.write","submissions.create"];
-const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",
-                           "artifact.read","artifact.write","submissions.create"];
 
 function renderToken(boxId, tok, note, hintText = "只显示这一次，关掉就没了；旧 token 已同时作废。") {
   const box = $(boxId);
@@ -1568,9 +1616,10 @@ async function issueFor(role, reissue = false) {
     $("dMeta").textContent = `${role} · ${scopes.length} 项权限`;
     $("dRole").textContent = role === "admin"
       ? "管理身份 · 可下发/广播/下载"
-      : "普通 agent · 只能收件与上报";
+      : "普通 agent · 收件 / 接任务 / 上报";
     $("dRole").classList.toggle("admin", role === "admin");
     detailRole = role;
+    renderScopeEditor(scopeList(scopes));
     await loadAgents().catch(() => {});
   } catch (e) {
     renderTokenError("dToken", e.message || e);
@@ -1580,6 +1629,30 @@ async function issueFor(role, reissue = false) {
 $("dGrant").onclick = () => issueFor("admin");
 $("dDemote").onclick = () => issueFor("agent");
 $("dReissue").onclick = () => issueFor(detailRole, true);
+
+async function saveScopes() {
+  if (!detailAgent || !current || !detailReady) return;
+  const scopes = [...$("dScopes").querySelectorAll("input:checked")].map((el) => el.value);
+  if (!scopes.length && detailRole !== "admin") return showToast("至少保留一项权限");
+  // 管理身份本身必须保留 admin；其余附加 scope 可以清空。
+  if (!scopes.length) scopes.push("admin");
+  if (!confirm(`保存 ${detailAgent} 的权限？\n不会重签 token，对同一 agent 的所有活跃 token 立即生效。`)) return;
+  const btn = $("dSaveScopes");
+  btn.disabled = true;
+  try {
+    const r = await api("/admin/agents", "PATCH", { project: current, agent_id: detailAgent, scopes });
+    const n = scopeList(r.scopes).length;
+    $("dMeta").textContent = `${r.role || detailRole} · ${n} 项权限`;
+    showToast(`已保存：${r.updated ?? 1} 条活跃 token 的权限已同步`);
+    await openAgent(detailAgent);
+    await loadAgents().catch(() => {});
+  } catch (e) {
+    showToast("保存失败：" + (e.message || e), 8000);
+  } finally {
+    btn.disabled = !detailReady;
+  }
+}
+$("dSaveScopes").onclick = saveScopes;
 
 $("btnIssueToken").onclick = async () => {
   if (!current || current === "*") return renderTokenError("issueTokenBox", "请先选择具体项目");

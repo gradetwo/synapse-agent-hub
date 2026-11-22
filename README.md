@@ -121,7 +121,7 @@ NOW="$(date +%s)000"
 npx wrangler d1 execute agent_hub --remote --command \
   "INSERT INTO agents (project,agent_id,role,scopes,token_sha,created_at)
    VALUES ('bootstrap','bootstrap-admin','admin',
-   'admin,poll,ack,report,heartbeat,publish,artifact.write,submissions.create,artifact.read',
+   'admin,poll,ack,report,heartbeat,publish,tasks.claim,tasks.release,artifact.write,submissions.create,artifact.read',
    '$SHA',$NOW)"
 printf 'admin token: %s\n' "$TOKEN"
 ```

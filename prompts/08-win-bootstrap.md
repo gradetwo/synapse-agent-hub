@@ -50,6 +50,7 @@ $body = @{
   agent_id  = "<AGENT_ID>"
   token_sha = $TOKEN_SHA
   scopes    = @("heartbeat","poll","publish","report","ack",
+                "tasks.claim","tasks.release",
                 "submissions.create","artifact.write","artifact.read")
   machine   = $env:COMPUTERNAME
 } | ConvertTo-Json -Depth 4
