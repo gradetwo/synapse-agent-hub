@@ -417,8 +417,18 @@ export class ProjectRoom implements DurableObject {
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
     if (t.state === "claimed" && t.owner === b.agent_id && Number(t.lease_until ?? 0) > now)
       return json({ ok: true, lease_until: t.lease_until, already: true });
+    // 非 open 状态按真实原因报错，不能一律说 locked：done/blocked/released 的
+    // owner 与 lease_until 都是空值，旧实现会拼出“被锁定但 owner=null、租约 0”的
+    // 假象，让节点以为任务被不存在的人占着（ISS-MWSSGUQ1-88BD71）。
+    if (t.state === "done")
+      return json({ error: "already_done", state: t.state }, 409);
+    if (t.state === "blocked")
+      return json({ error: "blocked", state: t.state }, 409);
+    if (t.state === "released")
+      return json({ error: "released_pending_collection", state: t.state,
+                    pending_submissions: Number(t.pending_submissions ?? 0) }, 409);
     if (t.state !== "open" && !(t.state === "claimed" && t.lease_until < now))
-      return json({ error: "locked", owner: t.owner, lease_until: t.lease_until }, 409);
+      return json({ error: "locked", state: t.state, owner: t.owner, lease_until: t.lease_until }, 409);
     const lease = now + this.taskLeaseMs();
     await this.st.put(`task:${b.task_id}`, { ...t, state: "claimed", owner: b.agent_id,
                                              lease_until: lease, updated_at: now });
