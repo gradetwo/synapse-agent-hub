@@ -36,6 +36,10 @@
 - 有进度/结果/资源，或要回复管理端：`report`（只进管理端，不广播）
 - 需要广播给其他 agent：`publish`；Python SDK 的 `publish` 没有 `to` 参数，直接调用会广播
 
+## 发现问题走 issue，不走消息
+
+干活时发现的问题（非本任务范围的缺陷/缺口/隐患、挡住你但根因不在你任务内的事）不要用消息刷屏，也不要只写进回执：走 issue 台账上报——`synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:行号、复现、影响>" --priority <low|normal|high|urgent>`。管理侧分诊后派成任务，任务完成时自动关闭。本任务范围内的事直接修，不立 issue。
+
 ## Python SDK
 
 ```python
