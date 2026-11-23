@@ -148,6 +148,24 @@ $msg = & $BIN wait | ConvertFrom-Json
 hub_reply $msg.seq "已完成" "" $msg.dedupe_key
 ```
 
+## 任务台账：领单与关单（阶段 6 收件之后、阶段 8 交付之前）
+
+管理端派活走任务台账，不靠普通消息口头约定。
+
+- **台账是什么**：服务端按项目维护的任务表。每单有 `task_id`、标题、正文、指派对象（`to`）、状态（`open` → `claimed` → `released`/`done`/`blocked`）与租约。管理端建单时只往你的收件箱投一条消息：`topic=task`、`kind=task`，`payload` 只有 `{task_id, title, body}`。**收到消息不等于领单**——不主动领，任务一直是 `open`，管理端看得到你没领。`run --window 1` 把任务消息注入窗口也只是送达，不是领单。
+- **领单（开工前必须做）**：`& $BIN task-claim --task <task_id>`，返回 `{"ok":true,"lease_until":<毫秒时间戳>}` 才算领到。
+  - `409 locked`：已被别人领走（响应带 `owner` 与 `lease_until`）。不要重复干这单，`hub_reply` 说明后跳过。
+  - `403 not_your_task`：这单没指派给你。不要领，`hub_reply` 报管理端。
+  - `404 not_found`：`task_id` 写错或任务已撤。`hub_reply` 报管理端核对。
+  - **领单失败必须响亮报告**：`hub_reply` 写明 `task_id` 与原始错误。不许静默跳过，不许没领单就开工。
+- **租约与续租**：claim 租约现行口径 600 秒（10 分钟）。实际到期时间以 claim 响应里的 `lease_until` 为准，不要自己估算。常驻 `run` 在跑、心跳在发，服务端自动给名下全部 `claimed` 任务续租；`run` 停了又没人续，租约到期后任务被回收成 `open` 给别人。把已领的 `task_id` 与 `lease_until` 记进本地文件（`$HOME\.synapse-agent\claimed-tasks.txt`），会话重开先读它对账。
+- **交付必须挂单**：阶段 8 的 `deliver` 必须带 `--task <task_id>`，交付才挂到这单名下；不带 `--task` 的交付，管理端对不上单。
+- **关单（release）**：交付完成、`hub_reply` 发出之后才关单：`& $BIN task-release --task <task_id> --state done`。
+  - 有交付还没被管理侧取走时，服务端返回 `state=released`（已交付待取）；最后一件被取走后自动转 `done`。这是正常状态，不是失败，不要重复 release。
+  - 干不了或被阻塞：先 `hub_reply` 写明原因，再 `--state blocked`。
+  - 中途放弃：`--state open` 把单放回池子，并 `hub_reply` 说明。
+- **你查不了台账**：任务列表只对管理端开放，agent 没有自查接口。你名下有哪些单，只能靠收件箱里的任务消息加你自己记的本地记录。处理完一条任务消息，把 `task_id` 与最终状态落盘，别凭记忆。
+
 ## 阶段 7：与本机窗口双向通信
 
 两个方向分开：**Hub → 窗口** 由 `run --window 1` 自动完成；**窗口 → Hub** 需要另起 `bridge --hub 1` 读取窗口新增文本并 publish。`win-send` 是一次性手动注入，`bridge` 不替代 `run` 的收件/ACK/交付。

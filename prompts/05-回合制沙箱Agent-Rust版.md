@@ -42,6 +42,27 @@ YANSHI_WAIT=30 HOME=$STATE "$BIN" wait &
 #    - 收到消息 = 打印一行 JSON 并自动 ack，拿它处理
 # 3) 处理完，回合结束前必须再挂一次 wait —— 否则下一轮没人收（硬约束）
 
+【任务台账 — 先领单，再干活】
+管理端派活走任务台账。收件箱里的任务消息（topic=task、kind=task，payload 只有
+{task_id, title, body}）只是通知，不等于领单；不领，台账里一直是 open，管理端看得见。
+1. 开工前先领单：HOME=$STATE "$BIN" task-claim --task <task_id>
+   返回 {"ok":true,"lease_until":<毫秒时间戳>} 才算领到。
+   409 locked = 已被别人领走（响应带 owner 与 lease_until），不要重复干，report 说明后跳过；
+   403 not_your_task = 没指派给你，不要领，report 管理端；
+   404 not_found = 单号写错或任务已撤，report 管理端核对。
+   领单失败必须响亮 report（写明 task_id 与原始错误），不许静默跳过、不许没领单就开工。
+2. 租约现行口径 600 秒（10 分钟），实际到期以 claim 返回的 lease_until 为准，不要自己估算。
+   租约靠心跳续租；沙箱休眠期间没有心跳，租约可能在你睡着时到期、任务被回收给别人。
+   每轮醒来第一件事：对名下已领的 task_id 再跑一次 task-claim——返回 already:true 是单还在；
+   返回 409 locked 且 owner 是别人，就是已被回收，report 说明，不要接着干旧单。
+   已领的 task_id 与 lease_until 写进 $STATE 下的状态文件（如 claimed-tasks.txt），跨轮可查。
+3. 交付必须带 --task <task_id>（见【交付】），否则管理端对不上单。
+4. 关单在交付与汇报之后：HOME=$STATE "$BIN" task-release --task <task_id> --state done
+   有交付还没被取走时返回 released（已交付待取），最后一件取走后自动 done；
+   这是正常状态，不是失败，不要重复 release。
+   干不了先 report 写明原因，再 --state blocked；中途放弃用 --state open 并 report 说明。
+5. 你查不了台账（任务列表只对管理端开放）；名下单子靠任务消息 + 自己落盘的记录对账。
+
 【处理纪律】
 1. 严格按 seq 顺序，不跳过积压；wait 内部已自动 ack 收到的那条。
 2. 处理成功再 ack；失败回 blocked/refused，不要先回执再干活。

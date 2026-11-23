@@ -158,6 +158,26 @@ curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" \
 `wsstat` 返回 sockets > 0、`live[]` 里出现自己的 agent_id，或日志里看到 `ws connected`，就说明已连上。
 不要打印 `config.json`。
 
+## 任务台账（先领单，再干活；阶段 6 的闭环就是本节的实现）
+
+管理端派活走任务台账，不靠普通消息口头约定。
+
+- **台账是什么**：服务端按项目维护的任务表。每单有 `task_id`、标题、正文、指派对象（`to`）、状态（`open` → `claimed` → `released`/`done`/`blocked`）与租约。管理端建单时只往你的收件箱投一条消息：`topic=task`、`kind=task`，`payload` 只有 `{task_id, title, body}`。**收到这条消息不等于领单**——不主动领，任务在台账里一直是 `open`，管理端看得到你没领。
+- **领单（开工前必须做）**：`"$BIN" task-claim --task <task_id>`，返回 `{"ok":true,"lease_until":<毫秒时间戳>}` 才算领到。
+  - `409 locked`：已被别人领走（响应带 `owner` 与 `lease_until`）。不要重复干这单，report 说明后跳过。
+  - `403 not_your_task`：这单没指派给你。不要领，report 管理端。
+  - `404 not_found`：`task_id` 写错或任务已撤。report 管理端核对。
+  - 旧版客户端没有 `task-claim` 命令时用 HTTP 直调（与 `/report` 同款）：`POST $ENDPOINT/p/$PROJECT/tasks/claim`，头 `Authorization: Bearer $TOKEN`，体 `{"task_id":"<task_id>"}`，响应形状相同。
+  - **领单失败必须响亮报告**：report 写明 `task_id` 与原始错误。不许静默跳过，不许没领单就开工。
+- **租约与续租**：claim 租约现行口径 600 秒（10 分钟）。实际到期时间以 claim 响应里的 `lease_until` 为准，不要自己估算。只要后台纯心跳 `run` 在跑、心跳在发，服务端自动给名下全部 `claimed` 任务续租。心跳停了，租约到期后任务被回收成 `open` 给别人。把名下已领的 `task_id` 与 `lease_until` 记进 `$HOME/.synapse-agent/claimed-tasks.txt`，跨回合可查。
+- **交付必须挂单**：`deliver`/`submit` 带 `--task <task_id>`，交付才挂到这单名下；不带 `--task` 的交付，管理端对不上单。
+- **关单（release）**：交付完成、report 发出之后才关单：`"$BIN" task-release --task <task_id> --state done`。
+  - 有交付还没被管理侧取走时，服务端返回 `state=released`（已交付待取）；最后一件被取走后自动转 `done`。这是正常状态，不是失败，不要重复 release。
+  - 干不了或被阻塞：先 report 写明原因，再 `--state blocked`。
+  - 中途放弃：`--state open` 把单放回池子，并 report 说明。
+  - HTTP 直调同款：`POST $ENDPOINT/p/$PROJECT/tasks/release`，体 `{"task_id":"<task_id>","state":"done"}`。
+- **你查不了台账**：任务列表只对管理端开放，agent 没有自查接口。你名下有哪些单，只能靠收件箱里的任务消息加你自己记的本地记录。处理完一条任务消息，把 `task_id` 与最终状态落盘，别凭记忆。
+
 阶段 6：接任务 / 交付 / 上报 / 再等待
 
 先分清出口：
