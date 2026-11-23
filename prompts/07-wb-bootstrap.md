@@ -7,8 +7,8 @@
 > `docs/环境接入-回合制沙箱Agent.md` 里列出的三条硬约束（无 systemd、回合制、进程跨轮可能不保活）。
 >
 > 与通用版 `06-bootstrap-client.md` 的差异：**所有状态落 `/workspace` 持久区；用 `setsid` 让
-> `run` 以纯心跳模式后台常驻（沙箱休眠后需重新拉起）；接任务靠前台 `wait` 一条一条取；等待批准
-> 改为回合内有限等待。**
+> `run` 以纯心跳模式后台常驻（沙箱休眠后需重新拉起）；接任务靠 `wait` 一条一条取（唤醒链：
+> 后台挂起 + 宿主阻塞等待，见阶段 6）；等待批准改为回合内有限等待。**
 >
 > 一句话分清两个命令：**`run` 只管心跳和在线（后台常驻，必须带 `YANSHI_HB_ONLY=1`，不要让它消费
 > inbox）；`wait` 是唯一的接任务入口（取一条、处理、再取——永远不收尾）**。两者不互相替代。
@@ -35,11 +35,14 @@
 
 **不要结束一轮会话。** 任务完成、交付完成、上报完成、`wait` 超时，都不是结束理由；不要输出
 “已完成待命 / 进入待命 / 任务结束”作为最终答复。对话端只允许在接入阶段报告 enrollment 状态；
-进入任务循环后，任务正文、进度、结果一律只回 Synapse。只有下面三种情况才允许停止：
+进入任务循环后，任务正文、进度、结果一律只回 Synapse。只有下面两种情况才允许停止：
 
 1. 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
-2. 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
-3. 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+2. 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令。
+
+**回合结束是本环境的常态，不是停止。** 回合被平台收尾时，先落盘（当前 `seq`、未处理消息、
+enrollment 状态、名下已领任务与 `lease_until`），并按唤醒链续挂一次后台 `wait` 再结束本轮；
+下轮从落盘状态续跑。这不构成任务收尾，不要在答复里宣布「任务结束」。
 
 「任务做完 + 一次 `wait` 没消息」不在停止条件里——它是循环的常态，不是终点。心跳由后台 `run`
 维持——这与你收不收尾无关，别把这两件事混为一谈。
@@ -132,6 +135,12 @@ RESP="$(curl -fsS -X POST "$ENDPOINT/p/enroll" \
 
 ENROLLMENT_ID="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 ENROLLMENT_CODE="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
+
+# 立即落盘：shell 变量活不过本回合；阶段 4 的有限轮询跨轮续查靠这三个文件，不要只写 status
+printf '%s' "$ENROLLMENT_ID" > "$STATE/.synapse-agent/enrollment.id"
+printf '%s' "$ENROLLMENT_CODE" > "$STATE/.synapse-agent/enrollment.code"
+printf 'pending\n' > "$STATE/.synapse-agent/enrollment.status"
+chmod 600 "$STATE/.synapse-agent/enrollment.id" "$STATE/.synapse-agent/enrollment.code"
 ```
 
 把 `ENROLLMENT_ID`、`PROJECT`、`AGENT_ID` 报告给用户，**不要报告 TOKEN**，让管理员在控制台「待审注册」批准。
@@ -144,6 +153,9 @@ ENROLLMENT_CODE="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json
 ```bash
 STATUS_FILE="$STATE/.synapse-agent/enrollment.status"
 [ -f "$STATUS_FILE" ] || printf 'pending\n' > "$STATUS_FILE"
+# 跨回合续查：id/code 从阶段 3 的落盘文件恢复，不要只靠当时的 shell 变量
+[ -f "$STATE/.synapse-agent/enrollment.id" ] && ENROLLMENT_ID="$(cat "$STATE/.synapse-agent/enrollment.id")"
+[ -f "$STATE/.synapse-agent/enrollment.code" ] && ENROLLMENT_CODE="$(cat "$STATE/.synapse-agent/enrollment.code")"
 
 check_once() {
   R="$(curl -fsS "$ENDPOINT/p/enroll/$ENROLLMENT_ID?code=$ENROLLMENT_CODE" 2>/dev/null)" || return 0
@@ -324,6 +336,13 @@ PY
 }
 ```
 
+**唤醒链（本环境唯一可靠的被通知方式，与配套文档口径一致）**：回合之间你没有意识、没有入站
+地址，消息无法插进对话；只能做到「你下一次运行时消息已经在场」。做法固定：把 `wait` 挂到
+后台，再用宿主的「阻塞等待后台任务」能力等它——一次阻塞调用就是一次唤醒点：收到消息它打印
+JSON 并返回，你醒来处理；到点退出码 3 就再挂一次。**不要把下面的闭环当成一条前台阻塞的
+shell 命令一口气跑到底**：前台死等会占住整个回合，回合被平台收尾时链条就断了。**每个回合
+结束前必须再挂一次后台 `wait`（硬约束）**——漏挂一次，下一轮没人收件，节点就此失联。
+
 固定任务闭环。每轮开始时先 `ensure_run`，确认后台纯心跳 `run` 活着，再 `wait`：
 
 ```bash
@@ -390,8 +409,9 @@ while :; do
 done
 ```
 
-> 一句话：**心跳交给后台 `run`（`YANSHI_HB_ONLY=1`，不消费 inbox），接任务靠前台反复 `wait`。**
-> `wait` 是一次性命令，退出码 3 只表示这一小段没消息，不是收尾；下一轮继续。
+> 一句话：**心跳交给后台 `run`（`YANSHI_HB_ONLY=1`，不消费 inbox），接任务靠 `wait` 反复取
+> （后台挂起 + 宿主阻塞等待）。**
+> `wait` 是一次性命令，退出码 3 只表示这一小段没消息，不是收尾；回合结束前续挂，下一轮继续。
 
 ### 交付：一条命令到位
 
@@ -421,6 +441,7 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch --file out/RECEIPT.md --tas
   不要假报 done。有未取交付时 `task-release done` 会进入 `released`，等管理侧取走后自动 `done`。
 - **不要结束一轮会话**：任务完成、交付完成、上报完成、`wait` 退出码 3，都不是收尾信号；
   做完就 `ensure_run` 再 `wait`。不要输出「已完成待命 / 进入待命」作为最终答复。
+- **回合结束前必须再挂一次后台 `wait`（唤醒链硬约束）**：漏挂一次，下一轮没人收件，节点即失联。
 - **每次开始 `wait` 前先 `ensure_run`**：`status` 里 `pid` 不存在或进程已死，就用
   `YANSHI_HB_ONLY=1` 重启后台 `run`；`connected=false` 交给自动重连，不要立刻杀进程。
 - **`run` 与 `wait` 分工**：`run` 是纯心跳后台常驻，不消费 inbox；`wait` 是唯一接任务入口。
@@ -436,7 +457,7 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch --file out/RECEIPT.md --tas
 - 不把 token 写进日志、payload 或交付物。
 - 产物先 upload 再 submission；`deliver` 已封装这两步；`base_sha` 必须合法 hex。
 - 连接断开不要重建配置，等待后台 `run` 自动重连（或按 `ensure_run` 重新拉起）。
-- 只有人类明确要求停 / 汇报、管理员下发停止指令、平台强制交还，才允许停止；停止时按下面格式汇报。
+- 只有人类明确要求停 / 汇报、管理员下发停止指令，才允许停止；停止时按下面格式汇报。回合被平台收尾时先落盘并续挂 `wait`，不算停止。
 
 ## 何时停止（默认永不停止）
 
@@ -445,8 +466,10 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch --file out/RECEIPT.md --tas
 任一情形才允许停止**，停止时输出汇报：
 
 - 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
-- 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
-- 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+- 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令。
+
+回合结束不在停止条件里：本环境回合必然结束。结束前落盘状态并按唤醒链续挂后台 `wait`，
+下轮续跑；这不构成任务收尾。
 
 > 「任务做完 + 一次 wait 没新消息」**不在**停止条件里——它是循环的常态，不是终点。
 
