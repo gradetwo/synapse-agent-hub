@@ -493,6 +493,7 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 | 场景 | 后果 | 对策 |
 |---|---|---|
 | agent 崩溃在任务中 | 任务永锁 | 默认 12h 租约 + cron 回收 + `task.reclaimed` |
+| 管理员在 agent 做工时转派/取回 | 已完成工作被判越权 | 有效租约默认 409 `task_active_lease`；`force:true` 才覆盖，并向旧 owner 定向发停止通知 |
 | 消息重复投递 | 重复产出 | `dedupe_key` 双端去重 |
 | 处理一半崩溃 | 产出残缺 | 游标只在成功后前移 |
 | 长任务漏拍 | 假 offline | `late` 中间档 + 抖动 |

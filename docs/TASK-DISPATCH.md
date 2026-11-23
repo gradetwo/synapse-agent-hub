@@ -67,19 +67,24 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 
 ### 3.3 Admin 取回
 
-`POST /admin/p/{project}/tasks/reclaim`，body `{task_id}`。
+`POST /admin/p/{project}/tasks/reclaim`，body `{task_id, reason?, force?}`。
 - 任意非 `done` 任务 → `open`。
 - `owner=null`、`lease_until=0`、`to=null`：回到公共池，任何节点都可 claim。
-- 保留 `pending_submissions`；`reclaimed_at` 记录时间。
-- 事件 `kind="reclaimed"`，payload 带 `prev_owner`、`prev_to`。
+- **有效租约保护**：任务仍是 `claimed` 且 `lease_until` 未到期时，默认返回 `409 task_active_lease`，带 `owner`、`lease_until`，不改变任何状态。管理员确认覆盖才传 `force:true`。
+- `force:true` 覆盖时，向旧 owner 定向发 `kind="reclaimed_away"`，要求它停止修改与提交；任务事件带 `forced:true`。
+- 保留 `pending_submissions`；`reclaimed_at`、`reclaimed_from` 记录时间和旧 owner。
+- 事件 `kind="reclaimed"`，payload 带 `prev_owner`、`prev_to`、`forced`。
 
 ### 3.4 Admin 转派
 
-`POST /admin/p/{project}/tasks/reassign`，body `{task_id, to}`。
+`POST /admin/p/{project}/tasks/reassign`，body `{task_id, to, reason?, force?}`。
 - 任意非 `done` 任务 → `open`，`to=<新节点>`。
+- **有效租约保护**：任务仍是 `claimed` 且 `lease_until` 未到期时，默认返回 `409 task_active_lease`，带 `owner`、`lease_until`，不改变任何状态。管理员确认覆盖才传 `force:true`。
+- `force:true` 覆盖时，向旧 owner 定向发 `kind="reassigned_away"`，要求它停止修改与提交；任务事件带 `forced:true`。
+- 同人转派（`claimed` 且 `owner` 已是 `to`）是 no-op，不会把任务重置成 `open`。
 - `owner=null`、`lease_until=0`；旧 owner 立即失去操作权（再 release 会 `not_owner`）。
 - 校验目标 agent 在项目内存在、未吊销、未过期；允许目标离线（离线节点上线后 claim）。
-- 事件 `kind="reassigned"`，payload 带 `prev_owner`、`to`。
+- 事件 `kind="reassigned"`，payload 带 `prev_owner`、`to`、`forced`。
 
 状态迁移表：
 
@@ -110,8 +115,8 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 GET  /admin/p/{project}/tasks
 POST /admin/p/{project}/tasks                 # 创建/派单
 POST /admin/p/{project}/tasks/close           # 完成
-POST /admin/p/{project}/tasks/reclaim         # 取回
-POST /admin/p/{project}/tasks/reassign        # 转派
+POST /admin/p/{project}/tasks/reclaim         # 取回；活跃租约需 force:true
+POST /admin/p/{project}/tasks/reassign        # 转派；活跃租约需 force:true
 ```
 
 列表响应在 Task 基础上补：
@@ -142,8 +147,8 @@ POST /admin/p/{project}/tasks/reassign        # 转派
 - **台账列**：任务、状态、执行节点、租约、待取交付、更新时间、操作。
 - **操作**：完成、取回、转派。
   - 完成：二次确认；有 pending 交付时提示「交付仍留在交付箱」。
-  - 取回：回到公共池，清空 `to`。
-  - 转派：行内 agent 选择器；目标离线也允许。
+  - 取回：回到公共池，清空 `to`；活跃租约先提示 owner/到期时间，确认后才带 `force:true` 重试。
+  - 转派：行内 agent 选择器；目标离线也允许；活跃租约同样先提示再强制覆盖。
 - **计数**：tab 上显示 active 任务数；空/全部项目视图明确提示「选择具体项目」。
 
 UI 不直接改任务状态；所有动作都走上面的 API，页面刷新以中枢为准。

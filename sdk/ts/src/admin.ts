@@ -37,12 +37,12 @@ export class Admin {
     return this.c.reqPost(this.p("/tasks/close"), { task_id: taskId, reason });
   }
 
-  reclaimTask(taskId: string, reason = ""): Promise<any> {
-    return this.c.reqPost(this.p("/tasks/reclaim"), { task_id: taskId, reason });
+  reclaimTask(taskId: string, reason = "", force = false): Promise<any> {
+    return this.c.reqPost(this.p("/tasks/reclaim"), { task_id: taskId, reason, ...(force ? { force: true } : {}) });
   }
 
-  reassignTask(taskId: string, to: string, reason = ""): Promise<any> {
-    return this.c.reqPost(this.p("/tasks/reassign"), { task_id: taskId, to, reason });
+  reassignTask(taskId: string, to: string, reason = "", force = false): Promise<any> {
+    return this.c.reqPost(this.p("/tasks/reassign"), { task_id: taskId, to, reason, ...(force ? { force: true } : {}) });
   }
 
   send(to: string[], title = "", body = "", ack = true, kind = "task"): Promise<any> {

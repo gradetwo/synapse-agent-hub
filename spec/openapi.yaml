@@ -606,6 +606,47 @@ paths:
       responses:
         '200': { description: 任务创建成功 }
         '409': { description: task_exists }
+  /admin/p/{project}/tasks/reclaim:
+    post:
+      summary: 取回任务到公共池
+      description: 任务仍被有效 claim 租约持有时默认返回 409 task_active_lease；管理员确认覆盖必须显式传 force=true，并向旧 owner 发停止通知。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id]
+              properties:
+                task_id: { type: string }
+                reason: { type: string, maxLength: 240 }
+                force: { type: boolean, default: false, description: 覆盖有效租约时必须显式置 true }
+      responses:
+        '200': { description: 已取回，返回 task }
+        '409': { description: task_done / task_active_lease }
+  /admin/p/{project}/tasks/reassign:
+    post:
+      summary: 转派任务（活跃租约默认拒绝）
+      description: 任务仍被有效 claim 租约持有时默认返回 409 task_active_lease；管理员确认覆盖必须显式传 force=true，并向旧 owner 发停止通知。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_id, to]
+              properties:
+                task_id: { type: string }
+                to: { type: string }
+                reason: { type: string, maxLength: 240 }
+                force: { type: boolean, default: false, description: 覆盖有效租约时必须显式置 true }
+      responses:
+        '200': { description: 已转派，返回 task }
+        '409': { description: task_done / task_active_lease }
   /admin/p/{project}/issues:
     get:
       summary: Issue 台账

@@ -778,6 +778,22 @@ async function api(path, method = "GET", body, _retried = false) {
 
 class AuthError extends Error {}
 
+/** 任务取回/转派：有效租约默认 409；管理员确认后才带 force:true 重试。 */
+async function adminTaskAction(path, body, label) {
+  try {
+    return await api(path, "POST", body);
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    if (!msg.includes("task_active_lease")) throw e;
+    let d = {};
+    try { d = JSON.parse(msg.slice(msg.indexOf("{"))); } catch { /* 保留空对象 */ }
+    const owner = d.owner || "其他节点";
+    const until = d.lease_until ? new Date(Number(d.lease_until)).toLocaleString() : "租约到期";
+    if (!confirm(`任务仍在 ${owner} 的有效租约内（至 ${until}）。强制${label}会让对方正在做的工作失效，确定继续？`)) return null;
+    return api(path, "POST", { ...body, force: true });
+  }
+}
+
 /* ── 锁屏 ─────────────────────────────────────────── */
 function lock(msg) {
   document.body.classList.add("locked");
@@ -2776,7 +2792,8 @@ document.addEventListener("click", async (e) => {
       if (!confirm(`取回任务 ${tr}？会清空执行节点与定向，回到公共池，交付保留。`)) return;
       const reason = prompt("修正理由（写入任务审计）", "管理员取回公共池");
       if (reason === null) return;
-      await api(`/admin/p/${current}/tasks/reclaim`, "POST", { task_id: tr, reason });
+      const r = await adminTaskAction(`/admin/p/${current}/tasks/reclaim`, { task_id: tr, reason }, "取回");
+      if (!r) return;
       showToast(`已取回 ${tr}`, 5000);
       return refresh();
     }
@@ -2790,7 +2807,8 @@ document.addEventListener("click", async (e) => {
       if (!confirm(`把 ${tas} 转派给 ${to}？旧节点会失去 claim。`)) return;
       const reason = prompt("修正理由（写入任务审计）", `管理员转派给 ${to}`);
       if (reason === null) return;
-      await api(`/admin/p/${current}/tasks/reassign`, "POST", { task_id: tas, to, reason });
+      const r = await adminTaskAction(`/admin/p/${current}/tasks/reassign`, { task_id: tas, to, reason }, "转派");
+      if (!r) return;
       showToast(`已转派 ${tas} → ${to}`, 5000);
       return refresh();
     }

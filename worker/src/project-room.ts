@@ -623,6 +623,46 @@ export class ProjectRoom implements DurableObject {
     return String(b?.reason ?? "").trim().slice(0, 240);
   }
 
+  /** 任务是否仍处于有效 claim 租约内；DO 单线程，检查与写入之间不会被并发穿插。 */
+  private activeLease(t: any, now = Date.now()): boolean {
+    return t?.state === "claimed" && !!t.owner && Number(t.lease_until ?? 0) > now;
+  }
+
+  /** 管理侧要覆盖有效租约时的统一拒绝体：先让 owner 释放/等到期，或显式 force。 */
+  private leaseConflict(t: any, op: string): Response {
+    const now = Date.now();
+    return json({
+      error: "task_active_lease",
+      task_id: t.task_id ?? t.id,
+      state: t.state,
+      owner: t.owner ?? null,
+      lease_until: Number(t.lease_until ?? 0),
+      lease_left_ms: Math.max(0, Number(t.lease_until ?? 0) - now),
+      hint: `任务仍在 ${t.owner} 的有效租约内；先让 owner release 或等租约到期，确认要覆盖时传 force:true 强制${op}`,
+    }, 409);
+  }
+
+  /** 强制换人/取回时定向通知旧 owner 停止工作（best-effort，不阻断管理动作）。 */
+  private async notifyLeaseEvicted(project: string, t: any, to: string | null,
+                                   reason: string, forced: boolean, kind: string) {
+    const prev = t?.owner;
+    if (!prev || prev === to) return;
+    const id = String(t.task_id ?? t.id ?? "");
+    try {
+      await this.append({
+        project, sender: "admin", topic: "task", kind, to: prev,
+        payload: {
+          task_id: id, title: t.title ?? "", body: "",
+          to, reason, forced,
+          message: "任务所有权已被管理侧收回，请立即停止该任务的修改与提交，避免交付被判越权。",
+        },
+        dedupe_key: `${kind}:${id}:${prev}:${Date.now()}`,
+      });
+    } catch (e: any) {
+      console.warn(`${kind} notify failed`, id, e?.message ?? e);
+    }
+  }
+
   private taskIdOf(b: any): string | null {
     const id = String(b?.task_id ?? "").trim();
     return id || null;
@@ -664,16 +704,22 @@ export class ProjectRoom implements DurableObject {
     const { t, project } = got;
     if (t.state === "done") return json({ error: "task_done", task_id: t.task_id ?? t.id }, 409);
     const now = Date.now();
+    const forced = b?.force === true;
+    // 互斥/租约保护：claim 仍在有效期内时，管理侧不能静默把任务抽回公共池。
+    // DO 是单线程，activeLease 检查与后面的 put 之间不会被其他 claim 穿插。
+    if (this.activeLease(t, now) && !forced) return this.leaseConflict(t, "取回");
     const reason = this.adminReason(b);
+    const prevOwner = t.owner ?? null;
     const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
     const task = { ...t, state: "open", owner: null, lease_until: 0, to: null,
                    pending_submissions: pending, updated_at: now, reclaimed_at: now,
-                   reclaimed_from: t.owner ?? null };
+                   reclaimed_from: prevOwner, forced_reclaim: forced };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    if (prevOwner) await this.notifyLeaseEvicted(project, t, null, reason, forced, "reclaimed_away");
     await this.append({ project, sender: "admin", topic: "task", kind: "reclaimed",
                         payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
-                                   prev_state: t.state, prev_owner: t.owner ?? null,
-                                   prev_to: t.to ?? null, reason },
+                                   prev_state: t.state, prev_owner: prevOwner,
+                                   prev_to: t.to ?? null, reason, forced },
                         dedupe_key: `admin-reclaim:${t.task_id ?? t.id}:${now}` });
     return json({ ok: true, task });
   }
@@ -685,22 +731,31 @@ export class ProjectRoom implements DurableObject {
     if (t.state === "done") return json({ error: "task_done", task_id: t.task_id ?? t.id }, 409);
     const to = String(b.to ?? "").trim();
     if (!to) return json({ error: "assignee_required" }, 422);
+    const now = Date.now();
+    // 同人转派是 no-op，不能把正在 claimed 的任务重置成 open，否则等于静默丢锁。
+    if (t.state === "claimed" && t.owner === to)
+      return json({ ok: true, task: t, already: true, brief_embedded: true });
+    const forced = b?.force === true;
+    // 互斥/租约保护：有效 claim 期间默认拒绝转派，避免正在做工的人被中途换掉。
+    if (this.activeLease(t, now) && !forced) return this.leaseConflict(t, "转派");
     const agent = await this.env.DB.prepare(
       `SELECT agent_id FROM agents WHERE project = ? AND agent_id = ?
          AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`
-    ).bind(project, to, Date.now()).first<any>();
+    ).bind(project, to, now).first<any>();
     if (!agent) return json({ error: "assignee_not_found", agent_id: to }, 422);
-    const now = Date.now();
     const reason = this.adminReason(b);
+    const prevOwner = t.owner ?? null;
     const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
     const task = { ...t, state: "open", owner: null, lease_until: 0, to,
                    pending_submissions: pending, updated_at: now,
-                   reassigned_at: now, reassigned_from: t.owner ?? t.to ?? null };
+                   reassigned_at: now, reassigned_from: prevOwner ?? t.to ?? null,
+                   forced_reassign: forced };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    if (prevOwner) await this.notifyLeaseEvicted(project, t, to, reason, forced, "reassigned_away");
     await this.append({ project, sender: "admin", topic: "task", kind: "reassigned", to,
                         payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
-                                   to, prev_state: t.state, prev_owner: t.owner ?? null,
-                                   prev_to: t.to ?? null, reason },
+                                   to, prev_state: t.state, prev_owner: prevOwner,
+                                   prev_to: t.to ?? null, reason, forced },
                         dedupe_key: `admin-reassign:${t.task_id ?? t.id}:${now}` });
     return json({ ok: true, task, brief_embedded: true });
   }

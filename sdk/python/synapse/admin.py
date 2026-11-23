@@ -95,8 +95,12 @@ class Admin:
     def task_close(self, task_id: str, reason: str = "") -> dict:
         return self._post("/tasks/close", {"task_id": task_id, "reason": reason})
 
-    def task_reclaim(self, task_id: str, reason: str = "") -> dict:
-        return self._post("/tasks/reclaim", {"task_id": task_id, "reason": reason})
+    def task_reclaim(self, task_id: str, reason: str = "", force: bool = False) -> dict:
+        """取回任务；任务仍在有效 claim 租约内时默认 409，确认覆盖才传 force=True。"""
+        payload = {"task_id": task_id, "reason": reason}
+        if force:
+            payload["force"] = True
+        return self._post("/tasks/reclaim", payload)
 
     # ── Issue 台账（管理侧）────────────────────────────────
     def issues(self, status: str = "", limit: int | None = None) -> dict:
@@ -125,8 +129,12 @@ class Admin:
             payload["body"] = body
         return self._post(f"/issues/{issue_id}/dispatch", payload)
 
-    def task_reassign(self, task_id: str, to: str, reason: str = "") -> dict:
-        return self._post("/tasks/reassign", {"task_id": task_id, "to": to, "reason": reason})
+    def task_reassign(self, task_id: str, to: str, reason: str = "", force: bool = False) -> dict:
+        """转派任务；任务仍在有效 claim 租约内时默认 409，确认覆盖才传 force=True。"""
+        payload = {"task_id": task_id, "to": to, "reason": reason}
+        if force:
+            payload["force"] = True
+        return self._post("/tasks/reassign", payload)
 
     # ── 下发 ────────────────────────────────────────────────
     def send(self, to: Iterable[str], title: str = "", body: str = "",
