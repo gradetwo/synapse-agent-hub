@@ -1,4 +1,4 @@
 Synapse agent-hub source snapshot
 build=functional-multiproject2-20261120
-sdk_version=0.5.2
-snapshot_date=2026-11-22
+sdk_version=0.5.3
+snapshot_date=2026-11-23

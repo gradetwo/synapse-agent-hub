@@ -15,7 +15,7 @@ from typing import Any, Iterable, Iterator
 
 import requests
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 def _state_dir() -> Path:
     new = os.environ.get("SYNAPSE_STATE_DIR") or os.environ.get("YANSHI_STATE_DIR")
     if new: return Path(new)
@@ -203,6 +203,13 @@ class Client:
             box.mkdir(parents=True, exist_ok=True)
             (box / f"{key.replace(':', '_')}.json").write_text(json.dumps(body))
             return {"queued": True, "dedupe_key": key}
+
+    def report_issue(self, title: str, body: str = "", priority: str = "normal",
+                     labels: str = "") -> dict:
+        """上报 issue；所有 agent 默认可上报（服务端不要求 issues.report scope）。"""
+        return self._post(f"/p/{self.project}/issues",
+                          {"title": title, "body": body,
+                           "priority": priority, "labels": labels})
 
     def drain_outbox(self) -> dict:
         box = self.state_dir / "outbox"

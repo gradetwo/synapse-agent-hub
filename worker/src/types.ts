@@ -17,7 +17,7 @@ export interface Msg {
   seq: number;
   project?: string;
   sender: string;
-  topic: "announce" | "task" | "artifact" | "report" | "ack" | "status" | "alert" | "admin";
+  topic: "announce" | "task" | "artifact" | "report" | "ack" | "status" | "alert" | "admin" | "issue";
   kind: string;
   payload: unknown;
   dedupe_key?: string;
@@ -43,6 +43,8 @@ export interface Task {
   created_at?: number;
   updated_at?: number;
   created_by?: string;
+  /** 由 issue 派发出的任务；任务 done 时用于回写 issues.status=closed */
+  issue_id?: string | null;
   closed_at?: number;
   closed_by?: "agent" | "admin" | "collection";
   reclaimed_at?: number;

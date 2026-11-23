@@ -323,7 +323,7 @@ export class ProjectRoom implements DurableObject {
         b.project ?? "unknown", b.agent_id, bucket,
         b.load?.cpu_pct ?? null, b.load?.mem_used_mb ?? null, b.load?.mem_total_mb ?? null,
         b.load?.disk?.[0]?.used_pct ?? null, b.work?.state ?? null
-      ).run();
+      ).run().catch(() => {});   // 心跳不能因 D1 配额/抖动失败；DO 仍会续租
     }
     return json({ ok: true, next_in_s: 60, server_ms: now });
   }
@@ -338,6 +338,9 @@ export class ProjectRoom implements DurableObject {
     if (old) return json({ error: "task_exists", task_id: id }, 409);
     const now = Date.now();
     const to = b.to === undefined || b.to === null || String(b.to).trim() === "" ? null : String(b.to).trim();
+    const issueId = b.issue_id === undefined || b.issue_id === null || String(b.issue_id).trim() === ""
+      ? null : String(b.issue_id).trim();
+    if (issueId && !/^[A-Za-z0-9._:-]{1,128}$/.test(issueId)) return json({ error: "bad_issue_id" }, 422);
     if (to) {
       const project = String(b.project ?? this.projectName());
       const active = await this.env.DB.prepare(
@@ -349,7 +352,7 @@ export class ProjectRoom implements DurableObject {
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
                      project: b.project ?? this.projectName(),
                      owner: null, lease_until: 0, created_at: now, updated_at: now,
-                     created_by: b.sender ?? "admin", to };
+                     created_by: b.sender ?? "admin", to, issue_id: issueId };
     await this.st.put(`task:${id}`, t);
     const seq = await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task",
                                    kind: "task", to: to ?? undefined,
@@ -457,6 +460,38 @@ export class ProjectRoom implements DurableObject {
     return Number(row?.n ?? 0);
   }
 
+  /**
+   * issue → task 的反向联动：任务真正 done 时自动关闭源 issue。
+   * 只关闭仍为 open 的 issue，不覆盖人工关闭/合并；D1 失败不能影响任务结算。
+   */
+  private async closeIssueForTask(t: any) {
+    const issueId = t?.issue_id;
+    if (!issueId) return;
+    const project = String(t?.project ?? this.projectName());
+    const taskId = String(t?.task_id ?? t?.id ?? "");
+    const now = Date.now();
+    await this.env.DB.prepare(
+      `UPDATE issues SET status = 'closed', closed_at = ?, closed_by = 'task',
+         close_reason = ?, updated_at = ?
+       WHERE project = ? AND issue_id = ? AND status = 'open'`
+    ).bind(now, `task_done:${taskId}`, now, project, issueId).run()
+      .catch((e: any) => console.warn("issue auto-close failed", issueId, e));
+  }
+
+  /** 任务因交付被拒而重新打开时，把同一任务自动关闭的 issue 也恢复为 open。 */
+  private async reopenIssueForTask(t: any) {
+    const issueId = t?.issue_id;
+    if (!issueId) return;
+    const project = String(t?.project ?? this.projectName());
+    const now = Date.now();
+    await this.env.DB.prepare(
+      `UPDATE issues SET status = 'open', closed_at = NULL, closed_by = NULL,
+         close_reason = NULL, updated_at = ?
+       WHERE project = ? AND issue_id = ? AND status = 'closed' AND closed_by = 'task'`
+    ).bind(now, project, issueId).run()
+      .catch((e: any) => console.warn("issue auto-reopen failed", issueId, e));
+  }
+
   private async release(b: any) {
     const t: any = await this.st.get(`task:${b.task_id}`);
     if (!t) return json({ error: "not_found" }, 404);
@@ -481,7 +516,9 @@ export class ProjectRoom implements DurableObject {
                          updated_at: now, released_by: b.agent_id };
     if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
     if (state === "blocked") { patch.blocked_at = now; }
-    await this.st.put(`task:${b.task_id}`, { ...t, ...patch });
+    const next = { ...t, ...patch };
+    await this.st.put(`task:${b.task_id}`, next);
+    if (state === "done") await this.closeIssueForTask(next);
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: state,
                         payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                    pending_submissions: pending,
@@ -506,9 +543,11 @@ export class ProjectRoom implements DurableObject {
     // 已结任务被明确 rejected：重新打开，绝不让拒收留在 done。
     if (b.reopen_on_reject === true && t.state === "done") {
       state = "open";
-      await this.st.put(`task:${b.task_id}`, { ...t, state, owner: null, lease_until: 0,
+      const reopened = { ...t, state, owner: null, lease_until: 0,
         pending_submissions: pending, pending_review: pendingReview, updated_at: Date.now(),
-        closed_at: null, closed_by: null, reopened_at: Date.now(), reopened_by: "review" });
+        closed_at: null, closed_by: null, reopened_at: Date.now(), reopened_by: "review" };
+      await this.st.put(`task:${b.task_id}`, reopened);
+      await this.reopenIssueForTask(reopened);
       await this.append({ project, sender: b.sender ?? "admin", topic: "task", kind: "open",
                           payload: { task_id: b.task_id, reopened_by: "review", reason: "delivery_rejected" },
                           dedupe_key: `reopen:${b.task_id}:${Date.now()}` });
@@ -520,10 +559,12 @@ export class ProjectRoom implements DurableObject {
     if (canClose) {
       state = "done";
       const now = Date.now();
-      await this.st.put(`task:${b.task_id}`, { ...t, state, owner: null, lease_until: 0,
-                                               pending_submissions: 0, pending_review: pendingReview,
-                                               updated_at: now, closed_at: now,
-                                               closed_by: b.closed_by === "approval" ? "approval" : "collection" });
+      const closed = { ...t, state, owner: null, lease_until: 0,
+                       pending_submissions: 0, pending_review: pendingReview,
+                       updated_at: now, closed_at: now,
+                       closed_by: b.closed_by === "approval" ? "approval" : "collection" };
+      await this.st.put(`task:${b.task_id}`, closed);
+      await this.closeIssueForTask(closed);
       await this.append({ project, sender: b.sender ?? "admin", topic: "task", kind: "done",
                           payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                      closed_by: b.closed_by === "approval" ? "approval" : "collection",
@@ -607,6 +648,7 @@ export class ProjectRoom implements DurableObject {
                    pending_submissions: pending, updated_at: now,
                    closed_at: now, closed_by: "admin" };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    await this.closeIssueForTask(task);
     await this.append({ project, sender: "admin", topic: "task", kind: "done",
                         payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
                                    closed_by: "admin", pending_submissions: pending,

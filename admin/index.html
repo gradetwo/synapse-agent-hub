@@ -76,6 +76,13 @@ if (location.search.includes("reset=1")) {
   .badge.approved{color:#86d99e;border-color:#1d3a25;background:#101b13}
   .badge.rejected{color:#ff9b9b;border-color:#5b2626;background:#211012}
   .badge.overtake{color:#ffb86b;border-color:#6b4218;background:#24180e}
+  .badge.issue-open{color:#ffd58a;border-color:#674b18;background:#241b0e}
+  .badge.issue-closed{color:#86d99e;border-color:#1d3a25;background:#101b13}
+  .badge.issue-merged{color:#8fb8ff;border-color:#24406e;background:#101a2a}
+  .badge.pri-low{color:#8b95a5;border-color:#2a333f}
+  .badge.pri-normal{color:#9aa4b2;border-color:#2a333f}
+  .badge.pri-high{color:#ffb86b;border-color:#6b4218}
+  .badge.pri-urgent{color:#ff9b9b;border-color:#5b2626;background:#211012}
   .taskForm .row{grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr)}
   .taskForm .row3{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:10px;align-items:center}
   .taskForm .row3 > .muted{grid-column:1/-1;font-size:11px;line-height:1.5}
@@ -215,7 +222,7 @@ if (location.search.includes("reset=1")) {
   .who{display:flex;flex-wrap:wrap;gap:8px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#11161d}
   .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid #232a33;border-radius:8px;background:#151b23}
   .whoItem input{width:auto;height:15px;min-height:0;margin:0;flex:0 0 auto}
-  .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(6,minmax(0,1fr))}
+  .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(7,minmax(0,1fr))}
   .stat{position:relative;background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;overflow:hidden}
   .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:transparent}
   .stat.ok::before{background:var(--ok)}
@@ -384,6 +391,12 @@ if (location.search.includes("reset=1")) {
             <span class="num" id="dashSubTotal">—</span>
           </div>
           <div class="legend" id="dashSubLegend"></div>
+          <div class="miniRow" style="margin-top:10px">
+            <span class="lab">Issue</span>
+            <div class="stack" id="dashIssueBar"></div>
+            <span class="num" id="dashIssueTotal">—</span>
+          </div>
+          <div class="legend" id="dashIssueLegend"></div>
           <button class="dashWarn" id="dashStale" hidden></button>
         </div>
         <div class="dashTile">
@@ -393,7 +406,7 @@ if (location.search.includes("reset=1")) {
         </div>
         <div class="dashTile">
           <div class="dashHead">近 7 天 <span id="dashTrendTotal" class="muted"></span></div>
-          <canvas id="dashTrendChart" aria-label="近七天消息与交付趋势"></canvas>
+          <canvas id="dashTrendChart" aria-label="近七天消息、交付与 Issue 趋势"></canvas>
           <div class="legend" id="dashTrendLegend"></div>
         </div>
       </div>
@@ -465,6 +478,19 @@ if (location.search.includes("reset=1")) {
         <th>任务</th><th>状态</th><th>执行节点</th><th>租约</th><th class="num">待取</th><th class="num">裁决</th><th>更新</th><th>操作</th>
       </tr></thead>
       <tbody id="tasks"><tr><td colspan="8" class="empty">选择具体项目查看任务</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Issue <span class="muted" id="issueStat"></span></h2>
+    <div class="muted" style="font-size:11px;margin:-2px 0 6px">
+      所有 agent 可上报；关闭 / 合并 / 重新打开 / 派发任务仅管理员可操作。任务完成会自动关闭来源 Issue。
+    </div>
+    <table>
+      <thead><tr>
+        <th>Issue</th><th>状态</th><th>优先级</th><th>报告者</th><th>关联任务</th><th>更新</th><th>操作</th>
+      </tr></thead>
+      <tbody id="issues"><tr><td colspan="7" class="empty">暂无 Issue</td></tr></tbody>
     </table>
   </div>
 
@@ -650,7 +676,8 @@ let refreshEpoch = 0;              // 切换项目/并发刷新时，旧请求�
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
 let TASK_ROWS = [];                // 最近一次任务台账快照（任务 tab 用）
-let ANALYTICS = { daily: [], submission_states: {}, totals: {} };
+let ISSUE_ROWS = [];               // 最近一次 Issue 台账快照
+let ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
 let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
 let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
 let toastTimer = null;
@@ -825,7 +852,7 @@ function activateProject(project) {
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
-  ANALYTICS = { daily: [], submission_states: {}, totals: {} };
+  ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
   fillDetailProjects();
   connectLive();
 }
@@ -973,6 +1000,90 @@ async function loadTasks() {
   reapplyFilters();
   renderDashboard();
   syncBulkAvailability();
+}
+
+const ISSUE_STATE_LABEL = { open: "待处理", closed: "已关闭", merged: "已合并" };
+const ISSUE_PRIORITY_LABEL = { low: "低", normal: "普通", high: "高", urgent: "紧急" };
+
+async function loadIssues() {
+  const project = current;
+  const isAll = project === "*";
+  let rows = [];
+  const counts = { open: 0, closed: 0, merged: 0 };
+  if (isAll) {
+    const projects = (allProjects || []).filter((p) => p.project !== "*");
+    const got = await Promise.allSettled(projects.map((p) => api(`/admin/p/${p.project}/issues`)));
+    if (current !== project) return;
+    got.forEach((r, i) => {
+      if (r.status !== "fulfilled") { console.warn("[hub] issue list failed", projects[i]?.project, r.reason); return; }
+      const d = r.value || {};
+      const list = Array.isArray(d) ? d : (d.issues || []);
+      rows.push(...list.map((x) => ({ ...x, project: projects[i].project })));
+      const c = d.counts || {};
+      for (const k of ["open", "closed", "merged"]) counts[k] += Number(c[k] ?? 0);
+    });
+  } else {
+    const d = await api(`/admin/p/${project}/issues`);
+    if (current !== project) return;
+    rows = Array.isArray(d) ? d : (d.issues || []);
+    const c = d.counts || {};
+    for (const k of ["open", "closed", "merged"]) counts[k] = Number(c[k] ?? 0);
+  }
+  const rank = (st) => st === "open" ? 0 : st === "closed" ? 1 : 2;
+  rows.sort((a, b) => rank(a.status) - rank(b.status)
+    || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
+  ISSUE_ROWS = rows;
+  const open = counts.open;
+  const total = counts.open + counts.closed + counts.merged;
+  $("issueStat").textContent = `${open} 待处理 · ${counts.closed} 已关闭 · ${counts.merged} 已合并 · 共 ${total}`
+    + (isAll ? " · 全部项目" : "");
+  BADGES.issue = open;
+  updateBadges();
+  renderIssueRows();
+  renderDashboard();
+}
+
+function renderIssueRows() {
+  const isAll = current === "*";
+  const rows = ISSUE_ROWS || [];
+  $("issues").innerHTML = rows.length ? rows.map((i) => {
+    const id = i.issue_id || "";
+    const st = i.status || "open";
+    const pri = i.priority || "normal";
+    const projectTag = isAll ? `<span class="muted" style="font-size:10px">${esc(i.project || "—")}</span><br>` : "";
+    const merged = i.merged_into ? `<div class="muted" style="font-size:10px">并入 ${esc(i.merged_into)}</div>` : "";
+    const taskCell = i.task_id
+      ? `<span class="mono">${esc(i.task_id)}</span>${st === "closed" && i.closed_by === "task"
+          ? `<div class="muted" style="font-size:10px">任务完成自动关闭</div>` : ""}`
+      : `<span class="muted">—</span>`;
+    let acts = `<span class="muted">切到项目</span>`;
+    if (!isAll) {
+      if (st === "open" && !i.task_id) {
+        acts = `<select class="mini issueAgent" data-issue-agent="${esc(id)}" title="派发目标">${taskAgentOptions("", false)}</select>
+          <button class="ghost mini" data-issue-dispatch="${esc(id)}">派发</button>
+          <button class="ghost mini" data-issue-merge="${esc(id)}">合并</button>
+          <button class="ghost mini" data-issue-close="${esc(id)}">关闭</button>`;
+      } else if (st === "open" && i.task_id) {
+        acts = `<span class="badge issue-open">已派发</span>
+          <button class="ghost mini" data-issue-close="${esc(id)}">关闭</button>`;
+      } else {
+        acts = `<button class="ghost mini" data-issue-reopen="${esc(id)}">重新打开</button>`;
+      }
+    }
+    const title = `<span class="mono">${esc(id)}</span><div style="white-space:normal;max-width:300px">${esc(i.title || "")}</div>`
+      + (i.body ? `<div class="muted" style="white-space:normal;max-width:300px;font-size:10px">${esc(String(i.body).slice(0, 120))}${String(i.body).length > 120 ? "…" : ""}</div>` : "")
+      + merged;
+    return `<tr data-issue-id="${esc(id)}" data-state="${esc(st)}" data-priority="${esc(pri)}" data-task="${esc(i.task_id || "")}" data-project="${esc(i.project || current)}">
+      <td>${projectTag}${title}</td>
+      <td><span class="badge issue-${esc(st)}">${esc(ISSUE_STATE_LABEL[st] || st)}</span></td>
+      <td><span class="badge pri-${esc(pri)}">${esc(ISSUE_PRIORITY_LABEL[pri] || pri)}</span></td>
+      <td class="mono">${esc(i.reporter || "—")}</td>
+      <td>${taskCell}</td>
+      <td class="muted">${i.updated_at ? ago((Date.now() - i.updated_at) / 1000) + "前" : "—"}</td>
+      <td style="white-space:nowrap">${acts}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">${isAll ? "全部项目还没有 Issue" : "当前项目还没有 Issue"}</td></tr>`;
+  reapplyFilters();
 }
 
 async function loadSubs() {
@@ -1308,7 +1419,8 @@ function drawTrend(cv, daily) {
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
   const rows = (daily || []).slice(-7);
-  const max = Math.max(1, ...rows.map((x) => Math.max(Number(x.messages) || 0, Number(x.submissions) || 0)));
+  const max = Math.max(1, ...rows.map((x) => Math.max(Number(x.messages) || 0,
+    Number(x.submissions) || 0, Number(x.issues) || 0)));
   const pad = { l: 5, r: 5, t: 13, b: 17 };
   const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
   g.strokeStyle = "#1d2530"; g.lineWidth = 1;
@@ -1323,15 +1435,19 @@ function drawTrend(cv, daily) {
     g.textAlign = "center"; g.fillText("暂无活动", w / 2, h / 2);
     return;
   }
-  const gw = pw / rows.length, bw = Math.max(3, gw * 0.26);
+  const gw = pw / rows.length, bw = Math.max(2, gw * 0.2);
   rows.forEach((row, i) => {
     const x = pad.l + gw * i + gw / 2;
     const m = Number(row.messages) || 0, s = Number(row.submissions) || 0;
-    const mh = (m / max) * ph, sh = (s / max) * ph;
+    const iss = Number(row.issues) || 0;
+    const mh = (m / max) * ph, sh = (s / max) * ph, ih = (iss / max) * ph;
+    const left = x - (bw * 3 + 2) / 2;
     g.fillStyle = "#6aa9ff";
-    g.fillRect(x - bw - 1, pad.t + ph - mh, bw, mh);
+    g.fillRect(left, pad.t + ph - mh, bw, mh);
     g.fillStyle = "#56d364";
-    g.fillRect(x + 1, pad.t + ph - sh, bw, sh);
+    g.fillRect(left + bw + 1, pad.t + ph - sh, bw, sh);
+    g.fillStyle = "#d29922";
+    g.fillRect(left + (bw + 1) * 2, pad.t + ph - ih, bw, ih);
     g.fillStyle = "#7d8798"; g.font = "8px ui-monospace,monospace"; g.textAlign = "center";
     g.fillText(String(row.day || "").slice(5), x, h - 5);
   });
@@ -1410,7 +1526,7 @@ function renderDashboard() {
         return `<button class="projChip" data-goto-project="${p.project}" title="切到该项目">
           <i class="dot ${agents.length && online === agents.length ? "alive" : online > 0 ? "late" : "offline"}"></i>
           <b>${esc(p.display_name || p.project)}</b>
-          <span>${active} 活跃 · ${online}/${agents.length} 在线</span></button>`;
+          <span>${active} 活跃 · ${online}/${agents.length} 在线 · ${(ISSUE_ROWS || []).filter((i) => (i.project || "") === p.project && i.status === "open").length} Issue</span></button>`;
       }).join("");
     }
   }
@@ -1425,6 +1541,17 @@ function renderDashboard() {
   $("dashSubTotal").textContent = subTotal ? `${subTotal}` : "—";
   renderStack($("dashSubBar"), subParts);
   renderLegend($("dashSubLegend"), subParts, "sub");
+
+  const issueStates = ANALYTICS.issue_states || {};
+  const issueParts = [
+    { key: "open", label: "待处理", color: "#d29922", value: Number(issueStates.open) || 0 },
+    { key: "closed", label: "已关闭", color: "#56d364", value: Number(issueStates.closed) || 0 },
+    { key: "merged", label: "已合并", color: "#6aa9ff", value: Number(issueStates.merged) || 0 },
+  ];
+  const issueTotal = issueParts.reduce((a, p) => a + p.value, 0);
+  $("dashIssueTotal").textContent = issueTotal ? `${issueTotal}` : "—";
+  renderStack($("dashIssueBar"), issueParts);
+  renderLegend($("dashIssueLegend"), issueParts, "issue");
 
   const agentParts = [
     { key: "work:idle", label: "空闲", color: "#56d364", value: 0 },
@@ -1447,12 +1574,14 @@ function renderDashboard() {
 
   const daily = ANALYTICS.daily || [];
   const sums = ANALYTICS.totals || {};
-  $("dashTrendTotal").textContent = daily.length ? `${sums.messages ?? 0} 条消息 · ${sums.submissions ?? 0} 交付` : "";
+  $("dashTrendTotal").textContent = daily.length
+    ? `${sums.messages ?? 0} 条消息 · ${sums.submissions ?? 0} 交付 · ${sums.issues ?? 0} Issue` : "";
   drawTrend($("dashTrendChart"), daily);
   const trendLegend = $("dashTrendLegend");
   if (trendLegend) trendLegend.innerHTML =
     `<span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#6aa9ff"></i>消息</span>
-     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#56d364"></i>交付</span>`;
+     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#56d364"></i>交付</span>
+     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#d29922"></i>Issue</span>`;
 }
 
 let dashResizeTimer = null;
@@ -1491,17 +1620,17 @@ let detailReady = false;
 const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes"];
 const TASK_SCOPES = ["tasks.claim", "tasks.release"];
 const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TASK_SCOPES,
-                      "artifact.read","artifact.write","submissions.create"];
+                      "artifact.read","artifact.write","submissions.create","issues.report"];
 const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",...TASK_SCOPES,
-                           "artifact.read","artifact.write","submissions.create"];
+                           "artifact.read","artifact.write","submissions.create","issues.report"];
 // 详情页可编辑的权限：管理员身份本身用“授予/收回管理”切换，不混进这里。
 const SCOPE_OPTIONS = [...TASK_SCOPES, "heartbeat", "poll", "report", "ack", "publish",
-                       "submissions.create", "artifact.write", "artifact.read"];
+                       "submissions.create", "artifact.write", "artifact.read", "issues.report"];
 const SCOPE_LABELS = {
   "tasks.claim": "领取任务", "tasks.release": "完成任务",
   heartbeat: "心跳", poll: "收件", report: "上报", ack: "回执",
   publish: "广播（旧任务权限）", "submissions.create": "创建交付",
-  "artifact.write": "上传产物", "artifact.read": "读取产物",
+  "artifact.write": "上传产物", "artifact.read": "读取产物", "issues.report": "上报 Issue",
 };
 function scopeList(raw) {
   return (Array.isArray(raw) ? raw : String(raw || "").split(","))
@@ -1909,6 +2038,7 @@ function bindFilters() {
         { v: "ack", label: "回执" },
         { v: "artifact", label: "交付" },
         { v: "report", label: "报告" },
+        { v: "issue", label: "Issue" },
       ],
       test: (row, v) => v === "all" || (row.dataset.topic || "") === v,
     });
@@ -1956,12 +2086,24 @@ function bindFilters() {
         || (v === "review:pending" ? Number(row.dataset.review || 0) > 0
           : (v === "stale" ? row.dataset.stale === "1" : (row.dataset.state || "") === v)),
     });
+    else if (/^Issue/.test(t)) addFilter(c, "搜编号 / 标题 / 报告者", {
+      items: [
+        { v: "all", label: "全部" },
+        { v: "open", label: "待处理" },
+        { v: "closed", label: "已关闭" },
+        { v: "merged", label: "已合并" },
+        { v: "dispatched", label: "已派发" },
+      ],
+      test: (row, v) => v === "all"
+        || (v === "dispatched" ? !!row.dataset.task : (row.dataset.state || "") === v),
+    });
   });
 }
 
 const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "名册"] },
   { id: "task",     label: "任务", cards: ["任务"] },
+  { id: "issue",    label: "Issue", cards: ["Issue"] },
   { id: "msg",      label: "消息", cards: ["消息流", "定向指令", "广播"] },
   { id: "deli",     label: "交付", cards: ["交付箱"] },
   { id: "access",   label: "接入", cards: ["签发 token", "注册审批", "登录封禁"] },
@@ -1977,7 +2119,7 @@ function setCardOpen(title, open) {
   if (open) setTimeout(renderDashboard, 30);
 }
 
-const BADGES = { access: 0, deli: 0, msg: 0, task: 0 };
+const BADGES = { access: 0, deli: 0, msg: 0, task: 0, issue: 0 };
 let MSG_MAX = 0;
 let ACTIVE_TAB = "overview";
 function markMsgSeen() {
@@ -1989,7 +2131,7 @@ function markMsgSeen() {
 function updateBadges() {
   const bar = $("tabs");
   if (!bar) return;
-  Object.entries({ access: BADGES.access, deli: BADGES.deli, msg: BADGES.msg, task: BADGES.task }).forEach(([g, n]) => {
+  Object.entries({ access: BADGES.access, deli: BADGES.deli, msg: BADGES.msg, task: BADGES.task, issue: BADGES.issue }).forEach(([g, n]) => {
     const el = bar.querySelector(`[data-cnt="${g}"]`);
     if (el) el.textContent = n > 0 ? ` ${n}` : "";
   });
@@ -2194,6 +2336,7 @@ async function loadStats() {
   const d = await api("/admin/stats").catch(() => null);
   if (!d) return;
   const sub = d.submissions || {};
+  const issue = d.issues || {};
   const total = Object.values(sub).reduce((a, b) => a + b, 0);
   const items = [
     ["在线 agent", d.agents_online ?? 0, "", "ok"],
@@ -2202,6 +2345,7 @@ async function loadStats() {
     ["待审注册", d.enrollments_pending ?? 0, "", "warn"],
     ["项目", d.projects ?? 0],
     ["交付", total, `待取 ${sub.delivered ?? 0}`, "accent"],
+    ["Issue", issue.open ?? 0, `关闭 ${issue.closed ?? 0}`, "warn"],
   ];
   $("stats").innerHTML = items.map(([k, v, note, cls]) =>
     `<div class="stat${cls ? " " + cls : ""}"><div class="k">${k}</div><div class="v">${v}${note ? `<span class="sub">${note}</span>` : ""}</div></div>`).join("");
@@ -2281,11 +2425,17 @@ async function refresh() {
   if (current === "*") {
     setProjectPanels(false);
     try { await loadTasks(); } catch (e) { console.warn("[hub] loadTasks failed", e); }
+    try { await loadIssues(); } catch (e) { console.warn("[hub] loadIssues failed", e); }
     return;
   }
   setProjectPanels(true);
   // 任务台账要等 loadAgents 完成后再渲染，才能把 active/offline 标在转派下拉里
   try { await loadTasks(); } catch (e) { console.warn("[hub] loadTasks failed", e); }
+  if (epoch !== refreshEpoch) return;
+  try { await loadIssues(); } catch (e) {
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] loadIssues failed", e);
+  }
   if (epoch !== refreshEpoch) return;
   // 先取交付箱，再渲染消息流：消息里的“done + 交付待取”提示需要最新待取数
   try { await loadSubs(); } catch (e) {
@@ -2306,7 +2456,7 @@ $("proj").onchange = (e) => {
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
-  ANALYTICS = { daily: [], submission_states: {}, totals: {} };
+  ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
   fillDetailProjects();
   refresh();
   connectLive();
@@ -2462,7 +2612,7 @@ $("btnTaskCreate").onclick = async () => {
 
 document.addEventListener("click", async (e) => {
   const el = e.target;
-  const dash = el.closest && el.closest("[data-dash-task],[data-dash-sub],[data-dash-agent]");
+  const dash = el.closest && el.closest("[data-dash-task],[data-dash-sub],[data-dash-agent],[data-dash-issue]");
   if (dash) {
     const taskState = dash.getAttribute("data-dash-task");
     if (taskState) return showCardFilter("任务", "task", taskState);
@@ -2473,12 +2623,66 @@ document.addEventListener("click", async (e) => {
     }
     const agentState = dash.getAttribute("data-dash-agent");
     if (agentState) return showCardFilter("名册", "overview", agentState);
+    const issueState = dash.getAttribute("data-dash-issue");
+    if (issueState) return showCardFilter("Issue", "issue", issueState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const gp = btn.getAttribute("data-goto-project");
     if (gp) { activateProject(gp); refresh(); return; }
+    const ic = btn.getAttribute("data-issue-close");
+    if (ic) {
+      if (current === "*") return alert("先选择具体项目再操作 Issue");
+      if (!confirm(`关闭 Issue ${ic}？`)) return;
+      const reason = prompt("关闭理由（写入 Issue 台账）", "管理员关闭");
+      if (reason === null) return;
+      try {
+        await api(`/admin/p/${current}/issues/${encodeURIComponent(ic)}/close`, "POST", { reason });
+        showToast(`已关闭 ${ic}`, 5000);
+        await refresh();
+      } catch (e) { alert(`关闭失败：${e.message || e}`); }
+      return;
+    }
+    const ir = btn.getAttribute("data-issue-reopen");
+    if (ir) {
+      if (current === "*") return alert("先选择具体项目再操作 Issue");
+      if (!confirm(`重新打开 Issue ${ir}？`)) return;
+      try {
+        await api(`/admin/p/${current}/issues/${encodeURIComponent(ir)}/reopen`, "POST", {});
+        showToast(`已重新打开 ${ir}`, 5000);
+        await refresh();
+      } catch (e) { alert(`重开失败：${e.message || e}`); }
+      return;
+    }
+    const im = btn.getAttribute("data-issue-merge");
+    if (im) {
+      if (current === "*") return alert("先选择具体项目再操作 Issue");
+      const into = prompt(`把 ${im} 合并到哪个 Issue？请输入目标 Issue ID`, "");
+      if (!into) return;
+      if (!confirm(`确认把 ${im} 合并进 ${into.trim()}？合并后不可直接再派发 ${im}。`)) return;
+      try {
+        await api(`/admin/p/${current}/issues/${encodeURIComponent(im)}/merge`, "POST", { into: into.trim() });
+        showToast(`已合并 ${im} → ${into.trim()}`, 6000);
+        await refresh();
+      } catch (e) { alert(`合并失败：${e.message || e}`); }
+      return;
+    }
+    const idp = btn.getAttribute("data-issue-dispatch");
+    if (idp) {
+      if (current === "*") return alert("先选择具体项目再派发 Issue");
+      const row = btn.closest("[data-issue-id]");
+      const sel = row?.querySelector("[data-issue-agent]");
+      const to = sel?.value || "";
+      if (sel?.selectedOptions?.[0]?.disabled) return alert("该节点当前离线或不可用，请选择在线节点");
+      if (!confirm(`把 ${idp} 转成任务派发${to ? `给 ${to}` : "到公共池"}？任务完成后会自动关闭 Issue。`)) return;
+      try {
+        const r = await api(`/admin/p/${current}/issues/${encodeURIComponent(idp)}/dispatch`, "POST", { to: to || null });
+        showToast(`已派发 ${idp} → ${r.task_id || "任务"}${to ? " · " + to : ""}`, 6000);
+        await refresh();
+      } catch (e) { alert(`派发失败：${e.message || e}`); }
+      return;
+    }
     const ca = btn.getAttribute("data-collect-all");
     if (ca) return collectAll();
     const gd = btn.getAttribute("data-goto-delivery");

@@ -98,6 +98,27 @@ class Admin:
     def task_reclaim(self, task_id: str, reason: str = "") -> dict:
         return self._post("/tasks/reclaim", {"task_id": task_id, "reason": reason})
 
+    # ── Issue 台账（管理侧）────────────────────────────────
+    def issues(self, status: str = "") -> dict:
+        q = f"/issues?status={status}" if status else "/issues"
+        return self._get(q)
+
+    def issue_close(self, issue_id: str, reason: str = "管理员关闭") -> dict:
+        return self._post(f"/issues/{issue_id}/close", {"reason": reason})
+
+    def issue_reopen(self, issue_id: str) -> dict:
+        return self._post(f"/issues/{issue_id}/reopen", {})
+
+    def issue_merge(self, issue_id: str, into: str) -> dict:
+        return self._post(f"/issues/{issue_id}/merge", {"into": into})
+
+    def issue_dispatch(self, issue_id: str, to: str | None = None,
+                       task_id: str = "", body: str = "") -> dict:
+        payload: dict[str, Any] = {"to": to or None, "task_id": task_id}
+        if body:
+            payload["body"] = body
+        return self._post(f"/issues/{issue_id}/dispatch", payload)
+
     def task_reassign(self, task_id: str, to: str, reason: str = "") -> dict:
         return self._post("/tasks/reassign", {"task_id": task_id, "to": to, "reason": reason})
 

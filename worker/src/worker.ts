@@ -5,14 +5,14 @@ import CONSOLE_HTML from "../../admin/index.html";
 export { ProjectRoom } from "./project-room";
 
 const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "tasks.claim", "tasks.release",
-                      "artifact.write", "submissions.create"];
+                      "artifact.write", "submissions.create", "issues.report"];
 const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "dispatch-s1s6-20261122";
+const BUILD_TAG = "dispatch-issue-20261123";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
-const SDK_VERSION = "0.5.2";
+const SDK_VERSION = "0.5.3";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -49,7 +49,8 @@ export default {
     if (path.startsWith("/console/admin/")) {
       const u2 = new URL(req.url);
       u2.pathname = path.slice("/console".length);
-      return admin(req, env, u2);
+      try { return await admin(req, env, u2); }
+      catch (e) { console.warn("console admin route failed", e); return dbUnavailable(); }
     }
 
     // 受 Access 保护的子路径：把 Access 身份换成 8 小时 HttpOnly 会话 cookie。
@@ -142,13 +143,20 @@ export default {
     // 登录：token 换 HttpOnly 会话 cookie（token 不落前端、不进 URL）
     if ((path === "/auth/login" || path === "/admin/login") && req.method === "POST") {
       const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
-      const g = await globalCheck(env);
+      let g: Awaited<ReturnType<typeof globalCheck>>;
+      let gate: Awaited<ReturnType<typeof guardCheck>>;
+      try {
+        g = await globalCheck(env);
+        gate = await guardCheck(ip, env);
+      } catch (e) {
+        console.warn("login guard db unavailable", e);
+        return dbUnavailable();
+      }
       if (g.blocked) {
         return new Response(JSON.stringify({ error: "too_many_attempts", retry_after_s: g.retry }), {
           status: 429, headers: { "content-type": "application/json", "retry-after": String(g.retry), ...SEC_HEADERS },
         });
       }
-      const gate = await guardCheck(ip, env);
       if (gate.blocked) {
         return new Response(JSON.stringify({ error: gate.permanent ? "ip_blocked" : "too_many_attempts",
                                              retry_after_s: gate.retry }), {
@@ -157,27 +165,37 @@ export default {
       }
       const b: any = await req.json().catch(() => ({}));
       const raw = String(b.token ?? "").trim();
-      if (!raw) { await guardFail(ip, env); await globalFail(env); return err(401, "bad_credentials"); }
+      if (!raw) { await guardFail(ip, env).catch(() => {}); await globalFail(env).catch(() => {}); return err(401, "bad_credentials"); }
       const sha = await sha256(raw);
-      const row = await env.DB.prepare(
-        `SELECT agent_id FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > ?)`
-      ).bind(sha, Date.now()).first<any>();
-      if (!row) { await guardFail(ip, env); await globalFail(env); return err(401, "bad_credentials"); }
-      await guardReset(ip, env);
+      let row: any;
+      try {
+        row = await env.DB.prepare(
+          `SELECT agent_id FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL
+             AND (expires_at IS NULL OR expires_at > ?)`
+        ).bind(sha, Date.now()).first<any>();
+      } catch (e) {
+        console.warn("login token lookup failed", e);
+        return dbUnavailable();
+      }
+      if (!row) { await guardFail(ip, env).catch(() => {}); await globalFail(env).catch(() => {}); return err(401, "bad_credentials"); }
+      await guardReset(ip, env).catch(() => {});
       const cookie = await makeSession(row.agent_id, env.SESSION_SECRET, await sessEpoch(env));
       return new Response(JSON.stringify({ ok: true, agent: row.agent_id }), {
         headers: { "content-type": "application/json", "set-cookie": cookie, ...SEC_HEADERS },
       });
     }
 
-    if (path.startsWith("/admin/")) return admin(req, env, url);
+    if (path.startsWith("/admin/")) {
+      try { return await admin(req, env, url); }
+      catch (e) { console.warn("admin route failed", e); return dbUnavailable(); }
+    }
 
     // 机器通路（CLI/agent）：不在 Access 覆盖范围内，只认 Bearer token
     if (path.startsWith("/x/admin/")) {
       const u2 = new URL(url.toString());
       u2.pathname = path.replace(/^\/x\/admin/, "/admin");
-      return admin(req, env, u2);
+      try { return await admin(req, env, u2); }
+      catch (e) { console.warn("x-admin route failed", e); return dbUnavailable(); }
     }
     // 安装入口只保留 R2 上的 /dl/install.sh；旧的 /install* wrapper 已下线。
 
@@ -286,6 +304,10 @@ export default {
     // 交付创建在 Worker 侧完成（需查 R2 + 写 D1），不转发给 DO
     if (action === "submissions" && req.method === "POST")
       return createSubmission(req, env, project, auth.agentId!);
+
+    // Issue 上报同样在 Worker 侧写 D1；权限对所有 agent 默认放行（见 inScope）。
+    if (action === "issues" && req.method === "POST")
+      return createIssue(req, env, project, auth.agentId!);
 
     let pubMaxPerMin = 0;
     if (["publish", "report"].includes(action) && req.method === "POST") {
@@ -443,10 +465,15 @@ async function wsTicket(req: Request, env: Env, project: string) {
   if (!auth.ok) return err(auth.status, auth.reason!);
   const ticket = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
   const exp = Date.now() + 90_000;
-  await env.DB.prepare(
-    "INSERT INTO ws_tickets (ticket,project,agent_id,role,exp_ms,used) VALUES (?,?,?,?,?,0)"
-  ).bind(ticket, project, auth.agentId, auth.role, exp).run();
-  // 顺手清掉过期票，避免表无限增长
+  try {
+    await env.DB.prepare(
+      "INSERT INTO ws_tickets (ticket,project,agent_id,role,exp_ms,used) VALUES (?,?,?,?,?,0)"
+    ).bind(ticket, project, auth.agentId, auth.role, exp).run();
+  } catch (e) {
+    console.warn("ws-ticket insert failed", e);
+    return dbUnavailable();
+  }
+  // 顺手清掉过期票，避免表无限增长；清理失败不影响出票
   await env.DB.prepare("DELETE FROM ws_tickets WHERE exp_ms < ?").bind(Date.now() - 3600_000).run().catch(() => {});
   return json({ ticket, exp_ms: exp, ttl_s: 90 });
 }
@@ -458,24 +485,29 @@ async function wsConnect(req: Request, env: Env, project: string, url: URL) {
   const ticket = url.searchParams.get("ticket") ?? "";
   let agentId = "", role = "";
 
-  if (ticket) {
-    const row = await env.DB.prepare(
-      "SELECT project, agent_id, role, exp_ms, used FROM ws_tickets WHERE ticket = ?"
-    ).bind(ticket).first<any>();
-    if (!row || row.project !== project) return err(401, "bad_ticket");
-    if (row.used) return err(401, "ticket_used");
-    if (row.exp_ms < Date.now()) return err(401, "ticket_expired");
-    await env.DB.prepare("UPDATE ws_tickets SET used = 1 WHERE ticket = ?").bind(ticket).run();
-    agentId = row.agent_id; role = row.role;
-  } else {
-    // 浏览器控制台：Access 会话 cookie（WebSocket 不能带自定义 header，但会带 cookie）
-    const sess = (await readSession(req, env)) ?? (await accessIdentityFromCookie(req));
-    if (!sess) return err(401, "bad_ticket");
-    agentId = "admin-panel"; role = "admin";
-  }
+  try {
+    if (ticket) {
+      const row = await env.DB.prepare(
+        "SELECT project, agent_id, role, exp_ms, used FROM ws_tickets WHERE ticket = ?"
+      ).bind(ticket).first<any>();
+      if (!row || row.project !== project) return err(401, "bad_ticket");
+      if (row.used) return err(401, "ticket_used");
+      if (row.exp_ms < Date.now()) return err(401, "ticket_expired");
+      await env.DB.prepare("UPDATE ws_tickets SET used = 1 WHERE ticket = ?").bind(ticket).run();
+      agentId = row.agent_id; role = row.role;
+    } else {
+      // 浏览器控制台：Access 会话 cookie（WebSocket 不能带自定义 header，但会带 cookie）
+      const sess = (await readSession(req, env)) ?? (await accessIdentityFromCookie(req));
+      if (!sess) return err(401, "bad_ticket");
+      agentId = "admin-panel"; role = "admin";
+    }
 
-  const proj = await env.DB.prepare("SELECT status FROM projects WHERE project = ?").bind(project).first<any>();
-  if (!proj || proj.status !== "active") return err(403, "project_unavailable");
+    const proj = await env.DB.prepare("SELECT status FROM projects WHERE project = ?").bind(project).first<any>();
+    if (!proj || proj.status !== "active") return err(403, "project_unavailable");
+  } catch (e) {
+    console.warn("ws connect db failed", e);
+    return dbUnavailable();
+  }
 
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
   return stub.fetch(new Request("https://do/ws", {
@@ -487,15 +519,22 @@ async function authenticate(req: Request, env: Env, project: string) {
   const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
   if (!bearer) return { ok: false, status: 401, reason: "missing_token" as string };
   const sha = await sha256(bearer);
-  const row = await env.DB.prepare(
-    `SELECT a.agent_id, a.role, a.scopes, a.revoked_at, a.expires_at, p.status
-       FROM agents a JOIN projects p ON p.project = a.project
-      WHERE a.token_sha = ? AND a.project = ?`
-  ).bind(sha, project).first<any>();
+  let row: any;
+  try {
+    row = await env.DB.prepare(
+      `SELECT a.agent_id, a.role, a.scopes, a.revoked_at, a.expires_at, p.status
+         FROM agents a JOIN projects p ON p.project = a.project
+        WHERE a.token_sha = ? AND a.project = ?`
+    ).bind(sha, project).first<any>();
+  } catch (e) {
+    console.warn("token lookup failed", e);
+    return { ok: false, status: 503, reason: "db_unavailable" as string };
+  }
   if (!row) return { ok: false, status: 401, reason: "unauthorized" };
   if (row.revoked_at) return { ok: false, status: 401, reason: "unauthorized" };
   if (row.expires_at && row.expires_at < Date.now()) return { ok: false, status: 401, reason: "unauthorized" };
-  return { ok: true, agentId: row.agent_id, role: row.role, scopes: row.scopes.split(","),
+  return { ok: true, agentId: row.agent_id, role: row.role,
+           scopes: String(row.scopes ?? "").split(",").filter(Boolean),
            projectStatus: row.status, status: 200, reason: "" };
 }
 
@@ -509,13 +548,18 @@ function need(action: string) {
   if (action.startsWith("tasks/admin-")) return "admin";
   if (action === "tasks/list" || action === "tasks/get") return "admin"; // 台账/单任务元数据不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
+  if (action === "issues") return "issues.report";
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
 }
-const inScope = (s: string[], n: string) =>
-  s.includes(n) || s.includes("admin") ||
-  // 兼容：存量 token 只有 publish，给它们继续走 claim/release 的过渡期。
-  ((n === "tasks.claim" || n === "tasks.release") && s.includes("publish"));
+const inScope = (s: string[], n: string) => {
+  // 需求：上报 issue 默认对所有 agent 开放。不能只靠新 token 的 scope，
+  // 存量 token 的 scopes 里没有 issues.report，也必须在数据面放行。
+  if (n === "issues.report") return true;
+  return s.includes(n) || s.includes("admin") ||
+    // 兼容：存量 token 只有 publish，给它们继续走 claim/release 的过渡期。
+    ((n === "tasks.claim" || n === "tasks.release") && s.includes("publish"));
+};
 
 async function projectQuota(env: Env, project: string) {
   const r = await env.DB.prepare(
@@ -661,11 +705,14 @@ async function admin(req: Request, env: Env, url: URL) {
 
   if (path === "/admin/stats" && req.method === "GET") {
     const now = Date.now();
+    const cached = cacheGet(STATS_CACHE, "global", 180_000);
+    if (cached) return json({ ...cached, at: now, cached: true });
     const pr = await env.DB.prepare("SELECT COUNT(*) AS n FROM projects WHERE status='active'").first<any>();
     const ag = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM agents WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)"
     ).bind(now).first<any>();
     const sub = await env.DB.prepare("SELECT state, COUNT(*) AS n FROM submissions GROUP BY state").all<any>();
+    const issue = await env.DB.prepare("SELECT status, COUNT(*) AS n FROM issues GROUP BY status").all<any>();
     const enr = await env.DB.prepare("SELECT COUNT(*) AS n FROM enrollments WHERE status='pending'").first<any>();
     const hb = await env.DB.prepare(
       "SELECT COUNT(DISTINCT project || ':' || agent_id) AS n FROM hb_hist WHERE bucket > ?"
@@ -678,15 +725,18 @@ async function admin(req: Request, env: Env, url: URL) {
     const online = await env.DB.prepare(
       "SELECT COUNT(DISTINCT project || ':' || agent_id) AS n FROM hb_hist WHERE bucket >= ?"
     ).bind(Math.floor(now / 300000) - 1).first<any>();
-    return json({
+    const payload = {
       projects: pr?.n ?? 0,
       agents_online: online?.n ?? 0,
       agents_active: ag?.n ?? 0, enrollments_pending: enr?.n ?? 0,
       agents_heartbeat_24h: hb?.n ?? 0,
-      submissions: Object.fromEntries(sub.results.map((r: any) => [r.state, r.n])),
+      submissions: Object.fromEntries(sub.results.map((r: any) => [r.state, Number(r.n ?? 0)])),
+      issues: Object.fromEntries(issue.results.map((r: any) => [r.status, Number(r.n ?? 0)])),
       per_project: perProj.results,
       at: now,
-    });
+    };
+    cacheSet(STATS_CACHE, "global", payload);
+    return json(payload);
   }
 
   // 管理台数据看板：最近 7 天消息/交付趋势 + 当前可见项目的交付状态分布。
@@ -704,6 +754,9 @@ async function admin(req: Request, env: Env, url: URL) {
       projects = [only];
     }
     const now = Date.now();
+    const cacheKey = JSON.stringify([only, policy.mode, projects]);
+    const cached = cacheGet(ANALYTICS_CACHE, cacheKey, 300_000);
+    if (cached) return json({ ...cached, at: now, cached: true });
     const dayMs = 86_400_000;
     const today = new Date();
     const dayKeys: string[] = [];
@@ -711,15 +764,16 @@ async function admin(req: Request, env: Env, url: URL) {
       dayKeys.push(new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(),
         today.getUTCDate()) - i * dayMs).toISOString().slice(0, 10));
     }
-    const zeroDaily = dayKeys.map((day) => ({ day, messages: 0, submissions: 0 }));
+    const zeroDaily = dayKeys.map((day) => ({ day, messages: 0, submissions: 0, issues: 0 }));
     if (!projects.length) {
       return json({ at: now, scope: only || "all", projects: [], daily: zeroDaily,
-                    submission_states: {}, totals: { messages: 0, submissions: 0 } });
+                    submission_states: {}, issue_states: {},
+                    totals: { messages: 0, submissions: 0, issues: 0 } });
     }
     const inSql = projects.map(() => "?").join(",");
     const sinceDay = dayKeys[0];
     const sinceMs = Date.parse(sinceDay + "T00:00:00Z");
-    const [archive, subs, states] = await Promise.all([
+    const [archive, subs, states, issueDaily, issueStates] = await Promise.all([
       env.DB.prepare(
         `SELECT substr(ts,1,10) AS day, COUNT(*) AS n FROM archive
           WHERE project IN (${inSql}) AND ts >= ? GROUP BY day`
@@ -731,23 +785,36 @@ async function admin(req: Request, env: Env, url: URL) {
       env.DB.prepare(
         `SELECT state, COUNT(*) AS n FROM submissions WHERE project IN (${inSql}) GROUP BY state`
       ).bind(...projects).all<any>(),
+      env.DB.prepare(
+        `SELECT date(created_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM issues
+          WHERE project IN (${inSql}) AND created_at >= ? GROUP BY day`
+      ).bind(...projects, sinceMs).all<any>(),
+      env.DB.prepare(
+        `SELECT status, COUNT(*) AS n FROM issues WHERE project IN (${inSql}) GROUP BY status`
+      ).bind(...projects).all<any>(),
     ]);
     const msgMap = new Map<string, number>(archive.results.map((r: any) => [String(r.day), Number(r.n)]));
     const subMap = new Map<string, number>(subs.results.map((r: any) => [String(r.day), Number(r.n)]));
+    const issueMap = new Map<string, number>(issueDaily.results.map((r: any) => [String(r.day), Number(r.n)]));
     const daily = dayKeys.map((day) => ({
       day, messages: msgMap.get(day) ?? 0, submissions: subMap.get(day) ?? 0,
+      issues: issueMap.get(day) ?? 0,
     }));
-    return json({
+    const payload = {
       at: now,
       scope: only || "all",
       projects,
       daily,
       submission_states: Object.fromEntries(states.results.map((r: any) => [r.state, Number(r.n)])),
+      issue_states: Object.fromEntries(issueStates.results.map((r: any) => [r.status, Number(r.n)])),
       totals: {
         messages: daily.reduce((a, b) => a + b.messages, 0),
         submissions: daily.reduce((a, b) => a + b.submissions, 0),
+        issues: daily.reduce((a, b) => a + b.issues, 0),
       },
-    });
+    };
+    cacheSet(ANALYTICS_CACHE, cacheKey, payload);
+    return json(payload);
   }
 
   if (path === "/admin/agents" && req.method === "GET") {
@@ -993,6 +1060,106 @@ async function admin(req: Request, env: Env, url: URL) {
       }
       return Response.json(d, { status: dr.status });
     }
+    // ── Issue 台账 ────────────────────────────────────────────────
+    // 所有 agent 都能上报（数据面 /p/{project}/issues）；管理侧只负责合并/关闭/
+    // 重开/派发。状态：open → closed / merged；派发后 task_id 关联，任务 done 时
+    // 由 ProjectRoom 回写 closed（closed_by=task）。
+    if (action === "issues" && req.method === "GET") {
+      const status = String(url.searchParams.get("status") ?? "").trim();
+      if (status && !["open", "closed", "merged"].includes(status)) return err(422, "bad_status");
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 100)));
+      const where = status ? "project = ? AND status = ?" : "project = ?";
+      const vals: any[] = status ? [project, status] : [project];
+      const rows = await env.DB.prepare(
+        `SELECT issue_id, title, body, status, priority, labels, reporter, task_id,
+                merged_into, close_reason, closed_by, created_at, updated_at, closed_at
+           FROM issues WHERE ${where} ORDER BY updated_at DESC LIMIT ?`
+      ).bind(...vals, limit).all<any>();
+      const counts = await env.DB.prepare(
+        "SELECT status, COUNT(*) AS n FROM issues WHERE project = ? GROUP BY status"
+      ).bind(project).all<any>();
+      return json({ issues: rows.results ?? [],
+                    counts: Object.fromEntries((counts.results ?? []).map((r: any) => [r.status, Number(r.n)])) });
+    }
+
+    const issueAction = action.match(/^issues\/([A-Za-z0-9._:-]{1,128})(?:\/(close|reopen|merge|dispatch))?$/);
+    if (issueAction && req.method === "POST") {
+      const [, issueId, op] = issueAction;
+      if (!op) return err(405, "method_not_allowed");
+      const row = await env.DB.prepare(
+        "SELECT * FROM issues WHERE project = ? AND issue_id = ?"
+      ).bind(project, issueId).first<any>();
+      if (!row) return err(404, "issue_not_found");
+      const now = Date.now();
+      const b: any = await req.json().catch(() => ({}));
+
+      if (op === "close") {
+        if (row.status === "merged") return err(409, "issue_merged");
+        const reason = String(b.reason ?? "").trim().slice(0, 240) || "管理员关闭";
+        await env.DB.prepare(
+          `UPDATE issues SET status = 'closed', closed_at = ?, closed_by = 'admin',
+             close_reason = ?, updated_at = ? WHERE project = ? AND issue_id = ?`
+        ).bind(now, reason, now, project, issueId).run();
+        return json({ ok: true, issue_id: issueId, status: "closed", close_reason: reason });
+      }
+
+      if (op === "reopen") {
+        // 任务完成自动关闭的 issue 重开时清掉旧 task_id，允许作为新的跟进单再派发；
+        // 人工关闭但任务仍在跑的重开则保留关联，任务 done 时继续自动收口。
+        const clearTask = row.closed_by === "task";
+        await env.DB.prepare(
+          `UPDATE issues SET status = 'open', closed_at = NULL, closed_by = NULL,
+             close_reason = NULL, merged_into = NULL, task_id = ${clearTask ? "NULL" : "task_id"},
+             updated_at = ?
+           WHERE project = ? AND issue_id = ? AND status IN ('closed', 'merged')`
+        ).bind(now, project, issueId).run();
+        return json({ ok: true, issue_id: issueId, status: "open", task_id_cleared: clearTask });
+      }
+
+      if (op === "merge") {
+        const into = String(b.into ?? "").trim();
+        if (!/^[A-Za-z0-9._:-]{1,128}$/.test(into)) return err(422, "into_required");
+        if (into === issueId) return err(422, "merge_self");
+        if (row.task_id) return err(409, "issue_has_task");
+        if (row.status === "merged") return err(409, "issue_already_merged");
+        const target = await env.DB.prepare(
+          "SELECT issue_id, status, task_id FROM issues WHERE project = ? AND issue_id = ?"
+        ).bind(project, into).first<any>();
+        if (!target) return err(404, "target_issue_not_found");
+        if (target.status !== "open") return err(409, "target_not_open");
+        await env.DB.prepare(
+          `UPDATE issues SET status = 'merged', merged_into = ?, closed_at = ?, closed_by = 'admin',
+             close_reason = 'merged', updated_at = ? WHERE project = ? AND issue_id = ?`
+        ).bind(into, now, now, project, issueId).run();
+        return json({ ok: true, issue_id: issueId, status: "merged", merged_into: into });
+      }
+
+      // dispatch：把 issue 转成任务并派发；任务完成后 ProjectRoom 自动 close issue。
+      if (row.status !== "open") return err(409, "issue_not_open");
+      if (row.task_id) return err(409, "issue_already_dispatched");
+      // 默认任务号带时间后缀：issue 重开后再次派发不能撞上上一轮已完成的 task_id。
+      const taskId = String(b.task_id ?? "").trim() ||
+        `T-${issueId}-${now.toString(36).toUpperCase()}`;
+      if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
+      const to = b.to === undefined || b.to === null || String(b.to).trim() === ""
+        ? null : String(b.to).trim();
+      const title = String(b.title ?? row.title).trim() || row.title;
+      const body = String(b.body ?? row.body ?? "");
+      const quota = await projectQuota(env, project);
+      const dr = await stub.fetch(new Request("https://do/tasks/create", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ task_id: taskId, title, body, to, issue_id: issueId,
+                               project, sender: "admin", max_per_min: quota.maxMsgsPerMin }),
+      }));
+      const d: any = await dr.json().catch(() => ({}));
+      if (!dr.ok) return Response.json(d, { status: dr.status });
+      await env.DB.prepare(
+        "UPDATE issues SET task_id = ?, updated_at = ? WHERE project = ? AND issue_id = ?"
+      ).bind(taskId, now, project, issueId).run();
+      return json({ ok: true, issue_id: issueId, status: "open", task_id: taskId,
+                    dispatched: true, task_link: d });
+    }
+
     if (action === "snapshot") return stub.fetch(new Request("https://do/snapshot"));
 
     // 吊销一个或多个 agent（幂等）：二次确认由前端承担，后端要 confirm 标记
@@ -1791,6 +1958,48 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
                 seq: seq.seq ?? null });
 }
 
+/** 所有 agent 都可上报 issue；身份由服务端注入，不接受客户端自报 reporter。 */
+async function createIssue(req: Request, env: Env, project: string, agentId: string) {
+  const b: any = await req.json().catch(() => ({}));
+  const title = String(b.title ?? "").trim();
+  const body = String(b.body ?? "").trim();
+  if (!title) return err(422, "title_required");
+  if (title.length > 200) return err(422, "title_too_long");
+  if (body.length > 20_000) return err(422, "body_too_long");
+  const priority = String(b.priority ?? "normal").toLowerCase();
+  if (!["low", "normal", "high", "urgent"].includes(priority))
+    return err(422, "bad_priority");
+  const labels = String(b.labels ?? "").trim().slice(0, 300);
+  // 与交付同一套卫生检查：issue 正文也不许把密钥带上管理台。
+  if (/(AKIA[0-9A-Z]{16}|-----BEGIN[^"]{0,40}PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[baprs]-)/.test(`${title}\n${body}`))
+    return err(422, "secret_detected");
+  const now = Date.now();
+  const issueId = "ISS-" + now.toString(36).toUpperCase() + "-" +
+    crypto.randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase();
+  await env.DB.prepare(
+    `INSERT INTO issues (project, issue_id, title, body, status, priority, labels,
+                         reporter, created_at, updated_at)
+     VALUES (?,?,?,?, 'open', ?, ?, ?, ?, ?)`
+  ).bind(project, issueId, title, body, priority, labels, agentId, now, now).run();
+  // 让管理台 WS 立即刷新 Issue tab；普通 agent 看不到这条广播（send 方不是 admin）。
+  // 消息写入失败不影响已经落库的 issue。
+  let seq: number | null = null;
+  try {
+    const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+    const r = await stub.fetch(new Request("https://do/publish", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, sender: agentId, topic: "issue", kind: "issue",
+                             payload: { issue_id: issueId, title, priority },
+                             dedupe_key: `issue:${issueId}` }),
+    }));
+    const d: any = await r.json().catch(() => ({}));
+    seq = d.seq ?? null;
+  } catch (e) {
+    console.warn("issue publish failed", issueId, e);
+  }
+  return json({ issue_id: issueId, status: "open", priority, seq, created_at: now }, 201);
+}
+
 // ── 会话（HttpOnly cookie + HMAC 签名）─────────────────────
 const SEC_HEADERS: Record<string, string> = {
   "cache-control": "no-store, no-cache, must-revalidate",
@@ -2014,7 +2223,33 @@ async function sha256(s: string) {
 }
 const json = (o: unknown, status = 200) =>
   new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json", "x-hub": "1" } });
-const err = (status: number, reason: string) => json({ error: reason }, status);
+const err = (status: number, reason: string) => {
+  const r = json({ error: reason }, status);
+  if (status === 503) r.headers.set("retry-after", "30");
+  return r;
+};
+/** D1 配额/故障时给客户端一个可重试的 JSON 503，不要把 Worker 异常抛成 CF 1101 HTML。 */
+const dbUnavailable = () => {
+  const r = err(503, "db_unavailable");
+  r.headers.set("retry-after", "30");
+  return r;
+};
+
+// 管理台轮询会高频打 /admin/stats 与 /admin/analytics；D1 免费额度按 rows_read 计，
+// 这里做短 TTL 缓存，避免多开标签页把当天额度打穿。
+const STATS_CACHE = new Map<string, { at: number; data: any }>();
+const ANALYTICS_CACHE = new Map<string, { at: number; data: any }>();
+const CACHE_MAX = 64;
+function cacheGet(map: Map<string, { at: number; data: any }>, key: string, ttlMs: number) {
+  const hit = map.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.data;
+  if (hit) map.delete(key);
+  return null;
+}
+function cacheSet(map: Map<string, { at: number; data: any }>, key: string, data: any) {
+  if (map.size >= CACHE_MAX) map.delete(map.keys().next().value as string);
+  map.set(key, { at: Date.now(), data });
+}
 const html = (s: string) => new Response(s, { headers: { "content-type": "text/html; charset=utf-8" } });
 const text = (s: string, ct: string) => new Response(s, { headers: { "content-type": ct } });
 

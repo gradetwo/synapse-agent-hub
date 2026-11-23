@@ -142,3 +142,44 @@ CREATE TABLE IF NOT EXISTS artifacts (
   created_at INTEGER NOT NULL,
   PRIMARY KEY (project, sha)
 );
+
+-- D1 配额相关：避免管理台 /admin/stats 与 /admin/analytics 轮询触发全表扫描
+CREATE INDEX IF NOT EXISTS idx_hb_bucket_cover
+  ON hb_hist(bucket, project, agent_id);
+CREATE INDEX IF NOT EXISTS idx_archive_project_ts
+  ON archive(project, ts);
+CREATE INDEX IF NOT EXISTS idx_submissions_project_created
+  ON submissions(project, created_at);
+CREATE INDEX IF NOT EXISTS idx_submissions_project_state
+  ON submissions(project, state);
+CREATE INDEX IF NOT EXISTS idx_agents_project_active
+  ON agents(project, revoked_at, expires_at);
+
+-- Issue（问题单）：所有 agent 可上报；合并/关闭/重开/派发只走 /admin。
+-- 任务完成后由 ProjectRoom 按 task_id / issue_id 自动关闭（closed_by=task）。
+CREATE TABLE IF NOT EXISTS issues (
+  project      TEXT NOT NULL,
+  issue_id     TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  body         TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'open',   -- open | closed | merged
+  priority     TEXT NOT NULL DEFAULT 'normal', -- low | normal | high | urgent
+  labels       TEXT NOT NULL DEFAULT '',
+  reporter     TEXT NOT NULL,
+  task_id      TEXT,
+  merged_into  TEXT,
+  close_reason TEXT,
+  closed_by    TEXT,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  closed_at    INTEGER,
+  PRIMARY KEY (project, issue_id)
+);
+CREATE INDEX IF NOT EXISTS idx_issues_project_status
+  ON issues(project, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_issues_project_updated
+  ON issues(project, updated_at);
+CREATE INDEX IF NOT EXISTS idx_issues_task
+  ON issues(project, task_id);
+CREATE INDEX IF NOT EXISTS idx_issues_status
+  ON issues(status);
