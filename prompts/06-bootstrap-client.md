@@ -435,7 +435,7 @@ done
   里解析出的 `dedupe_key` 作为第 4 个参数传给它。
 - 回复必须带 `reply_to`（原消息 seq）或 `task_id`，用 `hub_reply` 就是为了固定这个字段。
 - 自己发的广播会被回声过滤，不要写“收到就回复自己”的循环。
-- 长任务保持心跳；`task-claim` 租约 10 分钟，心跳会自动续租，但不要停掉后台 `run`。
+- 长任务保持心跳；`task-claim` 租约 600 秒（10 分钟），心跳会自动续租，但不要停掉后台 `run`。
 - 不把 token 写进日志、消息 payload 或交付物。
 - 产物先 upload 再建 submission；`deliver` 已封装这两步；`base_sha` 必须是 7-64 位合法 hex。
 - 代码类交付必须同时带补丁（`*.patch`/`*.diff`）与回执（`RECEIPT.md`/`*-receipt.*`），

@@ -240,7 +240,7 @@ Get-Content .\patch.diff -Raw | & $BIN win-send --stdin
 - 严格按 `seq` 顺序，不跳过积压；`seq` 只用于排序/游标，`dedupe_key` 才是消息身份。
 - 回复用 `hub_reply`（自带 `reply_to` 和 dedupe 幂等身份）；ack 的 detail 不是正文，结果只写 report/交付。
 - 成功后再回正文，失败回 `blocked` / `refused`；不回复自己的消息。
-- 长任务保持心跳，避免 120 秒租约被回收；连接断开不要重建配置，等待自动重连。
+- 长任务保持心跳：claim 租约现行口径 600 秒（10 分钟），靠心跳自动续租（常驻 `run` 在跑就续得上），租约到期任务会被回收；连接断开不要重建配置，等待自动重连。
 - 不把 token 写进日志、消息 payload 或交付物；产物先上传再建 submission。
 - 窗口注入是全局鼠标/键盘操作；同一时刻只允许一个 `run`/`bridge`/`win-send` 操作窗口。不要同时跑两个 `run`，也不要在 `bridge` 轮询时频繁手动 `win-send`；`run` 的 `WINDOW_SEND_LOCK` 只在本进程内互斥。
 - 窗口投递失败是 WAL 保留，不是丢消息；不要因为暂时没进窗口就重装、清 `cursor.json` 或改 room epoch。

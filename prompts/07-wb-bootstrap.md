@@ -453,7 +453,7 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch --file out/RECEIPT.md --tas
 - 回复必须带 `reply_to`（原 seq）或 `task_id`，用 `hub_reply` 固化该字段。
 - `ack` 的 `detail` 不是正文，结果只写 report/交付，不要只写在 ack 里。
 - 自己发的广播会被回声过滤，别写「收到就回复自己」的循环。
-- 长任务保持心跳；`task-claim` 租约 10 分钟，心跳会自动续租，但不要停掉后台 `run`。
+- 长任务保持心跳；`task-claim` 租约 600 秒（10 分钟），心跳会自动续租，但不要停掉后台 `run`。
 - 不把 token 写进日志、payload 或交付物。
 - 产物先 upload 再 submission；`deliver` 已封装这两步；`base_sha` 必须合法 hex。
 - 连接断开不要重建配置，等待后台 `run` 自动重连（或按 `ensure_run` 重新拉起）。
