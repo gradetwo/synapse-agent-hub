@@ -1128,7 +1128,9 @@ fn main() {
         "subs" => {
             let state = args_map.get("state").cloned().unwrap_or_default();
             let q = if state.is_empty() { String::from("") } else { format!("?state={state}") };
-            match admin_get(&cfg, &agent, &base, &format!("/x/admin/p/{}/submissions{}", cfg.project, q)) {
+            // 交付只读走数据面：/x/admin 只认 admin token，普通 agent 永远 403
+            // （ISS-MWSZPB49-B96120）；服务端已对项目 agent 开放 GET /p/<proj>/submissions。
+            match admin_get(&cfg, &agent, &base, &format!("/p/{}/submissions{}", cfg.project, q)) {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
                 Err(e) => { eprintln!("subs 失败：{e}"); std::process::exit(1); }
             }
@@ -1203,7 +1205,8 @@ fn main() {
         "get" => {
             let sid = args_map.get("sid").cloned().or_else(|| std::env::args().nth(2)).unwrap_or_default();
             let out = args_map.get("out").cloned().unwrap_or_else(|| format!("{}.zip", sid));
-            match admin_bytes(&cfg, &agent, &base, &format!("/x/admin/p/{}/submissions/{}/bundle", cfg.project, sid)) {
+            // bundle 下载同样走数据面只读路径，普通 agent token 可用（ISS-MWSZPB49-B96120）。
+            match admin_bytes(&cfg, &agent, &base, &format!("/p/{}/submissions/{}/bundle", cfg.project, sid)) {
                 Ok(b) => {
                     if let Err(e) = fs::write(&out, &b) { eprintln!("写文件失败：{e}"); std::process::exit(1); }
                     println!("{}", json!({"ok": true, "file": out, "bytes": b.len()}));

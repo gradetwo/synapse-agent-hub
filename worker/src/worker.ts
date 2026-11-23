@@ -297,13 +297,25 @@ export default {
 
     const auth = await authenticate(req, env, project);
     if (!auth.ok) return err(auth.status, auth.reason!);
-    if (!inScope(auth.scopes!, need(action)))
+    // 交付只读（GET submissions / bundle）对所有已认证的项目 agent 放行，与
+    // issues.report 同口径：返工节点要按真实补丁开工，必须能列交付、下载 bundle，
+    // 不能要求 admin token（ISS-MWSZPB49-B96120）。写路径仍按 submissions.create 查。
+    const subRead = req.method === "GET" && action.startsWith("submissions");
+    if (!subRead && !inScope(auth.scopes!, need(action)))
       return err(403, `insufficient_scope: 需要 ${need(action)}，当前 [${(auth.scopes || []).join(",")}]`);
     if (auth.projectStatus === "paused" && req.method !== "GET") return err(423, "project_paused");
 
     // 交付创建在 Worker 侧完成（需查 R2 + 写 D1），不转发给 DO
     if (action === "submissions" && req.method === "POST")
       return createSubmission(req, env, project, auth.agentId!);
+
+    // 交付只读在 Worker 侧查 D1 / 拼 bundle，不转发给 DO（DO 没有 submissions 动作，
+    // 此前 GET /p/<proj>/submissions 只会得到 404 unknown_action）。
+    if (action === "submissions" && req.method === "GET")
+      return listSubmissions(env, project, url);
+    const subBundle = action.match(/^submissions\/([^/]+)\/bundle$/);
+    if (subBundle && req.method === "GET")
+      return bundleSubmission(env, project, subBundle[1]);
 
     // Issue 上报同样在 Worker 侧写 D1；权限对所有 agent 默认放行（见 inScope）。
     if (action === "issues" && req.method === "POST")
@@ -1317,22 +1329,8 @@ async function admin(req: Request, env: Env, url: URL) {
     const bun = action.match(/^submissions\/([^/]+)\/bundle$/);
     if (bun && req.method === "GET") return bundleSubmission(env, project, bun[1]);
 
-    if (action === "submissions" && req.method === "GET") {
-      const state = url.searchParams.get("state") ?? "";
-      const taskId = url.searchParams.get("task_id") ?? "";
-      const review = url.searchParams.get("review_state") ?? "";
-      const valid = ["delivered", "collected", "archived"].includes(state);
-      const validReview = ["pending", "accepted", "approved", "rejected"].includes(review);
-      const cond = ["project = ?"];
-      const vals: any[] = [project];
-      if (valid) { cond.push("state = ?"); vals.push(state); }
-      if (taskId && /^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) { cond.push("task_id = ?"); vals.push(taskId); }
-      if (validReview) { cond.push("review_state = ?"); vals.push(review); }
-      const rows = await env.DB.prepare(
-        `SELECT * FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
-      ).bind(...vals).all();
-      return Response.json(rows.results);
-    }
+    if (action === "submissions" && req.method === "GET")
+      return listSubmissions(env, project, url);
 
     const col = action.match(/^submissions\/([^/]+)\/(collect|archive|result)$/);
     if (col && req.method === "POST") {
@@ -1616,6 +1614,24 @@ function zipStore(files: { name: string; data: Uint8Array }[]): Uint8Array {
   let pos = 0;
   for (const c of chunks) { out.set(c, pos); pos += c.length; }
   return out;
+}
+
+/** 交付列表（只读）：管理面与数据面共用同一查询，过滤口径保持一致。 */
+async function listSubmissions(env: Env, project: string, url: URL) {
+  const state = url.searchParams.get("state") ?? "";
+  const taskId = url.searchParams.get("task_id") ?? "";
+  const review = url.searchParams.get("review_state") ?? "";
+  const valid = ["delivered", "collected", "archived"].includes(state);
+  const validReview = ["pending", "accepted", "approved", "rejected"].includes(review);
+  const cond = ["project = ?"];
+  const vals: any[] = [project];
+  if (valid) { cond.push("state = ?"); vals.push(state); }
+  if (taskId && /^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) { cond.push("task_id = ?"); vals.push(taskId); }
+  if (validReview) { cond.push("review_state = ?"); vals.push(review); }
+  const rows = await env.DB.prepare(
+    `SELECT * FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
+  ).bind(...vals).all();
+  return Response.json(rows.results);
 }
 
 async function bundleSubmission(env: Env, project: string, id: string) {
