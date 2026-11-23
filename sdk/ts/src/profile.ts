@@ -31,12 +31,12 @@ export function detectProfile(agentId = ""): Profile {
   else if (has("WORKERBODY", "WORKER_BODY")) runtime = "workerbody";
   else if (has("GITHUB_ACTIONS") || process.env.CI) runtime = "ci";
 
-  const forced = process.env.YANSHI_HOST;
+  const forced = process.env.SYNAPSE_HOST ?? process.env.YANSHI_HOST;
   const host: Profile["host"] =
     forced === "cloud" || forced === "local" ? forced
     : (inContainer() || has("KUBERNETES", "CF_", "AWS_", "ALIYUN", "TENCENT", "VERCEL", "GOOGLE_CLOUD")) ? "cloud" : "local";
 
-  const wsBlocked = process.env.YANSHI_NO_WS === "1";
+  const wsBlocked = (process.env.SYNAPSE_NO_WS ?? process.env.YANSHI_NO_WS) === "1";
 
   let transport: Profile["transport"] = "ws";
   let heartbeatS = 60, pollMs = 5000, probeMs = 4000, queueMax = 200;

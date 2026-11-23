@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { detectProfile } from "./profile.js";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { Admin } from "./admin.js";
 
 export type WorkState = "busy" | "idle" | "blocked";
@@ -29,15 +29,16 @@ export class Client {
   private opts: Required<ClientOptions>;
   private work: Work = { state: "idle" };
   private timer?: any;
+  private running = false;
   private hb = 0;
 
   constructor(opts: ClientOptions) {
     if (opts.endpoint.startsWith("http://") && !/127\.0\.0\.1|localhost/.test(opts.endpoint))
       throw new Error("refuse plaintext http; use https");
     this.opts = {
-      stateDir: opts.stateDir ?? join(homedir(), ".synapse-agent"),
-      heartbeatS: opts.heartbeatS ?? 60,
       ...opts,
+      stateDir: opts.stateDir || join(homedir(), ".synapse-agent"),
+      heartbeatS: opts.heartbeatS || 60,
     } as Required<ClientOptions>;
     mkdirSync(this.opts.stateDir, { recursive: true });
   }
@@ -69,7 +70,7 @@ export class Client {
                   agentId: raw.agentId ?? raw.agent_id,
                   stateDir: raw.stateDir ?? raw.state_dir,
                   heartbeatS: raw.heartbeatS ?? raw.heartbeat_s };
-    const token = process.env.YANSHI_TOKEN ?? raw.token;
+    const token = process.env.SYNAPSE_TOKEN ?? process.env.YANSHI_TOKEN ?? raw.token;
     const c = new Client({ ...cfg, token } as ClientOptions);
     if (auto) c.start();                      // 构造即开始心跳，调用方无需手动触发
     return c;
@@ -86,6 +87,7 @@ export class Client {
 
   get endpoint(): string { return this.opts.endpoint; }
   get project(): string { return this.opts.project; }
+  get agentId(): string { return this.opts.agentId; }
 
   setWork(w: Partial<Work>) { this.work = { ...this.work, ...w }; }
 
@@ -99,28 +101,41 @@ export class Client {
   }
 
   start(): void {
-    if (this.timer) return;                   // 幂等：重复调用不会起第二个定时器
+    if (this.running) return;
+    this.running = true;
     const tick = async () => {
+      if (!this.running) return;
       await this.heartbeatOnce();
+      if (!this.running) return;
       this.timer = setTimeout(tick, (this.opts.heartbeatS + Math.random() * 15) * 1000);
     };
-    tick();
+    void tick();
   }
-  stop(): void { if (this.timer) clearTimeout(this.timer); }
+  stop(): void {
+    this.running = false;
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+  }
 
   // ── 消息 ──────────────────────────────────────────────
   async *events(topics?: string): AsyncGenerator<any> {
     this.start();
     while (true) {
       const since = this.cursorLoad();
-      const q = `/p/${this.opts.project}/inbox?since=${since}${topics ? `&topics=${topics}` : ""}`
+      const q = `/p/${this.opts.project}/inbox?since=${since}${topics ? `&topics=${encodeURIComponent(topics)}` : ""}`
                   + `&agent=${encodeURIComponent(this.opts.agentId)}`;
       const r = await this.get(q);
+      const nextCursor = Number(r.next_cursor ?? since);
       for (const m of r.messages ?? []) {
         yield m;
         this.cursorSave(m.seq);
       }
-      if (!(r.messages?.length)) await new Promise((s) => setTimeout(s, 1000));
+      if (!(r.messages?.length)) {
+        // 整页都是项目事件时 messages 为空，但 next_cursor 已前进；保存它避免死循环。
+        if (Number.isFinite(nextCursor) && nextCursor > since) this.cursorSave(nextCursor);
+        await new Promise((s) => setTimeout(s, 1000));
+      } else if (Number.isFinite(nextCursor) && nextCursor > since) {
+        this.cursorSave(Math.max(nextCursor, this.cursorLoad()));
+      }
     }
   }
 
@@ -151,7 +166,7 @@ export class Client {
     let pages = 0;
     while (true) {
       const r = await this.get(`/p/${this.opts.project}/inbox?since=${since}&limit=${limit}`
-        + (topics ? `&topics=${topics}` : "")
+        + (topics ? `&topics=${encodeURIComponent(topics)}` : "")
         + `&agent=${encodeURIComponent(this.opts.agentId)}`);
       const ep = r.epoch as string | undefined;
       const stored = this.epochLoad();
@@ -162,9 +177,16 @@ export class Client {
         break;
       }
       const msgs: any[] = r.messages ?? [];
-      if (!msgs.length) break;
+      const nextCursor = Number(r.next_cursor ?? since);
+      if (!msgs.length) {
+        // 服务端可能过滤掉整页项目事件：messages 为空但 next_cursor 已前进，
+        // 不保存会让客户端一直从旧游标重复请求，永远读不到后面的消息。
+        if (Number.isFinite(nextCursor) && nextCursor > since) this.cursorSave(nextCursor);
+        break;
+      }
       out.push(...msgs);
-      since = msgs[msgs.length - 1].seq;
+      since = Math.max(since, Number.isFinite(nextCursor) ? nextCursor : 0,
+                       Number(msgs[msgs.length - 1].seq) || 0);
       this.cursorSave(since);
       pages++;
       if (!r.has_more || pages >= 5) break;
@@ -199,7 +221,7 @@ export class Client {
       method: "PUT", body: data, headers: this.headers(), timeoutMs: 300_000,
     });
     if (!res.ok) throw new Error(`upload ${res.status}: ${await res.text()}`);
-    return { sha256: sha, name: path.split("/").pop()!, bytes: data.length };
+    return { sha256: sha, name: basename(path), bytes: data.length };
   }
 
   async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {}, taskId?: string) {

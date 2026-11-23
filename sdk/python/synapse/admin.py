@@ -99,9 +99,15 @@ class Admin:
         return self._post("/tasks/reclaim", {"task_id": task_id, "reason": reason})
 
     # ── Issue 台账（管理侧）────────────────────────────────
-    def issues(self, status: str = "") -> dict:
-        q = f"/issues?status={status}" if status else "/issues"
-        return self._get(q)
+    def issues(self, status: str = "", limit: int | None = None) -> dict:
+        from urllib.parse import urlencode
+        q: dict[str, str] = {}
+        if status:
+            q["status"] = status
+        if limit is not None:
+            q["limit"] = str(limit)
+        suffix = f"/issues?{urlencode(q)}" if q else "/issues"
+        return self._get(suffix)
 
     def issue_close(self, issue_id: str, reason: str = "管理员关闭") -> dict:
         return self._post(f"/issues/{issue_id}/close", {"reason": reason})

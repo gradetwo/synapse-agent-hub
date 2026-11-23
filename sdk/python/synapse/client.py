@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.parse import quote
 
 import requests
 
@@ -105,7 +106,7 @@ class Client:
             legacy = Path.home() / ".yanshi-agent" / "config.json"
             if legacy.exists(): cfg_path = legacy
         cfg = json.loads(cfg_path.read_text())
-        token = os.environ.get("YANSHI_TOKEN") or cfg["token"]
+        token = os.environ.get("SYNAPSE_TOKEN") or os.environ.get("YANSHI_TOKEN") or cfg["token"]
         c = cls(cfg["endpoint"], cfg["project"], token, cfg["agent_id"],
                 state_dir=cfg.get("state_dir"), heartbeat_s=int(cfg.get("heartbeat_s", 60)))
         if auto:
@@ -184,13 +185,20 @@ class Client:
             since = self._cursor_load()
             q = f"/p/{self.project}/inbox?since={since}&timeout={timeout}"
             if topics:
-                q += f"&topics={topics}"
+                q += f"&topics={quote(str(topics), safe='')}"
             r = self._get(q)
+            next_cursor = int(r.get("next_cursor") or since)
             for msg in r.get("messages", []):
                 yield msg
                 self._cursor_save(msg["seq"])
             if not r.get("messages"):
+                # 整页都是当前 agent 不可见的项目事件时 messages 为空，但
+                # next_cursor 已经前进；不保存会在旧游标上永久打转。
+                if next_cursor > since:
+                    self._cursor_save(next_cursor)
                 time.sleep(1)
+            elif next_cursor > since:
+                self._cursor_save(max(next_cursor, self._cursor_load()))
 
     def publish(self, topic: str, kind: str, payload: Any, dedupe_key: str | None = None) -> dict:
         """发布消息。网络失败时落盘到 outbox，恢复后 drain() 重放（同 dedupe_key 幂等）。"""
@@ -209,7 +217,7 @@ class Client:
         """上报 issue；所有 agent 默认可上报（服务端不要求 issues.report scope）。"""
         return self._post(f"/p/{self.project}/issues",
                           {"title": title, "body": body,
-                           "priority": priority, "labels": labels})
+                           "priority": priority, "labels": labels}, retry=False)
 
     def drain_outbox(self) -> dict:
         box = self.state_dir / "outbox"
@@ -241,7 +249,7 @@ class Client:
         pages = 0
         while True:
             r = self._get(f"/p/{self.project}/inbox?since={since}&limit={limit}"
-                          + (f"&topics={topics}" if topics else "")
+                          + (f"&topics={quote(str(topics), safe='')}" if topics else "")
                           + f"&agent={self.agent_id}")
             ep = r.get("epoch")
             stored_ep = self._epoch_load()
@@ -406,21 +414,26 @@ class Client:
             raise RuntimeError(f"DELETE {path} -> {r.status_code}: {r.text[:120]}")
         return r.json()
 
-    def _post(self, path: str, payload: dict) -> dict:
-        # 心跳/回执/发布都有幂等键；TLS EOF 或连接重置时重试 2 次（读超时不重试，避免未知副作用）
+    def _post(self, path: str, payload: dict, retry: bool = True) -> dict:
+        # 心跳/回执/发布都有幂等键；TLS EOF 或连接重置时重试 2 次。
+        # Issue 上报没有服务端幂等键，重试可能生成重复 Issue，所以 report_issue 走 retry=False。
         last = None
-        for i in range(4):
+        attempts = 4 if retry else 1
+        for i in range(attempts):
             try:
                 r = self._sess.post(f"{self.endpoint}{path}", json=payload,
                                   headers=self._headers(), timeout=30)
                 break
             except (requests.ConnectionError, requests.exceptions.SSLError) as e:
                 last = e
-                if i >= 3:
-                    raise RuntimeError(f"POST {path} 网络失败（已重试 3 次）：{e}") from e
+                if i >= attempts - 1:
+                    # 保持 requests.RequestException 类型：heartbeat/publish/drain_outbox
+                    # 都靠这个类型决定“返回离线/落 outbox”，不能抛 RuntimeError 绕过。
+                    raise requests.ConnectionError(
+                        f"POST {path} 网络失败（已尝试 {attempts} 次）：{e}") from e
                 time.sleep(1.5 * (i + 1))
         else:
-            raise RuntimeError(f"POST {path} 网络失败：{last}")
+            raise requests.ConnectionError(f"POST {path} 网络失败：{last}")
         if r.status_code == 401: raise RuntimeError("token revoked or unknown; re-issue token")
         if r.status_code == 403: raise RuntimeError("scope/project mismatch")
         if r.status_code == 426: raise RuntimeError("sdk too old; pip install -U synapse-agent")
@@ -463,7 +476,9 @@ class Client:
         except Exception:
             d = {"seq": 0}
         d["epoch"] = ep
-        self._cursor_path().write_text(json.dumps(d))
+        tmp = self._cursor_path().with_suffix(".tmp")
+        tmp.write_text(json.dumps(d))
+        os.replace(tmp, self._cursor_path())
 
     def _cursor_save(self, seq: int) -> None:
         tmp = self._cursor_path().with_suffix(".tmp")

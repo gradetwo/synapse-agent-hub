@@ -39,7 +39,7 @@ export class Loop {
 
   constructor(client: Client, opts: LoopOptions = {}) {
     this.c = client;
-    const prof = detectProfile((client as any).agentId ?? "");
+    const prof = detectProfile(client.agentId);
     this.profile = prof;
     this.pollMs = opts.pollMs ?? prof.pollMs;
     this.ackStatus = opts.ackStatus ?? "done";
@@ -99,6 +99,11 @@ export class Loop {
       if (this.ws === ws) this.ws = null;
       this.mode = "poll";
       if (this.transport === "ws" && !this.stopped) throw new Error("transport=ws 但长连接建立失败");
+      // auto 模式初次探测失败后不能永久停在 poll：按固定间隔重试，直到升级成功。
+      if (!this.stopped) {
+        if (this.probeTimer) clearTimeout(this.probeTimer);
+        this.probeTimer = setTimeout(() => void this.probeWs(), 5000);
+      }
     } finally {
       this.probing = false;
     }
@@ -177,11 +182,11 @@ export class Loop {
     const deadline = timeoutMs ? Date.now() + timeoutMs : Infinity;
     if (this.mode === "ws") {
       this.catchUp();
-      while (Date.now() < deadline) {
+      while (this.mode === "ws" && Date.now() < deadline) {
         if (this.q.length) { const m = this.q.shift()!; this.enterBusy("接任务"); return m; }
         await new Promise((r) => setTimeout(r, 100));
       }
-      return null;
+      if (this.mode === "ws") return null;
     }
     while (Date.now() < deadline) {
       try {

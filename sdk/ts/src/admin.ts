@@ -68,9 +68,11 @@ export class Admin {
   }
 
   // ── Issue 台账（管理侧）────────────────────────────────
-  issues(status?: string): Promise<any> {
-    const q = status ? `/issues?status=${encodeURIComponent(status)}` : "/issues";
-    return this.c.reqGet(this.p(q));
+  issues(status?: string, limit?: number): Promise<any> {
+    const q: string[] = [];
+    if (status) q.push(`status=${encodeURIComponent(status)}`);
+    if (limit != undefined) q.push(`limit=${limit}`);
+    return this.c.reqGet(this.p(`/issues${q.length ? `?${q.join("&")}` : ""}`));
   }
 
   issueClose(issueId: string, reason = "管理员关闭"): Promise<any> {

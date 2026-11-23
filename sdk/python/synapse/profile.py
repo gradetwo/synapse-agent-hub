@@ -38,10 +38,10 @@ def detect(agent_id: str | None = None) -> dict:
 
     cloud_marker = _in_container() or _has("KUBERNETES", "CF_", "AWS_", "ALIYUN", "TENCENT",
                                            "VERCEL", "FLY_", "GOOGLE_CLOUD")
-    forced = os.environ.get("YANSHI_HOST")
+    forced = os.environ.get("SYNAPSE_HOST") or os.environ.get("YANSHI_HOST")
     host = forced if forced in ("cloud", "local") else ("cloud" if cloud_marker else "local")
 
-    ws_blocked = os.environ.get("YANSHI_NO_WS") == "1"
+    ws_blocked = (os.environ.get("SYNAPSE_NO_WS") or os.environ.get("YANSHI_NO_WS")) == "1"
 
     if ws_blocked or runtime == "ci":
         transport, heartbeat, poll, probe, queue = "poll", 120, 10, 0, 50
@@ -71,5 +71,5 @@ def detect(agent_id: str | None = None) -> dict:
         "os": platform.platform(), "python": platform.python_version(),
         "transport": transport, "heartbeat_s": heartbeat, "poll_s": poll,
         "ws_probe_s": probe, "queue_max": queue,
-        "reason": ("环境变量 YANSHI_NO_WS=1：强制轮询" if ws_blocked else reasons.get((runtime, host), "")),
+        "reason": ("环境变量 SYNAPSE_NO_WS=1：强制轮询" if ws_blocked else reasons.get((runtime, host), "")),
     }

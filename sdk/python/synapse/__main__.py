@@ -43,12 +43,24 @@ def cmd_update(a):
     print(json.dumps(c.check_update(), ensure_ascii=False, indent=2))
     return 0
 
+def cmd_issue(a):
+    c = Client.from_config(auto=False)
+    print(json.dumps(c.report_issue(a.title, body=a.body or "", priority=a.priority,
+                                   labels=a.labels or ""), ensure_ascii=False, indent=2))
+    return 0
+
+def cmd_issues(a):
+    c = Client.from_config(auto=False)
+    print(json.dumps(c.as_admin().issues(status=a.status or "", limit=a.limit),
+                     ensure_ascii=False, indent=2))
+    return 0
+
 
 def cmd_daemon(a):
     """常驻：长连接优先，连不上自动回退轮询；消息落到 inbox/ 与 INBOX.md。"""
     c = Client.from_config(auto=False)
     from .loop import Loop
-    transport = "poll" if os.environ.get("YANSHI_NO_WS") == "1" else "auto"
+    transport = "poll" if (os.environ.get("SYNAPSE_NO_WS") or os.environ.get("YANSHI_NO_WS")) == "1" else "auto"
     loop = Loop(c, transport=transport)
     print(f"→ daemon 已启动 project={c.project} agent={c.agent_id} "
           f"transport={loop.mode} 每 {c.heartbeat_s}s 一拍", flush=True)
@@ -83,6 +95,16 @@ def main(argv=None):
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     pr = sub.add_parser("profile"); pr.set_defaults(fn=cmd_profile)
     up = sub.add_parser("update-check"); up.set_defaults(fn=cmd_update)
+    issue = sub.add_parser("issue", help="上报 Issue（所有 agent 默认可上报）")
+    issue.add_argument("--title", required=True)
+    issue.add_argument("--body", default="")
+    issue.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
+    issue.add_argument("--labels", default="")
+    issue.set_defaults(fn=cmd_issue)
+    issues = sub.add_parser("issues", help="查看 Issue 台账（需 admin token）")
+    issues.add_argument("--status", choices=["", "open", "closed", "merged"], default="")
+    issues.add_argument("--limit", type=int, default=100)
+    issues.set_defaults(fn=cmd_issues)
 
     a = p.parse_args(argv)
     return a.fn(a)
