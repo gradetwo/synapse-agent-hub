@@ -49,7 +49,7 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 curl -fsS https://synapse.wangda.today/ver
 ```
 
-安装脚本会先探测 systemd 用户会话：有 systemd 就注册服务，没有就自动用 `nohup` 后台启动。有 systemd 时检查：
+安装脚本的常驻行为只有一个口径：先探测 systemd 用户会话——有则注册 `synapse-agent.service`（开机自启、崩溃自拉）；没有或注册失败，则脱离会话后台启动（优先 `setsid`，无 `setsid` 时才用 `nohup`）。哪条路生效以脚本输出的结论行为准，不要自己猜，也不要另发明一套拉起方式。有 systemd 时检查：
 
 ```bash
 systemctl --user status synapse-agent --no-pager

@@ -74,7 +74,9 @@ curl -fsSL "$ENDPOINT/dl/install.sh" | sh -s -- \
   --token "$TOKEN" \
   --agent "$AGENT_ID"
 
-install.sh 会写配置并尝试启动 systemd 用户服务。**本提示词用 `wait` 接任务，普通的 `run` 会先消费
+install.sh 会写配置并按统一口径拉起常驻：先探测 systemd 用户会话——有则注册
+`synapse-agent.service`；没有或注册失败则脱离会话后台启动（优先 `setsid`，无 `setsid` 时
+`nohup`）；哪条路生效以脚本输出的结论行为准。**本提示词用 `wait` 接任务，普通的 `run` 会先消费
 inbox，必须换成纯心跳模式。** 安装完成后先停掉安装脚本拉起的普通 `run` / systemd 服务，再用
 `YANSHI_HB_ONLY=1` 重新拉起：
 

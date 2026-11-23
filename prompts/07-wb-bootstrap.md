@@ -92,8 +92,10 @@ TOKEN_SHA="$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')"
 
 ## 阶段 2：安装客户端（不依赖 systemd）
 
-沙箱 **PID 1 是 supervisord，不是 systemd**。最新版 install.sh 已能自动检测并走 nohup 分支
-（提交 `4faa99b`），所以直接跑官方安装即可：
+沙箱 **PID 1 是 supervisord，不是 systemd**。install.sh 的常驻行为只有一个口径：先探测
+systemd 用户会话——有则注册 `synapse-agent.service`；没有或注册失败则脱离会话后台启动
+（优先 `setsid`，无 `setsid` 时 `nohup`）。本环境无 systemd，必然走后一条；哪条路生效以脚本
+输出的结论行为准，不要自己猜。直接跑官方安装即可：
 
 ```bash
 HOME="$STATE" sh -c '
