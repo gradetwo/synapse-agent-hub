@@ -14,6 +14,8 @@ TARGET_PROJECT=<可选；加入/迁移目标项目>
 KEEP_SOURCE=true|false（仅 move 使用）
 ```
 
+网络口径：本提示词涉及的下载与 API 调用按全节点统一网络口径执行（先直连，失败回退公开镜像/代理，回退必响亮报告）；统一模板正本在 `prompts/_shared-sections.md`「网络口径」节，派发时可将该节全文附在本提示词之后。
+
 ## 签发新 token（同一项目）
 
 ```bash

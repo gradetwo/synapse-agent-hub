@@ -27,6 +27,31 @@ STATE=/workspace/.synapse-state        # 持久区；用 HOME 指向它隔离状
 4. 唯一可靠的被通知方式：把 synapse-agent wait 挂到后台 + 阻塞等待到点/收到消息。
 5. 定时任务最小 1 小时且只有 1 个名额，只作长周期兜底。
 
+【网络口径 — 全节点统一，先直连后回退】
+0. 来源口径：回退只用网络公开的镜像与代理（GitHub 用 gh-proxy.com 等公开代理，
+   Rust 用 rsproxy、清华 tuna 等公开镜像），不用自有代理地址。（Wang 2026-11-23 裁决）
+1. 默认直连。GitHub、crates.io、Rust 工具链分发，一律先直连，不预设代理，不预设镜像。
+2. 回退触发条件（满足任一即触发）：连接超时；DNS 解析失败；连接被重置或拒绝；
+   HTTP 403/407/429 持续出现；下载速率长期低于 10 KB/s。单次偶发失败先原路重试 1 次，
+   重试仍失败再回退。
+3. GitHub 回退：git clone/fetch、gh 直连失败时，改走公开代理前缀
+   https://gh-proxy.com/<原 GitHub URL>（或同类公开镜像），或按环境已有配置使用 HTTPS_PROXY。
+   只用公开来源，不填自有代理地址。中枢客户端同理：synapse-agent run --proxy <代理地址>
+   显式开启；--proxy off 强制直连；不带参数时自动检测 HTTPS_PROXY/ALL_PROXY 环境变量。
+4. cargo 回退：直连 crates.io 失败时启用镜像源。首选 rsproxy
+   （source.crates-io 替换为 registry = "sparse+https://rsproxy.cn/index/"，
+   并设 [net] git-fetch-with-cli = true）；不通再换清华 tuna 源
+   （sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/）。
+   只改当前项目 .cargo/config.toml 或用户级配置，不改全局系统配置。
+5. rustup 回退：设 RUSTUP_DIST_SERVER=https://rsproxy.cn 与
+   RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup 后重试；仍失败再换 tuna 的 rustup 镜像。
+6. 响亮报告（硬约束）：每次回退都写进本轮汇报与任务回执——哪条链路、触发原因、
+   换成了哪个代理或镜像。不许静默换源，不许把「换源后成功」写成「直连成功」。
+7. 回退是临时措施，不是默认配置；网络恢复后回到直连。不要把镜像地址写死进仓库代码或提交物。
+环境适配（类别② 回合制沙箱）：沙箱每轮环境可能重置。网络配置必须在每轮开工时重验一遍：
+先直连探活 1 次，失败即按本节回退，并在本轮汇报里写明。探活与回退都要写进状态文件，
+供下轮读取，避免每轮重复摸索。
+
 【初始化 — 只做一次】
 HOME=$STATE "$BIN" init --endpoint $ENDPOINT --project $PROJECT --token "$TOKEN" --agent $AGENT_ID
 （状态落在 $STATE/.synapse-agent/，持久区，跨休眠保留游标）
