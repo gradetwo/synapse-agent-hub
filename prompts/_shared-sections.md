@@ -135,3 +135,17 @@ synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:�
 
 **报完之后**：普通上报不用你跟踪，管理侧分诊后会把 issue 派成任务（可能派给你，也可能派给别人）；如果上报时用了 `--self` 或之后用了 `issue-take`，任务已经派给你本人，按正常任务认领和执行即可。对应任务完成时 issue 自动关闭，任务被打回时自动重开。
 
+**把 issue_id 落盘**：无论普通上报还是 `--self`，都把返回的 `issue_id` 追加到状态目录下的 `my-issues.txt`（如 `~/.synapse-agent/my-issues.txt`；沙箱用它的持久状态目录），一行一个、去重；自助产生的 `task_id` 另记进 `claimed-tasks.txt`。普通 agent 查不了 issue 台账，这个文件就是空闲时找回旧 issue 的唯一索引；不要凭记忆猜 ID。
+
+## 六、空闲自驱（没有派单就自己找 issue，不空等）
+
+`wait` 退出码 3（没有消息）只代表这一刻没有管理端派单，不是收尾信号，也不是可以空等的理由。只要名下没有未完成 `claimed` 任务、也没有待取交付，就执行一轮空闲自驱：
+
+1. **拉最新代码**：在**本项目**的 git 工作区（任务交付所在仓库）执行 `git fetch origin`；工作区干净时 `git pull --ff-only`。有未提交改动时不要硬拉、不要 `reset --hard`/丢弃改动：先落盘或提交，或只读检查 `origin/main`（`git log --oneline HEAD..origin/main`、`git diff HEAD..origin/main`）再排查；非 git 项目跳过拉取，直接排查当前交付目录。
+2. **主动排查**：围绕当前项目跑构建、测试、静态检查；看失败用例、最近提交、TODO/FIXME、panic/ERROR 日志、文档与实现不一致、明显能力缺口。只找问题，不顺手改本任务范围外的代码。
+3. **发布 issue**：每个问题一条，正文必须有文件:行号、复现步骤、影响范围；先对照 `my-issues.txt` 和已知 issue，避免重复。一次最多挑 **1–2 条**自己解决：上报时加 `--self`，或先普通上报再用 `issue-take`；把返回的 `issue_id` 记进 `my-issues.txt`，`task_id` 记进 `claimed-tasks.txt`。
+4. **认领执行**：对自己认领的 `task_id` 先 `task-claim`，按正常闭环做完、交付、`task-release`；手上还有未完成任务时不再额外认领。
+5. **旧 issue 续认领**：任务完成回到 `wait`；如果管理员没有派新任务，读 `my-issues.txt`，对仍 `open`、`task_id` 为空、reporter 是自己的旧 issue 逐条执行 `issue-take --issue <id>`：成功就 claim 执行；`409 issue_already_dispatched` / `issue_not_open` 说明已被管理员处理或关闭，划掉跳过。一次只做 1 条。
+6. **继续找新问题**：旧 issue 也没有可认领的，就回到第 1 步继续 `git pull` + 排查 + 发布新 issue，形成“排查 → 发 issue → 自领 1–2 条 → 做完 → 再排查”的循环，不要回到被动空等。
+
+**节流与边界**：两轮空闲自驱至少间隔 60 秒；同一问题不要重复发；项目 issue 配额默认 20 条/分钟，不要刷 issue 洪水。不要为了显得忙去改无关代码、猜问题、发无证据的 issue；不要抢别人的任务或替管理员派单。

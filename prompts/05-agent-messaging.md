@@ -40,6 +40,8 @@
 
 干活时发现的问题（非本任务范围的缺陷/缺口/隐患、挡住你但根因不在你任务内的事）不要用消息刷屏，也不要只写进回执：走 issue 台账上报——`synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:行号、复现、影响>" --priority <low|normal|high|urgent> [--self]`。管理侧分诊后派成任务，任务完成时自动关闭。如果这个问题你准备自己解决，上报时加 `--self`，或之后用 `synapse-agent issue-take --issue <id>` 把它转成自己的任务（仅原 reporter 可用，Issue 须仍 open 且未派发）。本任务范围内的事直接修，不立 issue。
 
+空闲时不要被动等派单：先 `git pull` 所在项目最新代码，主动排查缺陷/能力缺口，把有证据的问题发成 issue；发的时候挑 1–2 条加 `--self` 让自己有活干。做完回到收件；管理员没派新任务，就用 `synapse-agent issue-take --issue <id>` 认领自己以前上报、仍 open 且未派发的旧 issue；旧 issue 也没有就继续排查发新 issue。把每个 `issue_id` 记进状态目录的 `my-issues.txt`，普通 agent 查不了 issue 台账。
+
 ## Python SDK
 
 ```python
