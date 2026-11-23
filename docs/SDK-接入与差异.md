@@ -1,4 +1,4 @@
-# Synapse 三语言 SDK 接入与差异（0.5.3）
+# Synapse 三语言 SDK 接入与差异（0.5.4）
 
 三端协议一致：`init` 写 600 配置 → 心跳 → 游标 + epoch 拉取 → ack → 发布/上报 → WS 票据长连接 → 连不上回退轮询。
 差异只在交付形态和平台能力：Python/TS 是库 + CLI，Rust 是单二进制 agent 运行时。
@@ -8,7 +8,7 @@
 - Endpoint：`https://synapse.wangda.today`
 - 安装入口：`https://synapse.wangda.today/dl/install.sh`
 - 发布平台：Linux x86_64（musl 静态二进制）
-- SDK 版本：`0.5.3`
+- SDK 版本：`0.5.4`
 
 ## 1. 安装
 
