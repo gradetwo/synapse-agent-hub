@@ -2138,19 +2138,41 @@ fn parse_proxy_url(raw: &str) -> Result<ProxyCfg, String> {
     })
 }
 
-/// 直连可达性探测：只看 TCP/TLS/HTTP 是否通。任何 HTTP 状态码（含 4xx/5xx）
-/// 都说明“直连能到达 Hub”，不应该因为业务错误就误切代理。
-fn direct_reachable(endpoint: &str) -> bool {
+/// 单次直连探测的超时：3 秒在抖动网络下频繁误判（wb-win-189 实测一分钟内
+/// 直连→代理→直连翻转，ISS-MWSP9ART-9C0134），放宽到 8 秒。
+const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// 首次失败后重试一次；两次都失败才判直连不可用，避免单次抖动就整场走代理。
+const DIRECT_PROBE_ATTEMPTS: u32 = 2;
+
+/// 一次直连探测：只看 TCP/TLS/HTTP 是否通。任何 HTTP 状态码（含 4xx/5xx）
+/// 都说明“直连能到达 Hub”，不应该因为业务错误就误切代理。通了返回本次耗时。
+fn probe_direct_once(endpoint: &str) -> Option<Duration> {
     let url = format!("{}/ver", endpoint.trim_end_matches('/'));
+    let started = std::time::Instant::now();
     let probe = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(3))
+        .timeout(DIRECT_PROBE_TIMEOUT)
         .user_agent(concat!("synapse-agent/", env!("CARGO_PKG_VERSION"), " (rust)"))
         .build();
     match probe.get(&url).call() {
-        Ok(_) => true,
-        Err(ureq::Error::Status(_, _)) => true,
-        Err(_) => false,
+        Ok(_) => Some(started.elapsed()),
+        Err(ureq::Error::Status(_, _)) => Some(started.elapsed()),
+        Err(_) => None,
     }
+}
+
+/// 直连可达性探测：最多试 DIRECT_PROBE_ATTEMPTS 次；通了返回成功那次的耗时，
+/// 供启动日志记录，免得再出现“探针误判、原因不明”。
+fn probe_direct(endpoint: &str) -> Option<Duration> {
+    for _ in 0..DIRECT_PROBE_ATTEMPTS {
+        if let Some(elapsed) = probe_direct_once(endpoint) {
+            return Some(elapsed);
+        }
+    }
+    None
+}
+
+fn direct_reachable(endpoint: &str) -> bool {
+    probe_direct(endpoint).is_some()
 }
 
 /// 启动时解析一次：显式 --proxy 优先；未显式指定时先试直连，失败才用环境代理。
@@ -2183,12 +2205,13 @@ fn init_proxy(endpoint: &str) {
                 if explicit {
                     eprintln!("[proxy] 已启用代理 {}（--proxy 参数）", p.display);
                     Some(p)
-                } else if direct_reachable(endpoint) {
+                } else if let Some(elapsed) = probe_direct(endpoint) {
                     // 默认直连优先：环境里虽然有代理变量，但 Hub 直连可达时不要绕代理。
-                    eprintln!("[proxy] 直连可用，跳过代理 {}（环境变量自动检测）", p.display);
+                    eprintln!("[proxy] 直连可用（探测耗时 {}ms），跳过代理 {}（环境变量自动检测）", elapsed.as_millis(), p.display);
                     None
                 } else {
-                    eprintln!("[proxy] 直连不可用，改用代理 {}（环境变量自动检测）", p.display);
+                    eprintln!("[proxy] 直连不可用（探测 {} 次均失败，单次超时 {}s），改用代理 {}（环境变量自动检测）",
+                              DIRECT_PROBE_ATTEMPTS, DIRECT_PROBE_TIMEOUT.as_secs(), p.display);
                     Some(p)
                 }
             }
@@ -2745,6 +2768,32 @@ mod tests {
             tmux_forward: false,
             tmux_verify: true,
         }
+    }
+
+    #[test]
+    fn direct_probe_reaches_local_listener() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+            }
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        assert!(probe_direct(&endpoint).is_some(), "live local listener must probe reachable");
+        let _ = server.join();
+    }
+
+    #[test]
+    fn direct_probe_dead_port_is_unreachable() {
+        // 绑一个端口再立刻释放：几乎必然无人监听，连接会被拒绝。
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+            .local_addr().unwrap().port();
+        assert!(probe_direct(&format!("http://127.0.0.1:{port}")).is_none(),
+                "refused port must probe unreachable after retries");
     }
 
     #[test]
