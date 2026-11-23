@@ -213,11 +213,18 @@ class Client:
             return {"queued": True, "dedupe_key": key}
 
     def report_issue(self, title: str, body: str = "", priority: str = "normal",
-                     labels: str = "") -> dict:
-        """上报 issue；所有 agent 默认可上报（服务端不要求 issues.report scope）。"""
+                     labels: str = "", self_assign: bool = False) -> dict:
+        """上报 issue；所有 agent 默认可上报（服务端不要求 issues.report scope）。
+        self_assign=True 时服务端会在同一个请求里把 Issue 转成 reporter 自己的任务。"""
         return self._post(f"/p/{self.project}/issues",
                           {"title": title, "body": body,
-                           "priority": priority, "labels": labels}, retry=False)
+                           "priority": priority, "labels": labels,
+                           "self_assign": bool(self_assign)}, retry=False)
+
+    def take_issue(self, issue_id: str) -> dict:
+        """上报者把一条仍 open、未派发的 Issue 转成自己的任务；只有 reporter 本人可用。"""
+        return self._post(f"/p/{self.project}/issues/{quote(str(issue_id), safe='')}/take", {},
+                          retry=False)
 
     def drain_outbox(self) -> dict:
         box = self.state_dir / "outbox"

@@ -38,7 +38,7 @@
 
 ## 发现问题走 issue，不走消息
 
-干活时发现的问题（非本任务范围的缺陷/缺口/隐患、挡住你但根因不在你任务内的事）不要用消息刷屏，也不要只写进回执：走 issue 台账上报——`synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:行号、复现、影响>" --priority <low|normal|high|urgent>`。管理侧分诊后派成任务，任务完成时自动关闭。本任务范围内的事直接修，不立 issue。
+干活时发现的问题（非本任务范围的缺陷/缺口/隐患、挡住你但根因不在你任务内的事）不要用消息刷屏，也不要只写进回执：走 issue 台账上报——`synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:行号、复现、影响>" --priority <low|normal|high|urgent> [--self]`。管理侧分诊后派成任务，任务完成时自动关闭。如果这个问题你准备自己解决，上报时加 `--self`，或之后用 `synapse-agent issue-take --issue <id>` 把它转成自己的任务（仅原 reporter 可用，Issue 须仍 open 且未派发）。本任务范围内的事直接修，不立 issue。
 
 ## Python SDK
 

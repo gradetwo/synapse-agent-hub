@@ -46,7 +46,13 @@ def cmd_update(a):
 def cmd_issue(a):
     c = Client.from_config(auto=False)
     print(json.dumps(c.report_issue(a.title, body=a.body or "", priority=a.priority,
-                                   labels=a.labels or ""), ensure_ascii=False, indent=2))
+                                   labels=a.labels or "", self_assign=a.self),
+                     ensure_ascii=False, indent=2))
+    return 0
+
+def cmd_issue_take(a):
+    c = Client.from_config(auto=False)
+    print(json.dumps(c.take_issue(a.issue_id), ensure_ascii=False, indent=2))
     return 0
 
 def cmd_issues(a):
@@ -100,7 +106,12 @@ def main(argv=None):
     issue.add_argument("--body", default="")
     issue.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
     issue.add_argument("--labels", default="")
+    issue.add_argument("--self", action="store_true",
+                       help="上报后立即转成自己的任务")
     issue.set_defaults(fn=cmd_issue)
+    issue_take = sub.add_parser("issue-take", help="把本人上报的 open Issue 转成自己的任务")
+    issue_take.add_argument("--issue", dest="issue_id", required=True)
+    issue_take.set_defaults(fn=cmd_issue_take)
     issues = sub.add_parser("issues", help="查看 Issue 台账（需 admin token）")
     issues.add_argument("--status", choices=["", "open", "closed", "merged"], default="")
     issues.add_argument("--limit", type=int, default=100)

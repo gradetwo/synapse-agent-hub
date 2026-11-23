@@ -137,6 +137,10 @@ components:
         body: { type: string, maxLength: 20000, default: '' }
         priority: { type: string, enum: [low, normal, high, urgent], default: normal }
         labels: { type: string, maxLength: 300, default: '' }
+        self_assign:
+          type: boolean
+          default: false
+          description: 上报后立即转成 reporter 自己的任务（返回 task_id）
     Broadcast:
       type: object
       required: [broadcast_id, severity, title]
@@ -393,9 +397,27 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/IssueCreate' }
       responses:
-        '201': { description: 已创建，返回 issue_id / status / priority / seq }
+        '201': { description: 已创建，返回 issue_id / status / priority / seq / task_id；勾选 self_assign 时 self_task 为建任务结果，失败时 ok=false 且 Issue 仍为 open，可调用 /take 重试 }
         '422': { description: title_required / title_too_long / body_too_long / bad_priority / secret_detected }
         '429': { description: issue_rate_limited（默认 20 条/分钟/项目） }
+  /p/{project}/issues/{issueId}/take:
+    post:
+      summary: 上报者把 open Issue 转成自己的任务
+      description: 只有 issues.reporter 本人可以调用；等价于管理员 dispatch，但 to 固定为 reporter，不接受客户端指定他人。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: issueId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task_id: { type: string, maxLength: 64, description: 可选；不填由服务端生成 }
+      responses:
+        '200': { description: 已创建任务，返回 task_id / assigned_to / task_link }
+        '403': { description: not_issue_reporter }
+        '409': { description: issue_not_open / issue_already_dispatched }
   /p/{project}/ws-ticket:
     get:
       summary: 用 Bearer 换一次性 WebSocket 票据

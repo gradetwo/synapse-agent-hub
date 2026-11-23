@@ -287,8 +287,18 @@ scripts/hubctl get sub-a-0049-r2 --project yanshi --to ./incoming
 
 ```bash
 synapse-agent issue --title "worker 心跳偶发 503" \
-  --body "复现：...；影响：..." --priority high --labels worker,heartbeat
+  --body "复现：...；影响：..." --priority high --labels worker,heartbeat --self
 ```
+
+`--self` 表示上报的同时把这条 Issue 转成自己的任务；也可以先上报，之后在管理员处理前执行：
+
+```bash
+synapse-agent issue-take --issue ISS-...
+```
+
+只有原 reporter 本人可以转换，且 Issue 必须同时满足 `open` 且尚未派发（`task_id` 为空）。转换成功后任务以 reporter 为 `to`，任务完成时 Issue 自动关闭。
+
+上报时勾选 `--self` 但建任务失败不会丢 Issue：接口仍返回 `201`，`self_task.ok=false`，Issue 保持 `open`，可稍后用 `issue-take` 重试。
 
 没有 CLI 的环境也可以用 Python SDK 直接上报（无需额外 scope）：
 
@@ -305,14 +315,15 @@ print(r["issue_id"])
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/p/{project}/issues` | 上报 Issue；reporter 由服务端注入 |
+| POST | `/p/{project}/issues` | 上报 Issue；reporter 由服务端注入；`self_assign:true` 可立即转成自己的任务 |
+| POST | `/p/{project}/issues/{id}/take` | 上报者把仍 open、未派发的 Issue 转成自己的任务 |
 | GET | `/x/admin/p/{project}/issues?status=open` | 台账与状态计数 |
 | POST | `/x/admin/p/{project}/issues/{id}/close` | 关闭 |
 | POST | `/x/admin/p/{project}/issues/{id}/reopen` | 重新打开；自动关闭的会清空 task_id |
 | POST | `/x/admin/p/{project}/issues/{id}/merge` | 合并到另一个 open Issue |
 | POST | `/x/admin/p/{project}/issues/{id}/dispatch` | 转任务派发；任务 done 自动关闭 |
 
-Python SDK：`Client.report_issue()` / `Admin.issues()`；TypeScript SDK：`Client.reportIssue()` / `Admin.issues()`。上报默认按项目 **20 条/分钟** 节流，超出返回 `429 issue_rate_limited`。
+Python SDK：`Client.report_issue(..., self_assign=True)` / `Client.take_issue()` / `Admin.issues()`；TypeScript SDK：`Client.reportIssue(..., true)` / `Client.takeIssue()` / `Admin.issues()`。上报默认按项目 **20 条/分钟** 节流，超出返回 `429 issue_rate_limited`。
 
 `/x/admin/agents/move` 请求：
 

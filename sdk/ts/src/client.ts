@@ -209,8 +209,15 @@ export class Client {
 
   /** 上报 Issue；所有 agent 默认可上报，服务端注入 reporter。 */
   reportIssue(title: string, body = "", priority: "low" | "normal" | "high" | "urgent" = "normal",
-              labels = "") {
-    return this.post(`/p/${this.opts.project}/issues`, { title, body, priority, labels });
+              labels = "", selfAssign = false) {
+    return this.post(`/p/${this.opts.project}/issues`, {
+      title, body, priority, labels, self_assign: selfAssign,
+    });
+  }
+
+  /** 上报者把仍 open、未派发的 Issue 转成自己的任务。 */
+  takeIssue(issueId: string) {
+    return this.post(`/p/${this.opts.project}/issues/${encodeURIComponent(issueId)}/take`, {});
   }
 
   // ── 交付 ──────────────────────────────────────────────

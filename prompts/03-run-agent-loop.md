@@ -197,14 +197,15 @@ curl -fsS -X POST "$ENDPOINT/p/$PROJECT/report" \
 
 **怎么报**：
 ```
-synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:行号、复现步骤、影响范围>" --priority <low|normal|high|urgent>
+synapse-agent issue --title "<一句话说清问题>" --body "<证据：文件:行号、复现步骤、影响范围>" --priority <low|normal|high|urgent> [--self]
 ```
 - 标题一句话，只说问题本身，不写修法。
 - 正文必须带证据：定位（文件与行号）、怎么复现、影响什么。没有证据的 issue 会被退回重报。
 - 优先级口径：urgent = 正在造成数据损坏/安全问题/全线停工；high = 功能缺陷，影响交付；normal = 一般缺口与隐患；low = 小瑕疵与改进建议。
 - 正文太长用 --body-file <path>。
+- 如果这条问题你准备自己解决，就在上报时加 `--self`，Issue 会立即转成你的任务；已经先报了的，可在管理员处理前用 `synapse-agent issue-take --issue <id>` 转成自己的任务。只有原 reporter 本人能转，且 Issue 必须仍是 open、尚未派发。
 
-**报完之后**：不用你跟踪。管理侧分诊后会把 issue 派成任务（可能派给你，也可能派给别人）；对应任务完成时 issue 自动关闭，任务被打回时自动重开。你只要在自己的任务里正常干活。
+**报完之后**：普通上报不用你跟踪，管理侧分诊后会把 issue 派成任务（可能派给你，也可能派给别人）；如果上报时用了 `--self` 或之后用了 `issue-take`，任务已经派给你本人，按正常任务认领和执行即可。对应任务完成时 issue 自动关闭，任务被打回时自动重开。
 
 ## 收尾自检（停下之前逐项核对）
 

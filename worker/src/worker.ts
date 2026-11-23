@@ -10,7 +10,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "issue-hardening-20261123";
+const BUILD_TAG = "issue-self-assign-20261123";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.3";
 
@@ -309,6 +309,12 @@ export default {
     if (action === "issues" && req.method === "POST")
       return createIssue(req, env, project, auth.agentId!);
 
+    // 上报者自助转任务：只允许 issue.reporter 本人，且必须仍是 open 且未派发。
+    // 不能复用管理员的 /dispatch 路由，否则普通 agent 可以替别人派单。
+    const issueTake = action.match(/^issues\/([A-Za-z0-9._:-]{1,128})\/take$/);
+    if (issueTake && req.method === "POST")
+      return takeIssue(req, env, project, auth.agentId!, issueTake[1]);
+
     let pubMaxPerMin = 0;
     if (["publish", "report"].includes(action) && req.method === "POST") {
       // 只注入配额，计数由 DO 原子完成；Worker 侧预查会让幂等重试误吃 429
@@ -548,7 +554,7 @@ function need(action: string) {
   if (action.startsWith("tasks/admin-")) return "admin";
   if (action === "tasks/list" || action === "tasks/get") return "admin"; // 台账/单任务元数据不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
-  if (action === "issues") return "issues.report";
+  if (action === "issues" || action.startsWith("issues/")) return "issues.report";
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
 }
@@ -1146,47 +1152,17 @@ async function admin(req: Request, env: Env, url: URL) {
       }
 
       // dispatch：把 issue 转成任务并派发；任务完成后 ProjectRoom 自动 close issue。
-      if (row.status !== "open") return err(409, "issue_not_open");
-      if (row.task_id) return err(409, "issue_already_dispatched");
-      // 默认任务号带时间后缀：issue 重开后再次派发不能撞上上一轮已完成的 task_id。
-      const taskId = String(b.task_id ?? "").trim() ||
-        `T-${issueId}-${now.toString(36).toUpperCase()}`;
-      if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
-      // 先原子占住 task_id，避免双击/两个管理端同时派发造出两个任务。
-      const claim = await env.DB.prepare(
-        `UPDATE issues SET task_id = ?, updated_at = ?
-           WHERE project = ? AND issue_id = ? AND status = 'open' AND task_id IS NULL`
-      ).bind(taskId, now, project, issueId).run();
-      if (claim.meta.changes === 0) return err(409, "issue_already_dispatched");
-      const to = b.to === undefined || b.to === null || String(b.to).trim() === ""
-        ? null : String(b.to).trim();
-      const title = String(b.title ?? row.title).trim() || row.title;
-      const body = String(b.body ?? row.body ?? "");
-      const quota = await projectQuota(env, project);
-      let dr: Response;
-      try {
-        dr = await stub.fetch(new Request("https://do/tasks/create", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ task_id: taskId, title, body, to, issue_id: issueId,
-                                 project, sender: "admin", max_per_min: quota.maxMsgsPerMin }),
-        }));
-      } catch (e: any) {
-        await env.DB.prepare(
-          "UPDATE issues SET task_id = NULL, updated_at = ? WHERE project = ? AND issue_id = ? AND task_id = ?"
-        ).bind(Date.now(), project, issueId, taskId).run().catch(() => {});
-        console.warn("issue dispatch failed", issueId, e);
-        return err(503, "task_dispatch_failed");
-      }
-      const d: any = await dr.json().catch(() => ({}));
-      if (!dr.ok) {
-        // DO 建单失败时释放占位，允许修好目标后重试。
-        await env.DB.prepare(
-          "UPDATE issues SET task_id = NULL, updated_at = ? WHERE project = ? AND issue_id = ? AND task_id = ?"
-        ).bind(Date.now(), project, issueId, taskId).run().catch(() => {});
-        return Response.json(d, { status: dr.status });
-      }
-      return json({ ok: true, issue_id: issueId, status: "open", task_id: taskId,
-                    dispatched: true, task_link: d });
+      const out = await dispatchIssueToTask(env, project, issueId, {
+        to: b.to === undefined || b.to === null || String(b.to).trim() === ""
+          ? null : String(b.to).trim(),
+        sender: "admin",
+        taskId: String(b.task_id ?? "").trim() || undefined,
+        title: b.title,
+        body: b.body,
+      });
+      if (!out.ok) return out.detail ? json(out.detail, out.status) : err(out.status, out.error);
+      return json({ ok: true, issue_id: issueId, status: "open", task_id: out.task_id,
+                    dispatched: true, task_link: out.task });
     }
 
     if (action === "snapshot") return stub.fetch(new Request("https://do/snapshot"));
@@ -1987,6 +1963,76 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
                 seq: seq.seq ?? null });
 }
 
+/**
+ * 把 issue 原子地转成一个任务。管理员派单和上报者自助转任务共用这一条路径：
+ * 先 UPDATE 占住 task_id，再让 DO 建单；建单失败释放占位，避免并发双击造出两个任务。
+ */
+async function dispatchIssueToTask(
+  env: Env, project: string, issueId: string,
+  opts: { to: string | null; sender: string; taskId?: string; title?: string; body?: string },
+): Promise<{ ok: true; task_id: string; task: any }
+        | { ok: false; status: number; error: string; detail?: any }> {
+  const row = await env.DB.prepare(
+    "SELECT * FROM issues WHERE project = ? AND issue_id = ?"
+  ).bind(project, issueId).first<any>();
+  if (!row) return { ok: false, status: 404, error: "issue_not_found" };
+  if (row.status !== "open") return { ok: false, status: 409, error: "issue_not_open" };
+  if (row.task_id) return { ok: false, status: 409, error: "issue_already_dispatched" };
+  const now = Date.now();
+  const taskId = String(opts.taskId ?? "").trim() ||
+    `T-${issueId.replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 24)}-${now.toString(36).toUpperCase()}-${crypto.randomUUID().slice(0, 4)}`;
+  if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId))
+    return { ok: false, status: 422, error: "bad_task_id" };
+  const claim = await env.DB.prepare(
+    `UPDATE issues SET task_id = ?, updated_at = ?
+       WHERE project = ? AND issue_id = ? AND status = 'open' AND task_id IS NULL`
+  ).bind(taskId, now, project, issueId).run();
+  if (claim.meta.changes === 0)
+    return { ok: false, status: 409, error: "issue_already_dispatched" };
+  const title = String(opts.title ?? row.title).trim() || row.title;
+  const body = String(opts.body ?? row.body ?? "");
+  const quota = await projectQuota(env, project);
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  let dr: Response;
+  try {
+    dr = await stub.fetch(new Request("https://do/tasks/create", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ task_id: taskId, title, body, to: opts.to, issue_id: issueId,
+                             project, sender: opts.sender, max_per_min: quota.maxMsgsPerMin }),
+    }));
+  } catch (e) {
+    await env.DB.prepare(
+      "UPDATE issues SET task_id = NULL, updated_at = ? WHERE project = ? AND issue_id = ? AND task_id = ?"
+    ).bind(Date.now(), project, issueId, taskId).run().catch(() => {});
+    console.warn("issue dispatch failed", issueId, e);
+    return { ok: false, status: 503, error: "task_dispatch_failed" };
+  }
+  const d: any = await dr.json().catch(() => ({}));
+  if (!dr.ok) {
+    await env.DB.prepare(
+      "UPDATE issues SET task_id = NULL, updated_at = ? WHERE project = ? AND issue_id = ? AND task_id = ?"
+    ).bind(Date.now(), project, issueId, taskId).run().catch(() => {});
+    return { ok: false, status: dr.status, error: String(d.error ?? "task_dispatch_failed"), detail: d };
+  }
+  return { ok: true, task_id: taskId, task: d };
+}
+
+/** 上报者把一条 open issue 转成自己的任务；只有 reporter 本人可以调用。 */
+async function takeIssue(req: Request, env: Env, project: string, agentId: string, issueId: string) {
+  const row = await env.DB.prepare(
+    "SELECT issue_id, reporter, status, task_id FROM issues WHERE project = ? AND issue_id = ?"
+  ).bind(project, issueId).first<any>();
+  if (!row) return err(404, "issue_not_found");
+  if (row.reporter !== agentId) return err(403, "not_issue_reporter");
+  const b: any = await req.json().catch(() => ({}));
+  const out = await dispatchIssueToTask(env, project, issueId, {
+    to: agentId, sender: agentId, taskId: String(b.task_id ?? "").trim() || undefined,
+  });
+  if (!out.ok) return out.detail ? json(out.detail, out.status) : err(out.status, out.error);
+  return json({ ok: true, issue_id: issueId, status: "open", task_id: out.task_id,
+                assigned_to: agentId, task_link: out.task });
+}
+
 /** 所有 agent 都可上报 issue；身份由服务端注入，不接受客户端自报 reporter。 */
 async function createIssue(req: Request, env: Env, project: string, agentId: string) {
   const b: any = await req.json().catch(() => ({}));
@@ -1999,6 +2045,8 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
   if (!["low", "normal", "high", "urgent"].includes(priority))
     return err(422, "bad_priority");
   const labels = String(b.labels ?? "").trim().slice(0, 300);
+  const selfAssign = b.self_assign === true || b.self_assign === 1
+    || b.self_assign === "1" || b.self_assign === "true";
   const now = Date.now();
   // Issue 同样要节流：all-agent 开放后不能变成无限 D1 写入入口。
   // 用项目级分钟窗口，默认最多 20 条/分钟；不额外建表，也不走过期 DO 热状态。
@@ -2019,6 +2067,18 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
                          reporter, created_at, updated_at)
      VALUES (?,?,?,?, 'open', ?, ?, ?, ?, ?)`
   ).bind(project, issueId, title, body, priority, labels, agentId, now, now).run();
+
+  // 上报时勾选“自己解决”：Issue 落库后立即转成 reporter 的任务。
+  // Issue 已经落库，所以即使建任务失败也返回 201 + self_task.error，避免客户端
+  // 把“上报失败”重试成重复 Issue；上报者之后仍可调用 /take 重试。
+  let selfTask: any = null;
+  if (selfAssign) {
+    const out = await dispatchIssueToTask(env, project, issueId, { to: agentId, sender: agentId });
+    selfTask = out.ok
+      ? { ok: true, task_id: out.task_id, task_link: out.task }
+      : { ok: false, status: out.status, error: out.error };
+  }
+
   // 让管理台 WS 立即刷新 Issue tab；普通 agent 看不到这条广播（send 方不是 admin）。
   // 消息写入失败不影响已经落库的 issue。
   let seq: number | null = null;
@@ -2035,7 +2095,9 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
   } catch (e) {
     console.warn("issue publish failed", issueId, e);
   }
-  return json({ issue_id: issueId, status: "open", priority, seq, created_at: now }, 201);
+  return json({ issue_id: issueId, status: "open", priority, seq, created_at: now,
+                self_assign: selfAssign, task_id: selfTask?.task_id ?? null,
+                self_task: selfTask }, 201);
 }
 
 // ── 会话（HttpOnly cookie + HMAC 签名）─────────────────────
