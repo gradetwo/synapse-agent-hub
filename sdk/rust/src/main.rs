@@ -1099,6 +1099,13 @@ fn main() {
                             }
                             #[cfg(not(windows))]
                             {
+                                // 先补权限位再 rename：临时文件默认 0644，直接覆盖会让
+                                // 新二进制丢可执行位（ISS-MWSNUQQP-58ECCC）。
+                                if let Err(e) = apply_upgrade_mode(&tmp, &current) {
+                                    eprintln!("设置新二进制权限失败：{e}；已放弃替换（旧版本未动）");
+                                    let _ = fs::remove_file(&tmp);
+                                    std::process::exit(5);
+                                }
                                 match fs::rename(&tmp, &current) {
                                     Ok(_) => println!("{}", json!({"ok": true, "from": mine, "to": latest,
                                                                   "platform": platform, "bytes": b.len()})),
@@ -2160,6 +2167,16 @@ fn probe_direct_once(endpoint: &str) -> Option<Duration> {
     }
 }
 
+/// 升级替换前把旧二进制的权限位复制到临时文件：fs::write 新建的文件是 0644，
+/// rename 覆盖后新二进制没有可执行位，进程下次启动直接 Permission denied
+/// （ISS-MWSNUQQP-58ECCC）。读不到旧权限时兜底 0755，并强制带上执行位。
+#[cfg(not(windows))]
+fn apply_upgrade_mode(tmp: &str, current: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(current).map(|m| m.permissions().mode()).unwrap_or(0o755);
+    fs::set_permissions(tmp, fs::Permissions::from_mode(mode | 0o111))
+}
+
 /// 直连可达性探测：最多试 DIRECT_PROBE_ATTEMPTS 次；通了返回成功那次的耗时，
 /// 供启动日志记录，免得再出现“探针误判、原因不明”。
 fn probe_direct(endpoint: &str) -> Option<Duration> {
@@ -2768,6 +2785,22 @@ mod tests {
             tmux_forward: false,
             tmux_verify: true,
         }
+    }
+
+    #[test]
+    fn upgrade_mode_preserves_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("upgrade-mode");
+        let current = dir.join("synapse-agent");
+        let tmp = dir.join("synapse-agent.new");
+        fs::write(&current, b"old").unwrap();
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(&tmp, b"new").unwrap(); // fs::write 新建文件是 0644，没有可执行位
+        let before = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(before & 0o111, 0, "fixture tmp file must start without exec bits");
+        apply_upgrade_mode(tmp.to_str().unwrap(), &current).unwrap();
+        let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o751, "tmp must inherit the old binary's mode before rename");
     }
 
     #[test]
