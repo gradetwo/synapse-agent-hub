@@ -148,20 +148,36 @@ mod sys {
 
 #[cfg(windows)]
 mod uia {
-    use windows::Win32::Foundation::HWND;
+    use std::os::raw::c_long;
+    use windows::Win32::Foundation::{HWND, POINT};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_EditControlTypeId, UIA_DocumentControlTypeId,
-        UIA_GroupControlTypeId, UIA_PaneControlTypeId, UIA_TextControlTypeId, UIA_TextPatternId,
-        UIA_ValuePatternId, IUIAutomationTextPattern,
+        TreeScope_Descendants, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+        UIA_GroupControlTypeId, UIA_HyperlinkControlTypeId, UIA_PaneControlTypeId,
+        UIA_TextControlTypeId, UIA_TextPatternId, UIA_ValuePatternId, IUIAutomationTextPattern,
     };
 
     /// 找 composer 控件本身，供“取矩形”和“读输入框内容”共用同一套评分，
     /// 避免两次查找选中不同控件（一次点击搜索框、一次读正文）。
+    ///
+    /// 首次查找时窗口可能还在恢复/重排（豆包启动、切会话、刚激活），UIA 树里
+    /// 暂时没有 composer；这里做短重试，避免直接掉到固定坐标兜底。
     fn find_composer(hwnd: usize) -> Option<(IUIAutomationElement, (i32, i32, i32, i32))> {
+        for attempt in 0..6 {
+            if let Some(result) = find_composer_once(hwnd) {
+                return Some(result);
+            }
+            if attempt < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        None
+    }
+
+    fn find_composer_once(hwnd: usize) -> Option<(IUIAutomationElement, (i32, i32, i32, i32))> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let automation: IUIAutomation =
@@ -186,14 +202,24 @@ mod uia {
                 // name=doc_editor，class 含 input-content-container，位于窗口底部。
                 // WorkBuddy 等 Electron 应用也常把 contenteditable 暴露成 Group/Pane，
                 // 所以对这类“输入容器”单独识别，不能只认 Edit。
-                let is_input_container = ct == UIA_GroupControlTypeId || ct == UIA_PaneControlTypeId;
                 let class_looks_like_composer = [
                     "input-content", "composer", "chat-input", "chatinput",
                     "message-input", "prompt-input", "editor-input", "input-container",
                     "tiptap", "prosemirror", "contenteditable", "text-input",
                 ].iter().any(|x| lower_class.contains(x));
+                let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+                let lower = name.to_lowercase();
+                // Group/Pane 只有两种进入候选：
+                // 1) class 像输入容器（input-content / tiptap / ProseMirror ...）；
+                // 2) name 明确是 doc_editor。
+                // 之前只放行外层 input-content，内层 tiptap 被过滤；豆包切换会话时
+                // 外层容器可能暂时不在 UIA 树里，内层就是唯一可用落点。
+                let composer_class_or_name = class_looks_like_composer || lower.contains("doc_editor");
+                let is_input_container = ct == UIA_GroupControlTypeId || ct == UIA_PaneControlTypeId;
+                // 只有 Edit/Document 或真正的输入容器才能进候选。若放开到所有控件类型，
+                // 某些消息气泡/按钮只要 class 命中 "contenteditable" 也会被当成 composer。
                 if ct != UIA_EditControlTypeId && ct != UIA_DocumentControlTypeId
-                    && !(is_input_container && class_looks_like_composer) {
+                    && !(is_input_container && composer_class_or_name) {
                     continue;
                 }
                 if let Ok(off) = el.CurrentIsOffscreen() {
@@ -229,8 +255,6 @@ mod uia {
                 if w >= win_w.saturating_mul(9) / 10 && h >= win_h.saturating_mul(2) / 3 {
                     continue;
                 }
-                let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
-                let lower = name.to_lowercase();
                 let mut score = if ct == UIA_EditControlTypeId { 8 } else { 2 };
                 if class_looks_like_composer { score += 16; }
                 // 真正的 composer 在 input-content-container 里；消息气泡没有这个祖先，
@@ -403,6 +427,140 @@ mod uia {
         out
     }
 
+    /// 当前活动会话标题。豆包的顶层 Document 名称形如
+    /// `◆dou-win-133 - 豆包`，取 ` - ` 左侧；找不到时退回顶部居中 Text。
+    fn current_conversation_title(hwnd: usize) -> Option<String> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void)).ok()?;
+            let condition = automation.CreateTrueCondition().ok()?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition).ok()?;
+            let count = elements.Length().ok()?;
+
+            for i in 0..count {
+                let Ok(el) = elements.GetElement(i) else { continue };
+                if el.CurrentControlType().ok() != Some(UIA_DocumentControlTypeId) { continue; }
+                let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+                if let Some(pos) = name.rfind(" - ") {
+                    let prefix = name[..pos].trim();
+                    if !prefix.is_empty() {
+                        return Some(prefix.to_string());
+                    }
+                }
+            }
+
+            // 兼容没有 Document 名称的应用：顶部标题文本（用窗口中心附近过滤掉侧栏）。
+            let mut wr = super::sys::RECT::default();
+            super::sys::GetWindowRect(hwnd as super::sys::HWND, &mut wr);
+            let win_w = (wr.right - wr.left) as i32;
+            let win_center = wr.left + win_w / 2;
+            let mut best: Option<(i32, String)> = None;
+            for i in 0..count {
+                let Ok(el) = elements.GetElement(i) else { continue };
+                if el.CurrentControlType().ok() != Some(UIA_TextControlTypeId) { continue; }
+                if el.CurrentIsOffscreen().map(|b| b.as_bool()).unwrap_or(true) { continue; }
+                let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+                if name.trim().is_empty() { continue; }
+                let Ok(r) = el.CurrentBoundingRectangle() else { continue };
+                let h = r.bottom - r.top;
+                let w = r.right - r.left;
+                if h < 14 || h > 60 || w < 40 || w > 600 { continue; }
+                if r.top > wr.top + 180 || r.bottom < wr.top + 40 { continue; }
+                let center = (r.left + r.right) / 2;
+                let dist = (center - win_center).abs();
+                if dist > 400 { continue; }
+                if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
+                    best = Some((dist, name));
+                }
+            }
+            best.map(|(_, name)| name)
+        }
+    }
+
+    /// 确保目标会话是当前活动会话：
+    /// 1) 已匹配则直接返回；
+    /// 2) 未匹配时在左侧会话列表找 name 含 `want` 的 Hyperlink（class 含 conversation-item），
+    ///    点击它并等标题变化；
+    /// 3) 找不到/切换失败时返回错误，由调用方保留 WAL、不 ACK，绝不能把消息投进错误会话。
+    pub fn ensure_conversation(hwnd: usize, want: &str) -> Result<(), String> {
+        let want = want.trim();
+        if want.is_empty() {
+            return Ok(());
+        }
+        super::activate_window(hwnd)?;
+        if let Some(current) = current_conversation_title(hwnd) {
+            if current.contains(want) {
+                eprintln!("[conversation] 当前会话已匹配：{current:?}");
+                return Ok(());
+            }
+            eprintln!("[conversation] 当前会话={current:?}，目标={want:?}，准备从会话列表切换");
+        } else {
+            eprintln!("[conversation] 无法读取当前会话标题，目标={want:?}，仍尝试从会话列表切换");
+        }
+
+        let click_pos = unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| format!("创建 UIAutomation 失败：{e}"))?;
+            let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))
+                .map_err(|e| format!("取窗口 UIA 根失败：{e}"))?;
+            let condition = automation.CreateTrueCondition()
+                .map_err(|e| format!("创建 UIA 条件失败：{e}"))?;
+            let elements = root.FindAll(TreeScope_Descendants, &condition)
+                .map_err(|e| format!("枚举 UIA 控件失败：{e}"))?;
+            let count = elements.Length().map_err(|e| format!("读取 UIA 控件数失败：{e}"))?;
+            let mut hit: Option<(i32, i32, String)> = None;
+            for i in 0..count {
+                let Ok(el) = elements.GetElement(i) else { continue };
+                if el.CurrentControlType().ok() != Some(UIA_HyperlinkControlTypeId) { continue; }
+                let name = el.CurrentName().map(|s| s.to_string()).unwrap_or_default();
+                let class = el.CurrentClassName().map(|s| s.to_string()).unwrap_or_default();
+                if !name.contains(want) || !class.contains("conversation-item") { continue; }
+                if el.CurrentIsOffscreen().map(|b| b.as_bool()).unwrap_or(false) { continue; }
+                let Ok(r) = el.CurrentBoundingRectangle() else { continue };
+                if r.right - r.left < 80 || r.bottom - r.top < 18 { continue; }
+                let mut p = POINT::default();
+                let point = el.GetClickablePoint(&mut p).ok()
+                    .map(|_| (p.x, p.y))
+                    .unwrap_or(((r.left + r.right) / 2, (r.top + r.bottom) / 2));
+                hit = Some((point.0, point.1, name));
+                break;
+            }
+            hit
+        };
+
+        let Some((x, y, name)) = click_pos else {
+            return Err(format!("会话列表中没有找到包含 {want:?} 的 conversation-item"));
+        };
+        eprintln!("[conversation] 点击会话 {name:?} @({x},{y})");
+        unsafe {
+            let h = hwnd as super::sys::HWND;
+            let pt = super::sys::POINT { x: x as c_long, y: y as c_long };
+            let hit = super::sys::WindowFromPoint(pt);
+            if hit.is_null() || super::sys::GetAncestor(hit, super::sys::GA_ROOT) != h {
+                return Err(format!("会话列表点击坐标被其它窗口遮挡（hit hwnd={:#x}）", hit as usize));
+            }
+            super::sys::SetCursorPos(x, y);
+            super::sys::Sleep(80);
+            super::sys::mouse_event(super::sys::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            super::sys::Sleep(50);
+            super::sys::mouse_event(super::sys::MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        }
+
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if current_conversation_title(hwnd).map(|s| s.contains(want)).unwrap_or(false) {
+                eprintln!("[conversation] 已切换到目标会话：{want:?}");
+                return Ok(());
+            }
+        }
+        let current = current_conversation_title(hwnd).unwrap_or_else(|| "<unknown>".into());
+        Err(format!("点击会话后仍未匹配目标标题：当前={current:?} 目标={want:?}"))
+    }
+
     /// 当前键盘焦点是否已经在 composer 上。Electron 应用（WorkBuddy）打开欢迎页时
     /// 会自动聚焦输入框，此时再按 UIA 矩形点一次反而可能点到建议按钮，必须先读焦点。
     pub(super) fn input_has_focus(hwnd: usize) -> bool {
@@ -411,11 +569,13 @@ mod uia {
     }
 }
 
-
 #[cfg(not(windows))]
 mod uia {
     pub fn find_input_rect(_hwnd: usize) -> Option<(i32, i32, i32, i32)> { None }
     pub fn input_value(_hwnd: usize) -> Option<String> { None }
+    pub fn ensure_conversation(_hwnd: usize, _want: &str) -> Result<(), String> {
+        Err("窗口桥仅在 Windows 上可用".into())
+    }
 }
 
 pub struct WindowInfo {
@@ -659,6 +819,12 @@ pub fn activate_window(_hwnd: usize) -> Result<(), String> {
     Err("窗口桥仅在 Windows 上可用".into())
 }
 
+/// 确保目标会话是当前活动会话。Windows 上用 UIA 读标题并点击左侧会话项；
+/// 非 Windows 直接返回不支持。
+pub fn ensure_conversation(hwnd: usize, want: &str) -> Result<(), String> {
+    uia::ensure_conversation(hwnd, want)
+}
+
 /// 写文本到系统剪贴板（Unicode）。调用方负责先 OpenClipboard。
 #[cfg(windows)]
 unsafe fn set_clipboard_text(text: &str) -> Result<(), String> {
@@ -836,10 +1002,18 @@ pub fn send_text_click_paste(
                 (((l + r) / 2) as c_long, cy as c_long)
             }
             _ => {
-                eprintln!("[winmsg] UIA 未找到输入框，回退固定比例 {click_x_ratio}/{click_y_ratio}");
+                // 豆包当前窗口的 composer 在窗口底部（实测 hwnd 722318 时约 607-707，
+                // 窗口高 723）；0.83 比例会点在上方的消息正文，输入框反而没有焦点。
+                // 回退改成从窗口底边往上 80px，仍保留 x 比例给不同布局。
+                eprintln!("[winmsg] UIA 未找到输入框，回退窗口底部输入区 (x_ratio={click_x_ratio}, y=bottom-80)");
+                let fallback_cy = if hgt >= 240.0 {
+                    rect.bottom - 80
+                } else {
+                    rect.top + (hgt * click_y_ratio) as c_long
+                };
                 (
                     rect.left + (w * click_x_ratio) as c_long,
-                    rect.top + (hgt * click_y_ratio) as c_long,
+                    fallback_cy,
                 )
             }
         };

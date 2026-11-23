@@ -37,6 +37,9 @@ struct Cfg {
     exec_cmd: Option<String>,
     /// 默认窗口目标（应用名，如「豆包」），由 win-config 写入 config.json。
     window_app: String,
+    /// 目标会话标题（特殊标记，如「◆dou-win-133」）。非空时窗口投递前先确保
+    /// 该会话是当前活动会话；否则从左侧会话列表点击切换，失败则不 ACK。
+    window_conversation: String,
     /// `run --window 1` / config.json 的 window_forward：把收件消息真正注入窗口后才 ACK。
     window_forward: bool,
     /// 默认 tmux pane（如 `agent:0.0` / `%3`），由 tmux-config 写入 config.json。
@@ -85,7 +88,8 @@ impl Cfg {
             cmd: self.cmd.clone(), endpoint: self.endpoint.clone(), project: self.project.clone(),
             token: self.token.clone(), agent_id: self.agent_id.clone(), dir: self.dir.clone(),
             heartbeat_s: self.heartbeat_s, exec_cmd: self.exec_cmd.clone(),
-            window_app: self.window_app.clone(), window_forward: self.window_forward,
+            window_app: self.window_app.clone(), window_conversation: self.window_conversation.clone(),
+            window_forward: self.window_forward,
             tmux_target: self.tmux_target.clone(), tmux_forward: self.tmux_forward,
             tmux_verify: self.tmux_verify,
         }
@@ -106,13 +110,19 @@ impl Cfg {
             .ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
         let endpoint = map.get("endpoint").cloned()
             .or_else(|| saved["endpoint"].as_str().map(|s| s.to_string()))
+            .or_else(|| std::env::var("SYNAPSE_ENDPOINT").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| std::env::var("YANSHI_ENDPOINT").ok().filter(|s| !s.trim().is_empty()))
             .unwrap_or_else(|| "http://127.0.0.1:8787".into());
         let project = map.get("project").cloned()
             .or_else(|| saved["project"].as_str().map(|s| s.to_string()))
+            .or_else(|| std::env::var("SYNAPSE_PROJECT").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| std::env::var("YANSHI_PROJECT").ok().filter(|s| !s.trim().is_empty()))
             .unwrap_or_else(|| "yanshi".into());
         let token = map.get("token").cloned()
             .or_else(|| saved["token"].as_str().map(|s| s.to_string()))
-            .or_else(|| std::env::var("YANSHI_TOKEN").ok()).unwrap_or_default();
+            .or_else(|| std::env::var("SYNAPSE_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+            .or_else(|| std::env::var("YANSHI_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+            .unwrap_or_default();
         let agent_id = map.get("agent").cloned()
             .or_else(|| saved["agent_id"].as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "rust-agent".into());
@@ -120,6 +130,14 @@ impl Cfg {
             .or_else(|| saved["heartbeat_s"].as_u64()).unwrap_or(60);
         let window_app = map.get("app").cloned()
             .or_else(|| saved["window_app"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        // 目标会话标题（特殊标记）：命令行 --conversation / --window-conversation 优先，
+        // 其次 config.json window_conversation，最后环境变量 SYNAPSE_WINDOW_CONVERSATION。
+        let window_conversation = map.get("conversation").cloned()
+            .or_else(|| map.get("window-conversation").cloned())
+            .or_else(|| saved["window_conversation"].as_str().map(|s| s.to_string()))
+            .or_else(|| std::env::var("SYNAPSE_WINDOW_CONVERSATION").ok())
+            .filter(|s| !s.trim().is_empty())
             .unwrap_or_default();
         // 窗口转发必须显式开启：避免普通 win-config 用户跑 run 时意外把消息打进窗口。
         // 命令行 --window 1 优先，其次 config.json，最后环境变量。
@@ -155,7 +173,7 @@ impl Cfg {
             .or_else(|| std::env::var("SYNAPSE_TMUX_VERIFY").ok().filter(|s| !s.is_empty()).map(|v| cfg_truthy(&v)))
             .or_else(|| saved["tmux_verify"].as_bool())
             .unwrap_or(true);
-        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_forward, tmux_target, tmux_forward, tmux_verify }
+        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_conversation, window_forward, tmux_target, tmux_forward, tmux_verify }
     }
 }
 
@@ -577,6 +595,23 @@ fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
         resolved.remove(0)
     };
     let (app, hwnd, title) = selected;
+    // 目标会话：如果配置了特殊标题，先确保豆包/目标应用已经切到该会话。
+    // 这一步失败就直接保留 WAL、不 ACK，避免消息落进默认主对话或别的会话。
+    if !cfg.window_conversation.trim().is_empty() {
+        match winmsg::ensure_conversation(hwnd, &cfg.window_conversation) {
+            Ok(()) => eprintln!(
+                "[window] seq={seq} 已确认目标会话 {:?}（{app}）",
+                cfg.window_conversation
+            ),
+            Err(e) => {
+                eprintln!(
+                    "[window] seq={seq} 目标会话切换失败，保留 WAL 且不 ACK：{}：{e}",
+                    cfg.window_conversation
+                );
+                return false;
+            }
+        }
+    }
     let &(cx, cy) = fallback_clicks(&app).first().unwrap_or(&(0.53, 0.83));
     match winmsg::send_text_click_paste_checked(hwnd, &text, true, cx, cy) {
         Ok(verified) => {
@@ -785,8 +820,8 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>]\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
-  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名>     ★设置默认目标，写入 config.json（如 win-config --app 豆包）\n        win-config [--show|--clear] 查看/清除默认目标。设置后 win-send/win-read/bridge 无需再带 --app。\n        也可用环境变量 SYNAPSE_WINDOW_APP 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
+        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>]\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
+  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -917,6 +952,7 @@ fn main() {
                 "alive": alive,
                 "stale": alive.map(|a| !a),
                 "window_forward": cfg.window_forward, "window_app": cfg.window_app,
+                "window_conversation": cfg.window_conversation,
                 "tmux_forward": cfg.tmux_forward, "tmux_target": cfg.tmux_target,
                 "config": cfg.dir.join("config.json").display().to_string(),
             }));
@@ -929,12 +965,14 @@ fn main() {
             // 用于 WorkBuddy/CodeBuddy 等回合制 agent：消息必须留给对话回合里的 `wait`。
             // 否则后台 run 会先一步 fetch_inbox + ack + 推游标，把消息吞掉，
             // 对话回合的 wait 从新游标往后拉就是空的 → "后台收到了但对话收不到"。
-            let hb_only = std::env::var("YANSHI_HB_ONLY").map(|v| v == "1").unwrap_or(false);
-            let force_poll = std::env::var("YANSHI_NO_WS").map(|v| v == "1").unwrap_or(false) || hb_only;
-            if hb_only { eprintln!("YANSHI_HB_ONLY=1：纯心跳模式，不消费 inbox（消息留给对话回合的 wait）"); }
+            let hb_only = std::env::var("SYNAPSE_HB_ONLY").or_else(|_| std::env::var("YANSHI_HB_ONLY"))
+                .map(|v| v == "1").unwrap_or(false);
+            let force_poll = std::env::var("SYNAPSE_NO_WS").or_else(|_| std::env::var("YANSHI_NO_WS"))
+                .map(|v| v == "1").unwrap_or(false) || hb_only;
+            if hb_only { eprintln!("SYNAPSE_HB_ONLY=1：纯心跳模式，不消费 inbox（消息留给对话回合的 wait）"); }
             if force_poll {
-                if cfg.cmd == "ws" { eprintln!("YANSHI_NO_WS=1 与 ws 冲突"); std::process::exit(2); }
-                eprintln!("YANSHI_NO_WS=1：强制轮询");
+                if cfg.cmd == "ws" { eprintln!("SYNAPSE_NO_WS=1 与 ws 冲突"); std::process::exit(2); }
+                eprintln!("SYNAPSE_NO_WS=1：强制轮询");
                 run_poll(&cfg, &agent, &base, None);
                 return;
             }
@@ -951,7 +989,8 @@ fn main() {
             }
         }
         "wait" => {
-            let timeout: u64 = std::env::var("YANSHI_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let timeout: u64 = std::env::var("SYNAPSE_WAIT").or_else(|_| std::env::var("YANSHI_WAIT"))
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             let started = SystemTime::now();
             loop {
                 if let Some(m) = poll_once(&cfg, &agent, &base, true) {
@@ -1390,34 +1429,54 @@ fn main() {
 
         // ── 本地窗口桥（Windows） ───────────────────────────────
         "win-config" => {
-            // 配置默认窗口目标，写入 ~/.synapse-agent/config.json 的 window_app 字段。
-            // 用法：win-config --app 豆包   （设置）
-            //       win-config --show         （查看当前）
-            //       win-config --clear        （清除）
+            // 配置默认窗口目标与会话标题，写入 ~/.synapse-agent/config.json。
+            // 用法：win-config --app 豆包
+            //       win-config --conversation "◆dou-win-133"
+            //       win-config --show
+            //       win-config --clear
             let cfg_path = cfg.dir.join("config.json");
             let mut saved: Value = fs::read_to_string(&cfg_path)
                 .ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
             let show = flags.contains("show");
             let clear = flags.contains("clear");
-            if let Some(app) = args_map.get("app").cloned() {
+            let app_arg = args_map.get("app").cloned();
+            let conversation_arg = args_map.get("conversation").cloned()
+                .or_else(|| args_map.get("window-conversation").cloned());
+            let mut changed = false;
+            if let Some(app) = app_arg {
                 saved["window_app"] = json!(app);
+                changed = true;
+            }
+            if let Some(conversation) = conversation_arg {
+                saved["window_conversation"] = json!(conversation);
+                changed = true;
+            }
+            if changed {
                 if fs::write(&cfg_path, serde_json::to_string_pretty(&saved).unwrap_or_default()).is_err() {
                     eprintln!("写入配置失败：{cfg_path:?}"); std::process::exit(1);
                 }
                 println!("{}", json!({
-                    "ok": true, "op": "win-config-set", "window_app": app,
+                    "ok": true, "op": "win-config-set",
+                    "window_app": saved["window_app"].as_str().unwrap_or(""),
+                    "window_conversation": saved["window_conversation"].as_str().unwrap_or(""),
                     "config": cfg_path.to_string_lossy()
                 }));
             } else if clear {
-                saved.as_object_mut().map(|o| o.remove("window_app"));
+                if let Some(o) = saved.as_object_mut() {
+                    o.remove("window_app");
+                    o.remove("window_conversation");
+                }
                 let _ = fs::write(&cfg_path, serde_json::to_string_pretty(&saved).unwrap_or_default());
                 println!("{}", json!({"ok": true, "op": "win-config-clear"}));
             } else {
-                let cur = saved["window_app"].as_str().unwrap_or("");
                 println!("{}", json!({
-                    "op": "win-config-show", "window_app": cur,
+                    "op": "win-config-show",
+                    "window_app": saved["window_app"].as_str().unwrap_or(""),
+                    "window_conversation": saved["window_conversation"].as_str().unwrap_or(""),
                     "config": cfg_path.to_string_lossy(),
-                    "from_env": std::env::var("SYNAPSE_WINDOW_APP").unwrap_or_default()
+                    "from_env": std::env::var("SYNAPSE_WINDOW_APP").unwrap_or_default(),
+                    "from_env_app": std::env::var("SYNAPSE_WINDOW_APP").unwrap_or_default(),
+                    "from_env_conversation": std::env::var("SYNAPSE_WINDOW_CONVERSATION").unwrap_or_default()
                 }));
                 let _ = show; // 无参数时默认也是 show
             }
@@ -1500,6 +1559,16 @@ fn main() {
             let w = match resolve_target(&app, &title, &cfg.window_app) {
                 Ok(w) => w, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             };
+            // 只有目标仍然是默认应用（或显式指定了同一个 app）时才套用配置的会话；
+            // win-send --title 指向别的应用时，不应该拿豆包的会话标记去点对方窗口。
+            let use_configured_conversation = (app.is_empty() && title.is_empty())
+                || (!cfg.window_app.is_empty() && app == cfg.window_app);
+            if use_configured_conversation && !cfg.window_conversation.trim().is_empty() {
+                if let Err(e) = winmsg::ensure_conversation(w.hwnd, &cfg.window_conversation) {
+                    eprintln!("win-send 目标会话切换失败：{}：{e}", cfg.window_conversation);
+                    std::process::exit(1);
+                }
+            }
             let mut results = json!({});
             let mut any_ok = false;
             if verify {
@@ -1528,6 +1597,7 @@ fn main() {
             println!("{}", json!({
                 "module": "winmsg", "op": "send", "title": w.title,
                 "hwnd": w.hwnd, "method": method, "results": results,
+                "window_conversation": cfg.window_conversation,
                 "ok": any_ok
             }));
             if !any_ok {
@@ -1613,7 +1683,14 @@ fn main() {
                 "hwnd": w.hwnd, "endpoint": name, "to_hub": to_hub
             }));
 
-            // 总线监听线程：配置程序写入的消息 → 打印 + 写入窗口；可选上报 Hub
+            // 总线监听线程：配置程序写入的消息 → 打印 + 写入窗口；可选上报 Hub。
+            // 如果目标窗口就是配置的默认应用，out 方向也必须先切到目标会话，
+            // 否则 bridge 会把消息写进豆包重启后默认停留的“主对话”。
+            let conv2 = if app.is_empty() || app == cfg.window_app {
+                cfg.window_conversation.clone()
+            } else {
+                String::new()
+            };
             {
                 let (name2, w2, cfg2, agent2, base2, to_hub2) = (
                     name.clone(), w.hwnd, cfg.clone_lite(), agent.clone(), base.clone(), to_hub,
@@ -1627,6 +1704,12 @@ fn main() {
                             "sender": v["sender"], "text": text
                         }));
                         if dir == "out" {
+                            if !conv2.trim().is_empty() {
+                                if let Err(e) = winmsg::ensure_conversation(w2, &conv2) {
+                                    eprintln!("[bridge] 目标会话切换失败，拒绝写入窗口：{e}");
+                                    return Some(json!({"ok": false, "error": e}).to_string());
+                                }
+                            }
                             // agent → 窗口：点击输入框注入文字，不自动回车（避免误发）
                             if let Err(e) = winmsg::send_text_click_paste(w2, &text, false, 0.53, 0.83) {
                                 eprintln!("[bridge] 写入窗口失败：{e}");
@@ -2290,7 +2373,8 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
     };
 
     // YANSHI_HB_ONLY=1：纯心跳模式下不重放 WAL，不执行任何消息，inbox 全部留给 wait。
-    let hb_only_poll = std::env::var("YANSHI_HB_ONLY").map(|v| v == "1").unwrap_or(false);
+    let hb_only_poll = std::env::var("SYNAPSE_HB_ONLY").or_else(|_| std::env::var("YANSHI_HB_ONLY"))
+        .map(|v| v == "1").unwrap_or(false);
     // 先启动心跳，再重放 WAL：重放里的 exec 任务再慢，也不会让心跳停摆。
     let replay: Vec<Value> = if hb_only_poll { Vec::new() } else { journal.lock().unwrap().clone() };
     for m in replay {
@@ -2639,6 +2723,7 @@ mod tests {
             heartbeat_s: 30,
             exec_cmd: None,
             window_app: String::new(),
+            window_conversation: String::new(),
             window_forward: false,
             tmux_target: String::new(),
             tmux_forward: false,

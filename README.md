@@ -158,7 +158,7 @@ synapse-agent init --endpoint https://synapse.wangda.today \
 synapse-agent run
 ```
 
-Windows 默认用 `scripts/install.ps1` 从 `/dl` 下载预编译 exe，校验 SHA-256 后执行 `init`；也可用 `-Binary` 指定本机编译的 exe。发布时需同时上传 `synapse-agent-x86_64-windows-msvc.exe` 和对应 `.sha256`，否则脚本会明确报下载失败。
+Windows 默认用 `scripts/install.ps1` 从 `/dl` 下载预编译 exe，校验 SHA-256 后执行 `init`；也可用 `-Binary` 指定本机编译的 exe。安装脚本会保留并恢复已有的 `window_conversation`，也可用 `-WindowConversation "◆dou-win-133"` 显式指定；发布时需同时上传 `synapse-agent-x86_64-windows-msvc.exe` 和对应 `.sha256`，否则脚本会明确报下载失败。
 
 ---
 

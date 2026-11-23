@@ -8,7 +8,7 @@
 #
 # 常规用法（存成文件）：
 #   .\install.ps1 -Endpoint https://synapse.wangda.today -Project yanshi -Token <TOKEN>
-#   .\install.ps1 -Endpoint https://synapse.wangda.today -Project yanshi -Token <TOKEN> -WindowApp 豆包
+#   .\install.ps1 -Endpoint https://synapse.wangda.today -Project yanshi -Token <TOKEN> -WindowApp 豆包 -WindowConversation "◆dou-win-133"
 #   .\install.ps1 -Endpoint https://synapse.wangda.today -Project yanshi -Token <TOKEN> -Binary .\synapse-agent.exe
 #
 # 注意：token 只写入本地配置，不打印；配置目录为 $HOME\.synapse-agent。
@@ -21,6 +21,9 @@ param(
   # 默认窗口目标（应用名）。留空则保留机器上已有的设置；都没有则默认 "豆包"。
   # 在 init 之后设置——因为 init 会重写 config.json，win-config 能保留其它字段。
   [string]$WindowApp = "",
+
+  # 可选：目标会话标题特殊标记（如 "◆dou-win-133"）。留空则保留安装前已有设置。
+  [string]$WindowConversation = "",
 
   # 可选：本机已编译的 exe；给了就不下载
   [string]$Binary = "",
@@ -145,12 +148,14 @@ else { $UserHome = $InstallDir }
 $configDir = Join-Path $UserHome ".synapse-agent"
 $configPath = Join-Path $configDir "config.json"
 
-# 记录安装前的默认窗口目标，init 重写 config 后要恢复
+# 记录安装前的默认窗口目标与会话，init 重写 config 后要恢复
 $prevWindowApp = ""
+$prevWindowConversation = ""
 if (Test-Path -LiteralPath $configPath) {
   try {
     $prev = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($prev.window_app) { $prevWindowApp = [string]$prev.window_app }
+    if ($prev.window_conversation) { $prevWindowConversation = [string]$prev.window_conversation }
   } catch {}
 }
 
@@ -229,6 +234,16 @@ if (-not $finalApp) { $finalApp = "豆包" }
 & $Target win-config --app $finalApp
 if ($LASTEXITCODE -ne 0) { throw "synapse-agent win-config 失败，exit=$LASTEXITCODE" }
 Write-Host "默认窗口目标：$finalApp" -ForegroundColor Green
+
+# 2.1) 目标会话：本次 -WindowConversation > 安装前已有设置；都没有就不写。
+#      不能只依赖用户重装后手工重跑，否则 init 会静默丢掉 window_conversation。
+$finalConversation = $WindowConversation
+if (-not $finalConversation) { $finalConversation = $prevWindowConversation }
+if ($finalConversation) {
+  & $Target win-config --conversation $finalConversation
+  if ($LASTEXITCODE -ne 0) { throw "synapse-agent win-config --conversation 失败，exit=$LASTEXITCODE" }
+  Write-Host "默认目标会话：$finalConversation" -ForegroundColor Green
+}
 
 # 3) status：读本地配置自检
 & $Target status
