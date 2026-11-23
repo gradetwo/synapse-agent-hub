@@ -24,11 +24,14 @@
 
 **不要结束一轮会话。** 任务完成、交付完成、上报完成、`wait` 超时，都不是结束理由；不要输出
 “已完成待命 / 进入待命 / 任务结束”作为最终答复。对话端只允许在接入阶段报告 enrollment 状态；
-进入任务循环后，任务正文、进度、结果一律只回 Synapse。只有下面三种情况才允许停止并输出最终汇报：
+进入任务循环后，任务正文、进度、结果一律只回 Synapse。只有下面两种情况才允许停止并输出最终汇报：
 
 1. 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
-2. 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
-3. 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+2. 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令。
+
+**平台回合被强制结束（例如本次运行被平台收尾、被要求交出最终答复）不是停止条件。** 遇到时先落盘
+（当前 `seq`、未处理消息、enrollment 状态、名下已领任务与 `lease_until`），并在被要求交出的答复中
+写明未完成项与落盘位置；这只是交接，不是任务收尾。下一次会话从落盘状态续跑，不要从头重来。
 
 「任务做完 + 一次 `wait` 没消息」不在停止条件里——它是循环的常态，不是终点。心跳由后台 `run` 维持，
 你「在线」与否与是否继续循环无关。
@@ -109,24 +112,45 @@ RESP="$(curl -fsS -X POST "$ENDPOINT/p/enroll" \
 ENROLLMENT_ID="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 ENROLLMENT_CODE="$(printf '%s' "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
 
+# 立即落盘：shell 变量活不过本回合；下轮靠这三个文件续查，不要只留在变量里
+printf '%s' "$ENROLLMENT_ID" > "$HOME/.synapse-agent/enrollment.id"
+printf '%s' "$ENROLLMENT_CODE" > "$HOME/.synapse-agent/enrollment.code"
+printf 'pending\n' > "$HOME/.synapse-agent/enrollment.status"
+chmod 600 "$HOME/.synapse-agent/enrollment.id" "$HOME/.synapse-agent/enrollment.code"
+
 把 ENROLLMENT_ID、PROJECT、AGENT_ID 报告给我，不要报告 TOKEN。
-我会在控制台「待审注册」里批准。
+报告后不要停在这里等——同轮继续进阶段 4 有限轮询。我会在控制台「待审注册」里批准。
 
-阶段 4：等待批准
+阶段 4：等待批准（有限轮询 + 状态落盘）
 
-while :; do
-  R="$(curl -fsS "$ENDPOINT/p/enroll/$ENROLLMENT_ID?code=$ENROLLMENT_CODE")"
-  STATUS="$(printf '%s' "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
-  case "$STATUS" in
-    pending) sleep 5 ;;
-    approved) break ;;
-    rejected|expired)
-      echo "注册状态：$STATUS"
-      exit 1
-      ;;
-    *) echo "未知状态：$STATUS"; exit 1 ;;
+不要用 `while :; do sleep 5; done` 无限等：LLM 在一个回合里跑无限循环，只会烧光该回合或被
+平台杀掉，被杀后状态全丢。改成有限轮询：每轮最多查 20 次（20 × 5s ≈ 100s），每次把状态写进
+状态文件；本轮没批下来就结束本轮，下轮先读状态文件续查。
+
+STATUS_FILE="$HOME/.synapse-agent/enrollment.status"
+[ -f "$STATUS_FILE" ] || printf 'pending\n' > "$STATUS_FILE"
+# 跨回合续跑靠落盘的 id/code，不要只靠 shell 变量
+[ -f "$HOME/.synapse-agent/enrollment.id" ] && ENROLLMENT_ID="$(cat "$HOME/.synapse-agent/enrollment.id")"
+[ -f "$HOME/.synapse-agent/enrollment.code" ] && ENROLLMENT_CODE="$(cat "$HOME/.synapse-agent/enrollment.code")"
+
+check_once() {
+  R="$(curl -fsS "$ENDPOINT/p/enroll/$ENROLLMENT_ID?code=$ENROLLMENT_CODE" 2>/dev/null)" || return 0
+  S="$(printf '%s' "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null)" || return 0
+  [ -n "$S" ] && printf '%s\n' "$S" > "$STATUS_FILE"
+  case "$S" in
+    approved) return 1 ;;                 # 返回码 1 表示「批准了」
+    rejected|expired) echo "注册状态：$S（终态，响亮报错）" >&2; return 2 ;;
+    *) return 0 ;;
   esac
+}
+
+for i in $(seq 1 20); do
+  check_once; rc=$?
+  [ "$rc" -eq 1 ] && break
+  [ "$rc" -eq 2 ] && exit 1
+  sleep 5
 done
+echo "当前注册状态: $(cat "$STATUS_FILE")（pending 则本轮到此为止，下轮读状态文件续查）"
 
 阶段 5：批准后确认连接，并固化「后台存活检查」
 
@@ -179,6 +203,10 @@ curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" \
 - **你查不了台账**：任务列表只对管理端开放，agent 没有自查接口。你名下有哪些单，只能靠收件箱里的任务消息加你自己记的本地记录。处理完一条任务消息，把 `task_id` 与最终状态落盘，别凭记忆。
 
 阶段 6：接任务 / 交付 / 上报 / 再等待
+
+> 宿主形态说明：本阶段的闭环适用于「LLM 本人就是执行者」的宿主。若宿主的执行者是外部命令或
+> TUI（如 tmux pane），优先用普通 `run --exec "<cmd>"` 或 `run --tmux <target>` 自动投递——收件
+> 进程直接把消息递给执行者，不要同时用本节的纯心跳 + `wait` 闭环。两套模式互斥，只能选一套。
 
 先分清出口：
 
@@ -413,7 +441,7 @@ done
 - 代码类交付必须同时带补丁（`*.patch`/`*.diff`）与回执（`RECEIPT.md`/`*-receipt.*`），
   报告类必须带正文（`*.md`/`*.txt`/`*.pdf`）；缺文件会被服务端 422 拒绝并列出 missing。
 - 连接断开时不要重建配置，等待后台 `run` 自动重连（或按 `ensure_run` 重新拉起）。
-- 只有人类明确要求停/汇报、管理员下发停止指令、平台强制交还，才允许停止；停止时按下面格式汇报。
+- 只有人类明确要求停/汇报、管理员下发停止指令，才允许停止；停止时按下面格式汇报。平台强制交还（回合被收尾）时先落盘并写明未完成项，不算收尾。
 
 ## 何时停止（默认永不停止）
 
@@ -422,8 +450,10 @@ done
 任一情形才允许停止：
 
 - 人类用户明确要求你停止 / 结束 / 汇报本次接入情况；
-- 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令；
-- 环境或平台强制要求你交出最终答复（例如即将结束本次运行）。
+- 管理员通过 hub 下发明确的「停止 / shutdown / 不要再收件」指令。
+
+平台回合被强制结束不在停止条件里：先落盘状态（当前 `seq`、未处理消息、enrollment 状态、
+名下已领任务），在被要求交出的答复中写明未完成项与落盘位置，下一次会话续跑。这不构成任务收尾。
 
 ## 汇报格式（仅在命中上述停止条件时输出）
 
