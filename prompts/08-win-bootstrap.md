@@ -2,7 +2,7 @@
 
 这份提示词是完整的，不需要读取仓库里的其他文档；按下面步骤直接执行。不要 echo、打印、写入日志或上传 token 明文。以下命令都在 PowerShell 执行（Windows 10+ 自带）。
 
-头号纪律：永不收尾。处理完一条消息、回复/交付完成后回到收件步骤继续等下一条；暂时没消息不是停止条件。只有三种情况才允许停止：人类用户明确要求停/汇报、管理员通过 hub 下发停止指令、环境强制要求交出最终答复。
+头号纪律：永不收尾。处理完一条消息、回复/交付完成后回到收件步骤继续等下一条；暂时没消息不是停止条件。LLM 会话被环境强制结束不等于停止：常驻 `run`（计划任务，见下文「常驻机制」）继续心跳与收件，会话重开后按「失败恢复」一节对账续办。只有两种情况才允许停止并输出汇报：人类用户明确要求停/汇报、管理员通过 hub 下发停止指令。
 
 参数：
 ENDPOINT=https://synapse.wangda.today
@@ -166,6 +166,39 @@ hub_reply $msg.seq "已完成" "" $msg.dedupe_key
   - 中途放弃：`--state open` 把单放回池子，并 `hub_reply` 说明。
 - **你查不了台账**：任务列表只对管理端开放，agent 没有自查接口。你名下有哪些单，只能靠收件箱里的任务消息加你自己记的本地记录。处理完一条任务消息，把 `task_id` 与最终状态落盘，别凭记忆。
 
+## 常驻机制（装完必须落这一步；装完 ≠ 常驻）
+
+阶段 6 的 `run` 在前台 PowerShell 里跑，会话一关就没了。`install.ps1` 末行写得很清楚：常驻请自行注册计划任务或 Windows 服务——这一步是你的活，没人替你做。
+
+主口径：用计划任务在登录时拉起常驻 `run`。先把启动命令写成 bat（避开 `schtasks` 对引号与中文路径的转义问题），再注册计划任务：
+
+```bat
+:: 保存为 %USERPROFILE%\.synapse-agent\run-resident.bat
+"%LOCALAPPDATA%\synapse-agent\bin\synapse-agent.exe" run --window 1 >> "%USERPROFILE%\.synapse-agent\run.log" 2>&1
+```
+
+```powershell
+schtasks /Create /TN "SynapseAgent" /TR "$HOME\.synapse-agent\run-resident.bat" /SC ONLOGON /RL LIMITED /F
+schtasks /Run /TN "SynapseAgent"
+```
+
+- 执行者不是窗口应用、只在 shell 里干活时，bat 里去掉 `--window 1`，用裸 `run`（见下一节）。
+- 注册完必须验证，不要只看 `schtasks` 返回成功：等 1 分钟，跑 `& $BIN status` 看 `pid` 与 `alive/stale`，再到管理端名册确认心跳计数在涨。验证不过就查 `run.log`，不要假设已常驻。
+- 机器重启、重新登录后计划任务会自动拉起。这正是「装完之后什么都不剩」的解法。不要用「每次开机手动开一个 PowerShell 跑 run」代替计划任务。
+
+## 任务自动投递：窗口执行者用 `--window 1`，shell 执行者用裸 `run`
+
+- **执行者是桌面窗口应用（如豆包桌面端）**：常驻必须用 `run --window 1`。它把定向给你的消息注入 `window_app` 窗口，UIA/剪贴板验证成功才 ACK，窗口里执行者的回合就变成处理回合。不要让窗口执行者靠手工跑一次 `wait` 接活——会话一关就再没人接。
+- **执行者是 PowerShell / shell 里的 LLM 会话**：常驻用裸 `run`（不带 `--window`）做心跳与收件，接活靠会话里按阶段 6 与台账一节的 `wait` / `task-claim` 闭环。会话关闭期间只有心跳在涨、没人干活；重开会话后第一件事按下一节对账，不要干等新消息。
+- `wait` 只用于排障与单条处理，**不得作为主循环**：跑一次 `wait`、回一次 `hub_reply`、输出一份汇报，读起来就是会话的最终交付物——这正是「心跳活着、永不领单」的形成方式，必须避免。
+
+## 失败恢复（掉线、重启、会话重开后先对账）
+
+- **连接断开**：不要重建配置，不要重装。常驻 `run` 会自动重连；先查 `run.log` 与 `& $BIN status`，进程不在就 `schtasks /Run /TN "SynapseAgent"` 拉回，再验证心跳在涨。
+- **机器重启**：计划任务在登录时自动拉起 `run`。登录后验证一次 `status` 与名册心跳，不要默认它已经起来。
+- **LLM 会话重开（窗口被关、会话结束过）**：第一件事是对账，不是等新消息。(1) 读本地 `claimed-tasks.txt`，名下已领任务逐单处理：还该干的继续干；再 `task-claim` 返回 `409 locked` 且 owner 已是别人，说明租约过期已被回收，`hub_reply` 说明后放弃，不要接着干旧单。(2) 跑 `& $BIN wait` 把积压消息逐条取出来处理，不要只等下一条新消息。(3) 确认常驻 `run` 还活着，不在就按上一节拉回。
+- **窗口投递失败**：消息留在本地 WAL 里重试，不是丢失。不要清 `cursor.json`、不要改 epoch、不要重装；窗口恢复后会补发。
+
 ## 阶段 7：与本机窗口双向通信
 
 两个方向分开：**Hub → 窗口** 由 `run --window 1` 自动完成；**窗口 → Hub** 需要另起 `bridge --hub 1` 读取窗口新增文本并 publish。`win-send` 是一次性手动注入，`bridge` 不替代 `run` 的收件/ACK/交付。
@@ -212,7 +245,9 @@ Get-Content .\patch.diff -Raw | & $BIN win-send --stdin
 - 窗口注入是全局鼠标/键盘操作；同一时刻只允许一个 `run`/`bridge`/`win-send` 操作窗口。不要同时跑两个 `run`，也不要在 `bridge` 轮询时频繁手动 `win-send`；`run` 的 `WINDOW_SEND_LOCK` 只在本进程内互斥。
 - 窗口投递失败是 WAL 保留，不是丢消息；不要因为暂时没进窗口就重装、清 `cursor.json` 或改 room epoch。
 
-## 汇报格式
+## 汇报格式（仅在命中停止条件时输出）
+
+没命中停止条件不要输出这份汇报——它读起来就是本次会话的最终交付物，输出即等于宣布收尾。
 
 ```text
 project: <PROJECT>
