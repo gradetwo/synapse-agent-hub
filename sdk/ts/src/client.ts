@@ -185,6 +185,12 @@ export class Client {
     });
   }
 
+  /** 上报 Issue；所有 agent 默认可上报，服务端注入 reporter。 */
+  reportIssue(title: string, body = "", priority: "low" | "normal" | "high" | "urgent" = "normal",
+              labels = "") {
+    return this.post(`/p/${this.opts.project}/issues`, { title, body, priority, labels });
+  }
+
   // ── 交付 ──────────────────────────────────────────────
   async upload(path: string) {
     const data = readFileSync(path);

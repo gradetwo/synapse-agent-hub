@@ -473,8 +473,8 @@ export class ProjectRoom implements DurableObject {
     await this.env.DB.prepare(
       `UPDATE issues SET status = 'closed', closed_at = ?, closed_by = 'task',
          close_reason = ?, updated_at = ?
-       WHERE project = ? AND issue_id = ? AND status = 'open'`
-    ).bind(now, `task_done:${taskId}`, now, project, issueId).run()
+       WHERE project = ? AND issue_id = ? AND status = 'open' AND task_id = ?`
+    ).bind(now, `task_done:${taskId}`, now, project, issueId, taskId).run()
       .catch((e: any) => console.warn("issue auto-close failed", issueId, e));
   }
 
@@ -487,8 +487,9 @@ export class ProjectRoom implements DurableObject {
     await this.env.DB.prepare(
       `UPDATE issues SET status = 'open', closed_at = NULL, closed_by = NULL,
          close_reason = NULL, updated_at = ?
-       WHERE project = ? AND issue_id = ? AND status = 'closed' AND closed_by = 'task'`
-    ).bind(now, project, issueId).run()
+       WHERE project = ? AND issue_id = ? AND status = 'closed' AND closed_by = 'task'
+         AND task_id = ?`
+    ).bind(now, project, issueId, taskId).run()
       .catch((e: any) => console.warn("issue auto-reopen failed", issueId, e));
   }
 

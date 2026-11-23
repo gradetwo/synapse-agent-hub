@@ -10,7 +10,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "dispatch-issue-20261123";
+const BUILD_TAG = "issue-hardening-20261123";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.3";
 
@@ -705,8 +705,11 @@ async function admin(req: Request, env: Env, url: URL) {
 
   if (path === "/admin/stats" && req.method === "GET") {
     const now = Date.now();
-    const cached = cacheGet(STATS_CACHE, "global", 180_000);
-    if (cached) return json({ ...cached, at: now, cached: true });
+    const fresh = url.searchParams.get("fresh") === "1";
+    if (!fresh) {
+      const cached = cacheGet(STATS_CACHE, "global", 180_000);
+      if (cached) return json({ ...cached, at: now, cached: true });
+    }
     const pr = await env.DB.prepare("SELECT COUNT(*) AS n FROM projects WHERE status='active'").first<any>();
     const ag = await env.DB.prepare(
       "SELECT COUNT(*) AS n FROM agents WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)"
@@ -754,9 +757,12 @@ async function admin(req: Request, env: Env, url: URL) {
       projects = [only];
     }
     const now = Date.now();
+    const fresh = url.searchParams.get("fresh") === "1";
     const cacheKey = JSON.stringify([only, policy.mode, projects]);
-    const cached = cacheGet(ANALYTICS_CACHE, cacheKey, 300_000);
-    if (cached) return json({ ...cached, at: now, cached: true });
+    if (!fresh) {
+      const cached = cacheGet(ANALYTICS_CACHE, cacheKey, 300_000);
+      if (cached) return json({ ...cached, at: now, cached: true });
+    }
     const dayMs = 86_400_000;
     const today = new Date();
     const dayKeys: string[] = [];
@@ -1067,7 +1073,8 @@ async function admin(req: Request, env: Env, url: URL) {
     if (action === "issues" && req.method === "GET") {
       const status = String(url.searchParams.get("status") ?? "").trim();
       if (status && !["open", "closed", "merged"].includes(status)) return err(422, "bad_status");
-      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 100)));
+      const rawLimit = Number(url.searchParams.get("limit") ?? 100);
+      const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(200, rawLimit)) : 100;
       const where = status ? "project = ? AND status = ?" : "project = ?";
       const vals: any[] = status ? [project, status] : [project];
       const rows = await env.DB.prepare(
@@ -1096,10 +1103,11 @@ async function admin(req: Request, env: Env, url: URL) {
       if (op === "close") {
         if (row.status === "merged") return err(409, "issue_merged");
         const reason = String(b.reason ?? "").trim().slice(0, 240) || "管理员关闭";
-        await env.DB.prepare(
+        const upd = await env.DB.prepare(
           `UPDATE issues SET status = 'closed', closed_at = ?, closed_by = 'admin',
-             close_reason = ?, updated_at = ? WHERE project = ? AND issue_id = ?`
+             close_reason = ?, updated_at = ? WHERE project = ? AND issue_id = ? AND status != 'merged'`
         ).bind(now, reason, now, project, issueId).run();
+        if (upd.meta.changes === 0) return err(409, "issue_merged");
         return json({ ok: true, issue_id: issueId, status: "closed", close_reason: reason });
       }
 
@@ -1107,12 +1115,13 @@ async function admin(req: Request, env: Env, url: URL) {
         // 任务完成自动关闭的 issue 重开时清掉旧 task_id，允许作为新的跟进单再派发；
         // 人工关闭但任务仍在跑的重开则保留关联，任务 done 时继续自动收口。
         const clearTask = row.closed_by === "task";
-        await env.DB.prepare(
+        const upd = await env.DB.prepare(
           `UPDATE issues SET status = 'open', closed_at = NULL, closed_by = NULL,
              close_reason = NULL, merged_into = NULL, task_id = ${clearTask ? "NULL" : "task_id"},
              updated_at = ?
            WHERE project = ? AND issue_id = ? AND status IN ('closed', 'merged')`
         ).bind(now, project, issueId).run();
+        if (upd.meta.changes === 0) return err(409, "issue_not_reopenable");
         return json({ ok: true, issue_id: issueId, status: "open", task_id_cleared: clearTask });
       }
 
@@ -1120,17 +1129,19 @@ async function admin(req: Request, env: Env, url: URL) {
         const into = String(b.into ?? "").trim();
         if (!/^[A-Za-z0-9._:-]{1,128}$/.test(into)) return err(422, "into_required");
         if (into === issueId) return err(422, "merge_self");
+        if (row.status !== "open") return err(409, "issue_not_open");
         if (row.task_id) return err(409, "issue_has_task");
-        if (row.status === "merged") return err(409, "issue_already_merged");
         const target = await env.DB.prepare(
           "SELECT issue_id, status, task_id FROM issues WHERE project = ? AND issue_id = ?"
         ).bind(project, into).first<any>();
         if (!target) return err(404, "target_issue_not_found");
         if (target.status !== "open") return err(409, "target_not_open");
-        await env.DB.prepare(
+        const upd = await env.DB.prepare(
           `UPDATE issues SET status = 'merged', merged_into = ?, closed_at = ?, closed_by = 'admin',
-             close_reason = 'merged', updated_at = ? WHERE project = ? AND issue_id = ?`
+             close_reason = 'merged', updated_at = ? WHERE project = ? AND issue_id = ?
+             AND status = 'open' AND task_id IS NULL`
         ).bind(into, now, now, project, issueId).run();
+        if (upd.meta.changes === 0) return err(409, "issue_changed");
         return json({ ok: true, issue_id: issueId, status: "merged", merged_into: into });
       }
 
@@ -1141,21 +1152,39 @@ async function admin(req: Request, env: Env, url: URL) {
       const taskId = String(b.task_id ?? "").trim() ||
         `T-${issueId}-${now.toString(36).toUpperCase()}`;
       if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) return err(422, "bad_task_id");
+      // 先原子占住 task_id，避免双击/两个管理端同时派发造出两个任务。
+      const claim = await env.DB.prepare(
+        `UPDATE issues SET task_id = ?, updated_at = ?
+           WHERE project = ? AND issue_id = ? AND status = 'open' AND task_id IS NULL`
+      ).bind(taskId, now, project, issueId).run();
+      if (claim.meta.changes === 0) return err(409, "issue_already_dispatched");
       const to = b.to === undefined || b.to === null || String(b.to).trim() === ""
         ? null : String(b.to).trim();
       const title = String(b.title ?? row.title).trim() || row.title;
       const body = String(b.body ?? row.body ?? "");
       const quota = await projectQuota(env, project);
-      const dr = await stub.fetch(new Request("https://do/tasks/create", {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task_id: taskId, title, body, to, issue_id: issueId,
-                               project, sender: "admin", max_per_min: quota.maxMsgsPerMin }),
-      }));
+      let dr: Response;
+      try {
+        dr = await stub.fetch(new Request("https://do/tasks/create", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task_id: taskId, title, body, to, issue_id: issueId,
+                                 project, sender: "admin", max_per_min: quota.maxMsgsPerMin }),
+        }));
+      } catch (e: any) {
+        await env.DB.prepare(
+          "UPDATE issues SET task_id = NULL, updated_at = ? WHERE project = ? AND issue_id = ? AND task_id = ?"
+        ).bind(Date.now(), project, issueId, taskId).run().catch(() => {});
+        console.warn("issue dispatch failed", issueId, e);
+        return err(503, "task_dispatch_failed");
+      }
       const d: any = await dr.json().catch(() => ({}));
-      if (!dr.ok) return Response.json(d, { status: dr.status });
-      await env.DB.prepare(
-        "UPDATE issues SET task_id = ?, updated_at = ? WHERE project = ? AND issue_id = ?"
-      ).bind(taskId, now, project, issueId).run();
+      if (!dr.ok) {
+        // DO 建单失败时释放占位，允许修好目标后重试。
+        await env.DB.prepare(
+          "UPDATE issues SET task_id = NULL, updated_at = ? WHERE project = ? AND issue_id = ? AND task_id = ?"
+        ).bind(Date.now(), project, issueId, taskId).run().catch(() => {});
+        return Response.json(d, { status: dr.status });
+      }
       return json({ ok: true, issue_id: issueId, status: "open", task_id: taskId,
                     dispatched: true, task_link: d });
     }
@@ -1970,10 +1999,19 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
   if (!["low", "normal", "high", "urgent"].includes(priority))
     return err(422, "bad_priority");
   const labels = String(b.labels ?? "").trim().slice(0, 300);
-  // 与交付同一套卫生检查：issue 正文也不许把密钥带上管理台。
-  if (/(AKIA[0-9A-Z]{16}|-----BEGIN[^"]{0,40}PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[baprs]-)/.test(`${title}\n${body}`))
-    return err(422, "secret_detected");
   const now = Date.now();
+  // Issue 同样要节流：all-agent 开放后不能变成无限 D1 写入入口。
+  // 用项目级分钟窗口，默认最多 20 条/分钟；不额外建表，也不走过期 DO 热状态。
+  const quota = await projectQuota(env, project);
+  const issueCap = Math.min(20, Math.max(1, quota.maxMsgsPerMin));
+  const recent = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM issues WHERE project = ? AND created_at > ?"
+  ).bind(project, now - 60_000).first<any>().catch(() => null);
+  if (Number(recent?.n ?? 0) >= issueCap)
+    return err(429, `issue_rate_limited:${issueCap}/min`);
+  // 与交付同一套卫生检查：issue 标题/正文/标签也不许把密钥带上管理台。
+  if (/(AKIA[0-9A-Z]{16}|-----BEGIN[^"]{0,40}PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|xox[baprs]-)/.test(`${title}\n${body}\n${labels}`))
+    return err(422, "secret_detected");
   const issueId = "ISS-" + now.toString(36).toUpperCase() + "-" +
     crypto.randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase();
   await env.DB.prepare(

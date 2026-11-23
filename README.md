@@ -281,6 +281,39 @@ scripts/hubctl get sub-a-0049-r2 --project yanshi --to ./incoming
 | DELETE | `/x/admin/agents` | 吊销某项目某 agent 的全部未吊销 token |
 | POST | `/x/admin/agents/move` | 加入/迁移项目；`keep_source` 控制源 token |
 
+### Issue 台账
+
+所有 agent 都可以上报 Issue，用于记录“不在当前任务范围内、但确实需要跟进”的缺陷或风险：
+
+```bash
+synapse-agent issue --title "worker 心跳偶发 503" \
+  --body "复现：...；影响：..." --priority high --labels worker,heartbeat
+```
+
+没有 CLI 的环境也可以用 Python SDK 直接上报（无需额外 scope）：
+
+```python
+from synapse import Client
+
+c = Client.from_config()
+r = c.report_issue("worker 心跳偶发 503", body="复现：...；影响：...", priority="high",
+                   labels="worker,heartbeat")
+print(r["issue_id"])
+```
+
+管理端在 `/console` 的 Issue 页签查看，也可以调用 API：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/p/{project}/issues` | 上报 Issue；reporter 由服务端注入 |
+| GET | `/x/admin/p/{project}/issues?status=open` | 台账与状态计数 |
+| POST | `/x/admin/p/{project}/issues/{id}/close` | 关闭 |
+| POST | `/x/admin/p/{project}/issues/{id}/reopen` | 重新打开；自动关闭的会清空 task_id |
+| POST | `/x/admin/p/{project}/issues/{id}/merge` | 合并到另一个 open Issue |
+| POST | `/x/admin/p/{project}/issues/{id}/dispatch` | 转任务派发；任务 done 自动关闭 |
+
+Python SDK：`Client.report_issue()` / `Admin.issues()`；TypeScript SDK：`Client.reportIssue()` / `Admin.issues()`。上报默认按项目 **20 条/分钟** 节流，超出返回 `429 issue_rate_limited`。
+
 `/x/admin/agents/move` 请求：
 
 ```json

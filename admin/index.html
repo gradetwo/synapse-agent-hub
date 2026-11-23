@@ -591,6 +591,14 @@ if (location.search.includes("reset=1")) {
   <div class="foot" id="foot">浏览器访问经 Cloudflare Access 鉴权；CLI 走 /x/admin（Bearer）。</div>
 </div>
 
+<div id="issueDetail" class="overlay" hidden>
+  <div class="sheet">
+    <div class="sheetHead"><b id="issueDetailTitle">Issue</b><span class="muted" id="issueDetailMeta"></span>
+      <button class="ghost iconBtn" id="issueDetailClose" aria-label="关闭" title="关闭">×</button></div>
+    <div class="sheetBody"><pre id="issueDetailBody" style="margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1"></pre></div>
+  </div>
+</div>
+
 <div id="detail" class="overlay" hidden>
   <div class="sheet">
     <div class="sheetHead"><b id="dName">agent</b><span class="muted" id="dMeta"></span>
@@ -1052,10 +1060,12 @@ function renderIssueRows() {
     const pri = i.priority || "normal";
     const projectTag = isAll ? `<span class="muted" style="font-size:10px">${esc(i.project || "—")}</span><br>` : "";
     const merged = i.merged_into ? `<div class="muted" style="font-size:10px">并入 ${esc(i.merged_into)}</div>` : "";
+    const labels = i.labels ? `<div class="muted" style="font-size:10px">标签 ${esc(i.labels)}</div>` : "";
     const taskCell = i.task_id
       ? `<span class="mono">${esc(i.task_id)}</span>${st === "closed" && i.closed_by === "task"
           ? `<div class="muted" style="font-size:10px">任务完成自动关闭</div>` : ""}`
       : `<span class="muted">—</span>`;
+    const viewKey = `${i.project || current}|${id}`;
     let acts = `<span class="muted">切到项目</span>`;
     if (!isAll) {
       if (st === "open" && !i.task_id) {
@@ -1070,9 +1080,10 @@ function renderIssueRows() {
         acts = `<button class="ghost mini" data-issue-reopen="${esc(id)}">重新打开</button>`;
       }
     }
+    acts += `<button class="ghost mini" data-issue-view="${esc(viewKey)}">详情</button>`;
     const title = `<span class="mono">${esc(id)}</span><div style="white-space:normal;max-width:300px">${esc(i.title || "")}</div>`
       + (i.body ? `<div class="muted" style="white-space:normal;max-width:300px;font-size:10px">${esc(String(i.body).slice(0, 120))}${String(i.body).length > 120 ? "…" : ""}</div>` : "")
-      + merged;
+      + labels + merged;
     return `<tr data-issue-id="${esc(id)}" data-state="${esc(st)}" data-priority="${esc(pri)}" data-task="${esc(i.task_id || "")}" data-project="${esc(i.project || current)}">
       <td>${projectTag}${title}</td>
       <td><span class="badge issue-${esc(st)}">${esc(ISSUE_STATE_LABEL[st] || st)}</span></td>
@@ -1084,6 +1095,19 @@ function renderIssueRows() {
     </tr>`;
   }).join("") : `<tr><td colspan="7" class="empty">${isAll ? "全部项目还没有 Issue" : "当前项目还没有 Issue"}</td></tr>`;
   reapplyFilters();
+}
+
+function showIssueDetail(issue) {
+  const box = $("issueDetail");
+  if (!box || !issue) return;
+  $("issueDetailTitle").textContent = `${issue.issue_id || "Issue"} · ${issue.title || ""}`;
+  $("issueDetailMeta").textContent = [issue.project, ISSUE_STATE_LABEL[issue.status] ||
+    issue.status, ISSUE_PRIORITY_LABEL[issue.priority] || issue.priority,
+    issue.reporter ? `报告者 ${issue.reporter}` : "", issue.task_id ? `任务 ${issue.task_id}` : "",
+    issue.close_reason ? `关闭原因 ${issue.close_reason}` : ""].filter(Boolean).join(" · ");
+  $("issueDetailBody").textContent = issue.body || "（无正文）";
+  box.hidden = false;
+  document.body.classList.add("has-sheet");
 }
 
 async function loadSubs() {
@@ -2093,9 +2117,14 @@ function bindFilters() {
         { v: "closed", label: "已关闭" },
         { v: "merged", label: "已合并" },
         { v: "dispatched", label: "已派发" },
+        { v: "priority:urgent", label: "紧急" },
+        { v: "priority:high", label: "高优先级" },
+        { v: "priority:normal", label: "普通优先级" },
+        { v: "priority:low", label: "低优先级" },
       ],
       test: (row, v) => v === "all"
-        || (v === "dispatched" ? !!row.dataset.task : (row.dataset.state || "") === v),
+        || (v.startsWith("priority:") ? (row.dataset.priority || "") === v.slice(9)
+          : (v === "dispatched" ? !!row.dataset.task : (row.dataset.state || "") === v)),
     });
   });
 }
@@ -2331,9 +2360,9 @@ async function loadMsgs() {
   reapplyFilters();
 }
 
-async function loadStats() {
+async function loadStats(fresh = false) {
   if (!current) return;
-  const d = await api("/admin/stats").catch(() => null);
+  const d = await api("/admin/stats" + (fresh ? "?fresh=1" : "")).catch(() => null);
   if (!d) return;
   const sub = d.submissions || {};
   const issue = d.issues || {};
@@ -2352,10 +2381,13 @@ async function loadStats() {
   $("ovAt").textContent = new Date(d.at).toLocaleTimeString();
 }
 
-async function loadAnalytics() {
+async function loadAnalytics(fresh = false) {
   if (!current) return;
   const scope = current;
-  const q = scope !== "*" ? `?project=${encodeURIComponent(scope)}` : "";
+  const qs = new URLSearchParams();
+  if (scope !== "*") qs.set("project", scope);
+  if (fresh) qs.set("fresh", "1");
+  const q = qs.toString() ? `?${qs.toString()}` : "";
   const d = await api("/admin/analytics" + q).catch((e) => {
     if (e instanceof AuthError) throw e;
     console.warn("[hub] analytics failed", e);
@@ -2410,13 +2442,13 @@ function setProjectPanels(enabled) {
   setDetailReady(false);
 }
 
-async function refresh() {
+async function refresh(forceFresh = false) {
   if (!current) return;
   const scope = current;
   const epoch = ++refreshEpoch;
   // 各面板独立容错：任一非核心接口失败不应让整页 lock()。
   // 用 allSettled 并打印失败项，界面其余部分照常渲染。
-  const parts = [loadAgents(), loadSec(), loadStats(), loadEnr(), loadAnalytics()];
+  const parts = [loadAgents(), loadSec(), loadStats(forceFresh), loadEnr(), loadAnalytics(forceFresh)];
   const results = await Promise.allSettled(parts);
   if (current !== scope || epoch !== refreshEpoch) return;
   results.forEach((r, i) => {
@@ -2480,7 +2512,10 @@ function paintLive(on, note, why) {
   el.style.color = on ? "#3fb950" : /重连|超时|失败/.test(why || "") ? "#d29922" : "#8b95a5";
   el.title = note + (on ? "（点击切到轮询）" : "（点击尝试实时）");
 }
-function scheduleRefresh() { clearTimeout(liveTimer); liveTimer = setTimeout(refresh, 400); }
+function scheduleRefresh(forceFresh = false) {
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => refresh(forceFresh), 400);
+}
 function detachLive(ws) {
   if (!ws) return;
   ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
@@ -2533,7 +2568,10 @@ function connectLive() {
     };
     ws.onmessage = (ev) => {
       if (gen !== liveGen || ws !== liveWs) return;
-      try { if (JSON.parse(ev.data).type === "msg") scheduleRefresh(); } catch {}
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === "msg") scheduleRefresh(d.topic === "issue");
+      } catch {}
     };
     ws.onclose = (e) => {
       if (gen !== liveGen || ws !== liveWs) return;  // 已切项目/已主动关闭，别再抢当前连接
@@ -2574,6 +2612,10 @@ const btnQuickEl = $("btnQuick");
 if (btnQuickEl) btnQuickEl.onclick = quickRun;
 const dCloseEl = $("dClose");
 if (dCloseEl) dCloseEl.onclick = () => { const d = $("detail"); if (d) { d.hidden = true; d.style.display = ""; document.body.classList.remove("has-sheet"); } };
+const iCloseEl = $("issueDetailClose");
+if (iCloseEl) iCloseEl.onclick = () => { const d = $("issueDetail"); if (d) { d.hidden = true; document.body.classList.remove("has-sheet"); } };
+const iOv = $("issueDetail");
+if (iOv) iOv.onclick = (e) => { if (e.target === iOv) { iOv.hidden = true; document.body.classList.remove("has-sheet"); } };
 const dOv = $("detail");
 if (dOv) dOv.onclick = (e) => { if (e.target === dOv) { dOv.hidden = true; document.body.classList.remove("has-sheet"); } };
 $("btnSettings").onclick = settings;
@@ -2626,9 +2668,18 @@ document.addEventListener("click", async (e) => {
     const issueState = dash.getAttribute("data-dash-issue");
     if (issueState) return showCardFilter("Issue", "issue", issueState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
+    const iv = btn.getAttribute("data-issue-view");
+    if (iv) {
+      const sep = iv.indexOf("|");
+      const project = iv.slice(0, sep), id = iv.slice(sep + 1);
+      const issue = (ISSUE_ROWS || []).find((x) => (x.issue_id || "") === id
+        && (x.project || current) === project);
+      if (issue) showIssueDetail(issue);
+      return;
+    }
     const gp = btn.getAttribute("data-goto-project");
     if (gp) { activateProject(gp); refresh(); return; }
     const ic = btn.getAttribute("data-issue-close");
@@ -2640,7 +2691,7 @@ document.addEventListener("click", async (e) => {
       try {
         await api(`/admin/p/${current}/issues/${encodeURIComponent(ic)}/close`, "POST", { reason });
         showToast(`已关闭 ${ic}`, 5000);
-        await refresh();
+        await refresh(true);
       } catch (e) { alert(`关闭失败：${e.message || e}`); }
       return;
     }
@@ -2651,7 +2702,7 @@ document.addEventListener("click", async (e) => {
       try {
         await api(`/admin/p/${current}/issues/${encodeURIComponent(ir)}/reopen`, "POST", {});
         showToast(`已重新打开 ${ir}`, 5000);
-        await refresh();
+        await refresh(true);
       } catch (e) { alert(`重开失败：${e.message || e}`); }
       return;
     }
@@ -2664,7 +2715,7 @@ document.addEventListener("click", async (e) => {
       try {
         await api(`/admin/p/${current}/issues/${encodeURIComponent(im)}/merge`, "POST", { into: into.trim() });
         showToast(`已合并 ${im} → ${into.trim()}`, 6000);
-        await refresh();
+        await refresh(true);
       } catch (e) { alert(`合并失败：${e.message || e}`); }
       return;
     }
@@ -2679,7 +2730,7 @@ document.addEventListener("click", async (e) => {
       try {
         const r = await api(`/admin/p/${current}/issues/${encodeURIComponent(idp)}/dispatch`, "POST", { to: to || null });
         showToast(`已派发 ${idp} → ${r.task_id || "任务"}${to ? " · " + to : ""}`, 6000);
-        await refresh();
+        await refresh(true);
       } catch (e) { alert(`派发失败：${e.message || e}`); }
       return;
     }

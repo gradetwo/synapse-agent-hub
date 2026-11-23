@@ -179,6 +179,8 @@ CREATE INDEX IF NOT EXISTS idx_issues_project_status
   ON issues(project, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_issues_project_updated
   ON issues(project, updated_at);
+CREATE INDEX IF NOT EXISTS idx_issues_project_created
+  ON issues(project, created_at);
 CREATE INDEX IF NOT EXISTS idx_issues_task
   ON issues(project, task_id);
 CREATE INDEX IF NOT EXISTS idx_issues_status

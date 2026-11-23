@@ -36,7 +36,7 @@ components:
         sender: { type: string }
         topic:
           type: string
-          enum: [announce, task, artifact, report, ack, status, alert, admin]
+          enum: [announce, task, artifact, report, ack, status, alert, admin, issue]
         kind: { type: string }
         to:
           oneOf:
@@ -111,6 +111,32 @@ components:
         notes: { type: string }
         state: { type: string, enum: [delivered, collected, archived], readOnly: true }
         result: { type: string, description: 纯信息备注，不改状态 }
+    Issue:
+      type: object
+      required: [issue_id, title, status, priority, reporter]
+      properties:
+        issue_id: { type: string, pattern: '^[A-Za-z0-9._:-]{1,128}$' }
+        title: { type: string, maxLength: 200 }
+        body: { type: string, maxLength: 20000 }
+        status: { type: string, enum: [open, closed, merged], readOnly: true }
+        priority: { type: string, enum: [low, normal, high, urgent], default: normal }
+        labels: { type: string, maxLength: 300 }
+        reporter: { type: string, readOnly: true, description: 服务端从 token 注入 }
+        task_id: { type: [string, 'null'], readOnly: true }
+        merged_into: { type: [string, 'null'], readOnly: true }
+        close_reason: { type: [string, 'null'], readOnly: true }
+        closed_by: { type: [string, 'null'], readOnly: true }
+        created_at: { type: integer, readOnly: true }
+        updated_at: { type: integer, readOnly: true }
+        closed_at: { type: [integer, 'null'], readOnly: true }
+    IssueCreate:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        body: { type: string, maxLength: 20000, default: '' }
+        priority: { type: string, enum: [low, normal, high, urgent], default: normal }
+        labels: { type: string, maxLength: 300, default: '' }
     Broadcast:
       type: object
       required: [broadcast_id, severity, title]
@@ -355,6 +381,21 @@ paths:
       responses:
         '200': { description: 已创建或幂等返回 }
         '422': { description: base_sha 缺失 / blob_missing / secret_detected }
+  /p/{project}/issues:
+    post:
+      summary: 上报 Issue（所有 agent 默认可上报）
+      description: reporter 由服务端从 token 注入，忽略客户端提交的同名字段。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueCreate' }
+      responses:
+        '201': { description: 已创建，返回 issue_id / status / priority / seq }
+        '422': { description: title_required / title_too_long / body_too_long / bad_priority / secret_detected }
+        '429': { description: issue_rate_limited（默认 20 条/分钟/项目） }
   /p/{project}/ws-ticket:
     get:
       summary: 用 Bearer 换一次性 WebSocket 票据
@@ -543,6 +584,80 @@ paths:
       responses:
         '200': { description: 任务创建成功 }
         '409': { description: task_exists }
+  /admin/p/{project}/issues:
+    get:
+      summary: Issue 台账
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: status, in: query, schema: { type: string, enum: [open, closed, merged] } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, minimum: 1, maximum: 200 } }
+      responses:
+        '200':
+          description: '{ issues: Issue[], counts: { open, closed, merged } }'
+  /admin/p/{project}/issues/{issueId}/close:
+    post:
+      summary: 关闭 Issue
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: issueId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 240, default: 管理员关闭 }
+      responses:
+        '200': { description: 已关闭 }
+        '409': { description: issue_merged }
+  /admin/p/{project}/issues/{issueId}/reopen:
+    post:
+      summary: 重新打开 Issue
+      description: 自动关闭（closed_by=task）的 Issue 会清空 task_id，允许重新派发。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: issueId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 已重新打开 }
+        '409': { description: issue_not_reopenable }
+  /admin/p/{project}/issues/{issueId}/merge:
+    post:
+      summary: 合并 Issue 到另一个 open Issue
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: issueId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [into]
+              properties:
+                into: { type: string }
+      responses:
+        '200': { description: 已合并 }
+        '409': { description: issue_not_open / issue_has_task / target_not_open / issue_changed }
+  /admin/p/{project}/issues/{issueId}/dispatch:
+    post:
+      summary: Issue 转任务并派发
+      description: 任务完成后由 ProjectRoom 自动关闭来源 Issue。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: issueId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task_id: { type: string, maxLength: 64 }
+                to: { type: [string, 'null'], description: 为空进入公共池 }
+                title: { type: string }
+                body: { type: string }
+      responses:
+        '200': { description: 已派发，返回 task_id / task_link }
+        '409': { description: issue_not_open / issue_already_dispatched }
   /admin/p/{project}/broadcast:
     post:
       summary: 广播（broadcast_id 幂等，支持 supersedes）

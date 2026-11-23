@@ -67,6 +67,30 @@ export class Admin {
     return this.c.reqGet(this.p(q)).then((r) => Array.isArray(r) ? r : (r.submissions ?? []));
   }
 
+  // ── Issue 台账（管理侧）────────────────────────────────
+  issues(status?: string): Promise<any> {
+    const q = status ? `/issues?status=${encodeURIComponent(status)}` : "/issues";
+    return this.c.reqGet(this.p(q));
+  }
+
+  issueClose(issueId: string, reason = "管理员关闭"): Promise<any> {
+    return this.c.reqPost(this.p(`/issues/${encodeURIComponent(issueId)}/close`), { reason });
+  }
+
+  issueReopen(issueId: string): Promise<any> {
+    return this.c.reqPost(this.p(`/issues/${encodeURIComponent(issueId)}/reopen`), {});
+  }
+
+  issueMerge(issueId: string, into: string): Promise<any> {
+    return this.c.reqPost(this.p(`/issues/${encodeURIComponent(issueId)}/merge`), { into });
+  }
+
+  issueDispatch(issueId: string, to?: string | null, taskId = "", body = ""): Promise<any> {
+    return this.c.reqPost(this.p(`/issues/${encodeURIComponent(issueId)}/dispatch`), {
+      to: to ?? null, task_id: taskId, ...(body ? { body } : {}),
+    });
+  }
+
   /** 取交付物 zip 到磁盘（不解压；需要则自行 unzip）。 */
   async download(id: string, to: string): Promise<string> {
     const buf = await this.c.reqBytes(this.p(`/submissions/${id}/bundle`));
