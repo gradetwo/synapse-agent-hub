@@ -103,6 +103,31 @@ export class ProjectRoom implements DurableObject {
     return true;
   }
 
+  /** 任务播报（topic=task, kind=task, 无 to）在创建时冻结收件范围：无主任务先
+   * 播报给全员，之后被指派给别人、被别人领走或已关闭时，播报仍留在其他人的
+   * inbox 里，点了只会吃 not_your_task / locked（ISS-MWSO8HVB-A957CB）。
+   * 这里按任务的当前记录复核这三类失效；任务记录查不到时保留（fail-open），
+   * 管理员视角（me="*"/null）在调用处已跳过，不过滤。 */
+  private async dropStaleTaskAnnouncements(messages: Msg[], me: string): Promise<Msg[]> {
+    const isAnnouncement = (m: any) =>
+      m.topic === "task" && m.kind === "task" && !m.to && !!(m.payload as any)?.task_id;
+    if (!messages.some(isAnnouncement)) return messages;
+    const out: Msg[] = [];
+    const cache = new Map<string, any>();
+    for (const m of messages) {
+      if (!isAnnouncement(m)) { out.push(m); continue; }
+      const id = String((m.payload as any).task_id);
+      if (!cache.has(id)) cache.set(id, await this.st.get(`task:${id}`));
+      const t: any = cache.get(id);
+      if (!t) { out.push(m); continue; }
+      if (t.to && !this.isToMe(t.to, me)) continue;
+      if (t.state === "claimed" && t.owner && t.owner !== me) continue;
+      if (t.state === "done") continue;
+      out.push(m);
+    }
+    return out;
+  }
+
   private projectName(): string {
     try { return String((this.state.id as any).name ?? ""); } catch { return ""; }
   }
@@ -269,7 +294,10 @@ export class ProjectRoom implements DurableObject {
     // 普通 agent 只看定向消息和管理端广播；项目事件（announce/artifact/task 生命周期）只进管理台。
     // me="*" 是管理员视角：不做过滤，看全量。
     const rawMessages = messages;
-    const visible = messages.filter((m: any) => this.agentCanSee(m, me));
+    let visible = messages.filter((m: any) => this.agentCanSee(m, me));
+    // 任务播报冻结的是创建时的 to：无主播报之后被指派/领走/关闭，对其他人已失效，
+    // 返回前按任务当前记录复核（ISS-MWSO8HVB-A957CB）。
+    if (me && me !== "*") visible = await this.dropStaleTaskAnnouncements(visible, me);
     const page = desc ? visible.slice(-limit) : visible.slice(0, limit);
     // 游标必须推进到“已扫描的原始消息”末条：如果这一页全被过滤掉，
     // 还停在 since 会让客户端每次轮询都重复拉同一段噪音。
