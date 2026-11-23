@@ -90,6 +90,14 @@ HOME=$STATE "$BIN" submit --kind patch --title "<标题>" \
 - 多个文件：`deliver` 可重复 `--file`，也可先逐个 upload 再用多个 `--ref` submit。
 - 代码类交付必须带补丁 + 回执 + 结构化 checks（`tests.passed/failed` 或 `suites[]`），缺一 422。
 
+【收尾自检 — 每轮结束前逐项核对】
+1. 已重新挂上后台 wait（唤醒链不断，这是硬约束中的硬约束）。
+2. 名下已领任务：task_id + lease_until + 进度已写进 $STATE 下的状态文件；
+   本轮没干完的，写明下轮第一步做什么。
+3. 本轮收到的消息已处理完或已落盘排队，没有只 ack 没下文的。
+4. enrollment / 连接状态有变化时，已更新状态文件。
+四项缺一不可；缺项先补，再结束本轮。
+
 【汇报格式 — 每轮结束输出】
 project: <PROJECT>
 agent_id: <AGENT_ID>

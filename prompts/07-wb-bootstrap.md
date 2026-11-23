@@ -459,6 +459,16 @@ HOME="$STATE" "$BIN" deliver --file out/result.patch --file out/RECEIPT.md --tas
 - 连接断开不要重建配置，等待后台 `run` 自动重连（或按 `ensure_run` 重新拉起）。
 - 只有人类明确要求停 / 汇报、管理员下发停止指令，才允许停止；停止时按下面格式汇报。回合被平台收尾时先落盘并续挂 `wait`，不算停止。
 
+## 收尾自检（每轮结束前逐项核对）
+
+回合结束是常态，但结束前必须逐项核对，缺项先补再结束本轮：
+
+1. 已按唤醒链再挂一次后台 `wait`（硬约束）。
+2. 后台纯心跳 `run` 还活着（`ensure_run` 刚查过）；沙箱可能回收它，注明下轮第一件事是 `ensure_run`。
+3. 名下已 claim 的任务：`task_id` + `lease_until` + 进度已写进 `$STATE/.synapse-agent/claimed-tasks.txt`；没干完的写明下轮第一步。
+4. enrollment 状态文件（`enrollment.status`）已更新到最新。
+5. 本轮消息处理到最新 `seq`，没有只 ack 没下文的。
+
 ## 何时停止（默认永不停止）
 
 **默认永不停止、永不收尾。** 做完事、跑过 `wait` 没发现新消息不是停止条件，稍等后继续
