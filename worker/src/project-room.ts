@@ -5,6 +5,10 @@ import { Env, Msg, Task, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOW
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
 const DEFAULT_TASK_LEASE_MS = 12 * 60 * 60_000; // 任务 claim 默认租约 12h；心跳会续，LEASE_TTL_S 可调
 export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任务/Issue 时，名下已 claim 未完成任务上限
+const DEFAULT_SURFACE_PARALLEL = 1;              // window/tmux 一次只能跑一个任务
+const DEFAULT_HEADLESS_PARALLEL = 2;             // 无窗口/无 tmux 的循环默认允许两件在途任务
+const MAX_PARALLEL_TASKS = 8;
+
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
@@ -67,6 +71,109 @@ export class ProjectRoom implements DurableObject {
     return Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : DEFAULT_TASK_LEASE_MS;
   }
 
+  /** 定向任务并发上限：管理端显式配置优先；其次按心跳上报的 surface 类型取默认。
+   *  未知类型按 surface=1 处理，宁可排队也不能把多条任务灌进旧窗口客户端。 */
+  private async agentMaxParallel(agentId: string): Promise<number> {
+    const rec: any = await this.st.get(`agent:${agentId}`).catch(() => null);
+    const configured = Number(rec?.max_parallel_tasks ?? 0);
+    if (Number.isFinite(configured) && configured >= 1) return Math.min(MAX_PARALLEL_TASKS, Math.floor(configured));
+    const kind = String(rec?.surface?.kind ?? "").toLowerCase();
+    if (kind === "window" || kind === "tmux") return DEFAULT_SURFACE_PARALLEL;
+    if (kind === "none") return DEFAULT_HEADLESS_PARALLEL;
+    return DEFAULT_SURFACE_PARALLEL;
+  }
+
+  private dispatchStateOf(t: any): string {
+    if (t?.dispatch_state) return String(t.dispatch_state);
+    // 旧任务没有 dispatch_state：已 claim 的定向任务视为在途；open 定向任务可能已经
+    // 由旧版本直接下发过，也按在途处理，避免升级后瞬间再灌一条。
+    if (t?.to && t?.state === "claimed") return "active";
+    if (t?.to && t?.state === "open") return "notified";
+    return "closed";
+  }
+
+  private isTerminalDispatch(t: any): boolean {
+    return ["done", "released", "blocked"].includes(String(t?.state ?? ""));
+  }
+
+  /** 当前占用并发槽的定向任务数。notified（已发消息）和 active（已 claim）都算；
+   *  done/released/blocked 释放槽位。 */
+  private async directedInFlight(agentId: string): Promise<number> {
+    if (!agentId) return 0;
+    const tasks = await this.listRawTasks();
+    return tasks.filter((t: any) => t.to === agentId && !this.isTerminalDispatch(t)
+      && ["notified", "active"].includes(this.dispatchStateOf(t))).length;
+  }
+
+  private async queuePosition(agentId: string, taskId: string): Promise<number> {
+    if (!agentId) return 0;
+    const queued = (await this.listRawTasks())
+      .filter((t: any) => t.to === agentId && t.state === "open" && this.dispatchStateOf(t) === "queued")
+      .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0));
+    const idx = queued.findIndex((t: any) => String(t.task_id ?? t.id ?? "") === taskId);
+    return idx >= 0 ? idx + 1 : 0;
+  }
+
+  private async listRawTasks(): Promise<any[]> {
+    const m = await this.st.list({ prefix: "task:" });
+    return [...m.values()].map((v: any) => v).filter(Boolean);
+  }
+
+  /** 把任务写入派发状态并发一条任务消息；没有槽位时只入队，不发消息。
+   *  这是“服务端单飞”的核心：窗口客户端不需要自己猜 TUI 是否在忙。 */
+  private async dispatchTaskOrQueue(project: string, t: any, extra: any = {}): Promise<any> {
+    if (!t?.to) return { notified: false, max_parallel: 0 };
+    const max = await this.agentMaxParallel(t.to);
+    const inFlight = await this.directedInFlight(t.to);
+    const taskId = String(t.task_id ?? t.id ?? "");
+    if (inFlight >= max) {
+      const pos = await this.queuePosition(t.to, taskId);
+      const queued = { ...t, dispatch_state: "queued", updated_at: Date.now() };
+      await this.st.put(`task:${taskId}`, queued);
+      return { notified: false, dispatch_state: "queued", queue_position: pos, max_parallel: max };
+    }
+    const count = Number(t.dispatch_count ?? 0) + 1;
+    const next = { ...t, dispatch_state: "notified", notified_at: Date.now(),
+                   dispatch_count: count, updated_at: Date.now() };
+    await this.st.put(`task:${taskId}`, next);
+    const seq = await this.append({
+      project, sender: "admin", topic: "task", kind: "task", to: t.to,
+      payload: { task_id: taskId, title: t.title ?? "", body: t.body ?? "",
+                 work_item: true, dispatch_count: count, ...extra },
+      dedupe_key: `task-dispatch:${taskId}:${count}`,
+    });
+    return { notified: true, dispatch_state: "notified", seq, max_parallel: max };
+  }
+
+  /** 释放一个槽位后，按 FIFO 补发队列里的任务，直到达到并发上限。 */
+  private async promoteQueue(project: string, agentId: string | null | undefined): Promise<any[]> {
+    if (!agentId) return [];
+    const max = await this.agentMaxParallel(agentId);
+    let inFlight = await this.directedInFlight(agentId);
+    const promoted: any[] = [];
+    while (inFlight < max) {
+      const queued = (await this.listRawTasks())
+        .filter((t: any) => t.to === agentId && t.state === "open" && this.dispatchStateOf(t) === "queued")
+        .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0));
+      const t = queued[0];
+      if (!t) break;
+      const taskId = String(t.task_id ?? t.id ?? "");
+      const count = Number(t.dispatch_count ?? 0) + 1;
+      const next = { ...t, dispatch_state: "notified", notified_at: Date.now(),
+                     dispatch_count: count, updated_at: Date.now() };
+      await this.st.put(`task:${taskId}`, next);
+      const seq = await this.append({
+        project, sender: "admin", topic: "task", kind: "task", to: agentId,
+        payload: { task_id: taskId, title: t.title ?? "", body: t.body ?? "",
+                   work_item: true, dispatch_count: count, queue_promoted: true },
+        dedupe_key: `task-dispatch:${taskId}:${count}`,
+      });
+      promoted.push({ task_id: taskId, seq });
+      inFlight++;
+    }
+    return promoted;
+  }
+
   async fetch(req: Request): Promise<Response> {
     try {
       return await this.handle(req);
@@ -104,6 +211,7 @@ export class ProjectRoom implements DurableObject {
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
       case "agent/activity": return this.markActivity(body);
+      case "agents/config": return this.setAgentConfig(body);
       case "agents/idle-list": return this.idleList(body);
       case "agents/idle-remind": return this.idleRemind(body);
       case "agent/remove": return this.removeAgent(body);
@@ -369,6 +477,11 @@ export class ProjectRoom implements DurableObject {
       work: b.work ?? { state: "idle" },
       load: b.load ?? {},
       env: b.env ?? {},
+      // 外观/运行形态由客户端上报，用于计算默认并发；管理端覆盖值不能被心跳冲掉。
+      surface: b.surface ?? prev.surface ?? null,
+      client_max_parallel_tasks: Number.isFinite(Number(b.max_parallel_tasks))
+        ? Math.max(0, Math.min(MAX_PARALLEL_TASKS, Math.floor(Number(b.max_parallel_tasks)))) : null,
+      max_parallel_tasks: prev.max_parallel_tasks ?? null,
       sdk_version: clientVersion || null,
       sdk_latest: latestVersion || null,
       sdk_outdated: outdated,
@@ -391,6 +504,7 @@ export class ProjectRoom implements DurableObject {
             title: "客户端版本过旧：请升级 SDK",
             body: `检测到当前 agent SDK 为 ${shown}，服务端最新为 ${latestVersion}。` +
                   "请执行 /dl/install.sh 升级并重启；升级后心跳会自动上报新版本。",
+            notice: true,
             agent_id: b.agent_id,
             current_version: clientVersion || null,
             latest_version: latestVersion,
@@ -469,20 +583,29 @@ export class ProjectRoom implements DurableObject {
                         message: `你当前名下已 claim 未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再认领 Issue。` }, 409);
       }
     }
+    const projectName = String(b.project ?? this.projectName());
+    // 新建前先把已有队列按 FIFO 填满空槽；否则新任务会插队到老任务前面。
+    if (to) await this.promoteQueue(projectName, to);
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
-                     project: b.project ?? this.projectName(),
+                     project: projectName,
                      owner: null, lease_until: 0, created_at: now, updated_at: now,
-                     created_by: b.sender ?? "admin", to, issue_id: issueId };
+                     created_by: b.sender ?? "admin", to, issue_id: issueId,
+                     dispatch_state: to ? "queued" : undefined, dispatch_count: 0 };
     await this.st.put(`task:${id}`, t);
-    const seq = await this.append({ project: b.project, sender: b.sender ?? "admin", topic: "task",
-                                   kind: "task", to: to ?? undefined,
-                                   payload: { task_id: id, title, body: t.body },
-                                   dedupe_key: `task:${id}` });
+    // 定向任务先经过单飞队列：没有槽位时只登记排队，不往窗口/循环里发消息。
+    // 公共池任务不排队，仍然按原逻辑广播，agent 自己 claim。
+    const dispatch = to
+      ? await this.dispatchTaskOrQueue(projectName, t)
+      : { notified: false, max_parallel: 0 };
+    const seq = dispatch.seq ?? null;
     // S5：指派事件至少落一条定向消息（节点 wait/run 下一次拉取即被唤醒）。
     // 离线节点仍收不到，管理台账用 to_online 明确标出，避免“已派单”造成在线错觉。
     const hb: any = to ? await this.st.get(`agent:${to}`).catch(() => null) : null;
     const targetAge = hb?.last_hb_ms ? now - Number(hb.last_hb_ms) : Infinity;
     return json({ task_id: id, state: "open", seq,
+                  dispatch_state: dispatch.dispatch_state ?? (to ? "queued" : "closed"),
+                  queue_position: dispatch.queue_position ?? 0,
+                  max_parallel_tasks: dispatch.max_parallel ?? 0,
                   wake: to ? { channel: "inbox", target: to,
                                online: targetAge <= 300_000,
                                alive: targetAge <= 120_000 ? "alive" : targetAge <= 300_000 ? "late" : "offline" } : null });
@@ -535,6 +658,10 @@ export class ProjectRoom implements DurableObject {
     if (!t) return json({ error: "not_found" }, 404);
     const now = Date.now();
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
+    if (t.to && this.dispatchStateOf(t) === "queued")
+      return json({ error: "task_not_dispatched", task_id: t.task_id ?? t.id,
+                    queue_position: await this.queuePosition(String(t.to), String(t.task_id ?? t.id ?? "")),
+                    message: "该任务还在该节点的派单队列里，等前序任务释放后会自动下发；不要提前 claim。" }, 409);
     if (t.state === "claimed" && t.owner === b.agent_id && Number(t.lease_until ?? 0) > now)
       return json({ ok: true, lease_until: t.lease_until, already: true });
     // 自领公共任务前检查名下已 claim 未完成任务；定向任务不受此限（管理员派单只提醒不拦截）。
@@ -559,8 +686,10 @@ export class ProjectRoom implements DurableObject {
     if (t.state !== "open" && !(t.state === "claimed" && t.lease_until < now))
       return json({ error: "locked", state: t.state, owner: t.owner, lease_until: t.lease_until }, 409);
     const lease = now + this.taskLeaseMs();
-    await this.st.put(`task:${b.task_id}`, { ...t, state: "claimed", owner: b.agent_id,
-                                             lease_until: lease, updated_at: now });
+    const next = { ...t, state: "claimed", owner: b.agent_id,
+                   ...(t.to ? { dispatch_state: "active" } : {}),
+                   lease_until: lease, updated_at: now };
+    await this.st.put(`task:${b.task_id}`, next);
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "claimed",
                         payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                    lease_until: lease },
@@ -653,18 +782,21 @@ export class ProjectRoom implements DurableObject {
     const now = Date.now();
     const patch: any = { state, owner: null, lease_until: 0, pending_submissions: pending,
                          pending_review: pendingReview,
-                         updated_at: now, released_by: b.agent_id };
+                         updated_at: now, released_by: b.agent_id,
+                         ...(t.to ? { dispatch_state: "closed" } : {}) };
     if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
     if (state === "blocked") { patch.blocked_at = now; }
     const next = { ...t, ...patch };
     await this.st.put(`task:${b.task_id}`, next);
     if (state === "done") await this.closeIssueForTask(next);
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: state,
+                        to: b.agent_id,
                         payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                    pending_submissions: pending,
                                    ...(state === "open" ? { abandoned_by: b.agent_id } : {}) },
                         dedupe_key: `release:${b.task_id}:${Date.now()}` });
-    return json({ ok: true, state, pending_submissions: pending });
+    const promoted = await this.promoteQueue(project, t.to);
+    return json({ ok: true, state, pending_submissions: pending, promoted });
   }
 
   /**
@@ -685,14 +817,17 @@ export class ProjectRoom implements DurableObject {
       state = "open";
       const reopened = { ...t, state, owner: null, lease_until: 0,
         pending_submissions: pending, pending_review: pendingReview, updated_at: Date.now(),
-        closed_at: null, closed_by: null, reopened_at: Date.now(), reopened_by: "review" };
+        closed_at: null, closed_by: null, reopened_at: Date.now(), reopened_by: "review",
+        ...(t.to ? { dispatch_state: "queued" } : {}) };
       await this.st.put(`task:${b.task_id}`, reopened);
       await this.reopenIssueForTask(reopened);
       await this.append({ project, sender: b.sender ?? "admin", topic: "task", kind: "open",
+                          to: t.to ?? undefined,
                           payload: { task_id: b.task_id, reopened_by: "review", reason: "delivery_rejected" },
                           dedupe_key: `reopen:${b.task_id}:${Date.now()}` });
+      const promoted = await this.promoteQueue(project, t.to);
       return json({ ok: true, task_id: b.task_id, state, pending_submissions: pending,
-                    pending_review: pendingReview, unapproved_reports: unapproved });
+                    pending_review: pendingReview, unapproved_reports: unapproved, promoted });
     }
     const canClose = pending === 0 && unapproved === 0
       && (t.state === "claimed" || t.state === "released");
@@ -702,14 +837,17 @@ export class ProjectRoom implements DurableObject {
       const closed = { ...t, state, owner: null, lease_until: 0,
                        pending_submissions: 0, pending_review: pendingReview,
                        updated_at: now, closed_at: now,
+                       ...(t.to ? { dispatch_state: "closed" } : {}),
                        closed_by: b.closed_by === "approval" ? "approval" : "collection" };
       await this.st.put(`task:${b.task_id}`, closed);
       await this.closeIssueForTask(closed);
       await this.append({ project, sender: b.sender ?? "admin", topic: "task", kind: "done",
+                          to: t.owner ?? t.to ?? undefined,
                           payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                      closed_by: b.closed_by === "approval" ? "approval" : "collection",
                                      pending_review: pendingReview },
                           dedupe_key: `close:${b.task_id}` });
+      await this.promoteQueue(project, t.to);
     } else {
       await this.st.put(`task:${b.task_id}`, { ...t, pending_submissions: pending,
                                                pending_review: pendingReview, updated_at: Date.now() });
@@ -730,6 +868,9 @@ export class ProjectRoom implements DurableObject {
       owner: t.owner ?? null,
       to: t.to ?? null,
       project: t.project ?? this.projectName(),
+      dispatch_state: this.dispatchStateOf(t),
+      dispatch_count: Number(t.dispatch_count ?? 0),
+      notified_at: Number(t.notified_at ?? 0) || null,
     });
   }
 
@@ -759,11 +900,27 @@ export class ProjectRoom implements DurableObject {
     const now = Date.now();
     const agents = new Map<string, any>();
     for (const a of (await this.st.list<any>({ prefix: "agent:" })).values()) agents.set(a.agent_id, a);
+    // 队列位置只对 queued 定向任务有意义；先按目标 group，再按创建时间排序。
+    const queuedBy = new Map<string, any[]>();
+    for (const t of r.values()) {
+      const anyT: any = t;
+      if (!anyT.to || anyT.state !== "open" || this.dispatchStateOf(anyT) !== "queued") continue;
+      const list = queuedBy.get(String(anyT.to)) ?? [];
+      list.push(anyT);
+      queuedBy.set(String(anyT.to), list);
+    }
+    const queuePos = new Map<string, number>();
+    for (const [to, list] of queuedBy) {
+      list.sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0));
+      list.forEach((t: any, i: number) => queuePos.set(String(t.task_id ?? t.id ?? ""), i + 1));
+    }
     const tasks = [...r.values()].map((t: any) => {
       const ownerAge = t.owner ? now - Number(agents.get(t.owner)?.last_hb_ms ?? 0) : Infinity;
       const toAge = t.to ? now - Number(agents.get(t.to)?.last_hb_ms ?? 0) : Infinity;
       return {
         ...t,
+        dispatch_state: this.dispatchStateOf(t),
+        queue_position: queuePos.get(String(t.task_id ?? t.id ?? "")) ?? 0,
         lease_left_ms: Math.max(0, Number(t.lease_until ?? 0) - now),
         owner_online: t.owner ? ownerAge <= 300_000 : null,
         owner_alive: t.owner ? (ownerAge <= 120_000 ? "alive" : ownerAge <= 300_000 ? "late" : "offline") : null,
@@ -847,15 +1004,18 @@ export class ProjectRoom implements DurableObject {
     const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
     const task = { ...t, state: "done", owner: null, lease_until: 0,
                    pending_submissions: pending, updated_at: now,
+                   ...(t.to ? { dispatch_state: "closed" } : {}),
                    closed_at: now, closed_by: "admin" };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     await this.closeIssueForTask(task);
     await this.append({ project, sender: "admin", topic: "task", kind: "done",
+                        to: t.owner ?? t.to ?? undefined,
                         payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
                                    closed_by: "admin", pending_submissions: pending,
                                    prev_state: t.state, reason },
                         dedupe_key: `admin-close:${t.task_id ?? t.id}:${now}` });
-    return json({ ok: true, task });
+    const promoted = await this.promoteQueue(project, t.to);
+    return json({ ok: true, task, promoted });
   }
 
   private async adminReclaim(b: any) {
@@ -870,18 +1030,22 @@ export class ProjectRoom implements DurableObject {
     if (this.activeLease(t, now) && !forced) return this.leaseConflict(t, "取回");
     const reason = this.adminReason(b);
     const prevOwner = t.owner ?? null;
+    const prevTo = t.to ?? null;
     const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
     const task = { ...t, state: "open", owner: null, lease_until: 0, to: null,
                    pending_submissions: pending, updated_at: now, reclaimed_at: now,
-                   reclaimed_from: prevOwner, forced_reclaim: forced };
+                   reclaimed_from: prevOwner, forced_reclaim: forced,
+                   ...(prevTo ? { dispatch_state: "closed" } : {}) };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     if (prevOwner) await this.notifyLeaseEvicted(project, t, null, reason, forced, "reclaimed_away");
     await this.append({ project, sender: "admin", topic: "task", kind: "reclaimed",
+                        to: prevOwner ?? prevTo ?? undefined,
                         payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
                                    prev_state: t.state, prev_owner: prevOwner,
                                    prev_to: t.to ?? null, reason, forced },
                         dedupe_key: `admin-reclaim:${t.task_id ?? t.id}:${now}` });
-    return json({ ok: true, task });
+    const promoted = await this.promoteQueue(project, prevTo);
+    return json({ ok: true, task, promoted });
   }
 
   private async adminReassign(b: any) {
@@ -892,8 +1056,12 @@ export class ProjectRoom implements DurableObject {
     const to = String(b.to ?? "").trim();
     if (!to) return json({ error: "assignee_required" }, 422);
     const now = Date.now();
-    // 同人转派是 no-op，不能把正在 claimed 的任务重置成 open，否则等于静默丢锁。
+    // 同人转派是 no-op，不能把正在 claimed 的任务重置成 open，否则等于静默丢锁；
+    // 未 claim 但已经指向同一人时也必须 no-op，否则会走一遍 queued → promote
+    // → dispatch，可能把同一条任务重复下发。
     if (t.state === "claimed" && t.owner === to)
+      return json({ ok: true, task: t, already: true, brief_embedded: true });
+    if (t.to === to)
       return json({ ok: true, task: t, already: true, brief_embedded: true });
     const forced = b?.force === true;
     // 互斥/租约保护：有效 claim 期间默认拒绝转派，避免正在做工的人被中途换掉。
@@ -905,19 +1073,33 @@ export class ProjectRoom implements DurableObject {
     if (!agent) return json({ error: "assignee_not_found", agent_id: to }, 422);
     const reason = this.adminReason(b);
     const prevOwner = t.owner ?? null;
+    const prevTo = t.to ?? null;
     const pending = await this.pendingDeliveries(project, t.task_id ?? t.id);
     const task = { ...t, state: "open", owner: null, lease_until: 0, to,
                    pending_submissions: pending, updated_at: now,
-                   reassigned_at: now, reassigned_from: prevOwner ?? t.to ?? null,
-                   forced_reassign: forced };
+                   reassigned_at: now, reassigned_from: prevOwner ?? prevTo,
+                   forced_reassign: forced, dispatch_state: "queued" };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     if (prevOwner) await this.notifyLeaseEvicted(project, t, to, reason, forced, "reassigned_away");
-    await this.append({ project, sender: "admin", topic: "task", kind: "reassigned", to,
-                        payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
-                                   to, prev_state: t.state, prev_owner: prevOwner,
-                                   prev_to: t.to ?? null, reason, forced },
-                        dedupe_key: `admin-reassign:${t.task_id ?? t.id}:${now}` });
-    return json({ ok: true, task, brief_embedded: true });
+    // 任务可能已下发但还没 claim（没有 owner）；旧窗口仍持有 active，需要一条
+    // 生命周期消息让它释放本地 task 锁，否则下一条会被自己的 dispatcher 挡住。
+    if (!prevOwner && prevTo && prevTo !== to) {
+      await this.append({ project, sender: "admin", topic: "task", kind: "reassigned_away", to: prevTo,
+                          payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", to,
+                                     reason, forced, message: "任务已转派，请停止当前任务的修改与提交。" },
+                          dedupe_key: `reassigned-away:${t.task_id ?? t.id}:${prevTo}:${now}` });
+    }
+    // 先释放旧目标的槽位，再按新目标的并发上限决定“立即下发”还是“排队”。
+    const promoted = await this.promoteQueue(project, prevTo);
+    const dispatched = await this.dispatchTaskOrQueue(project, task,
+      { reassigned: true, to, prev_state: t.state, prev_owner: prevOwner,
+        prev_to: prevTo, reason, forced });
+    const stored: any = await this.st.get(`task:${t.task_id ?? t.id}`);
+    return json({ ok: true, task: stored ?? task,
+                  brief_embedded: true,
+                  dispatch_state: dispatched.dispatch_state ?? "queued",
+                  queue_position: dispatched.queue_position ?? 0,
+                  promoted });
   }
 
   // ── 广播：一条消息 + 待确认名单 + supersedes 失效 ─────────
@@ -927,7 +1109,8 @@ export class ProjectRoom implements DurableObject {
     if (dup) return json({ seq: dup, deduped: true });
 
     const seq = await this.append({ project: b.project, sender: b.sender ?? "admin",
-                                    topic: "announce", kind: "broadcast", payload: b,
+                                    topic: "announce", kind: "broadcast",
+                                    payload: { ...b, notice: true },
                                     ...(b.max_per_min ? { max_per_min: b.max_per_min } : {}),
                                     dedupe_key: `bc:${b.broadcast_id}` });
     await this.st.put(`bc:${b.broadcast_id}`, seq);
@@ -951,6 +1134,24 @@ export class ProjectRoom implements DurableObject {
     if (!id) return json({ error: "agent_id_required" }, 422);
     await this.st.delete(`agent:${id}`);
     return json({ ok: true });
+  }
+
+  /** 管理端修改单个 agent 的定向任务并发上限；0 表示恢复自动默认。 */
+  private async setAgentConfig(b: any) {
+    const id = String(b?.agent_id ?? "").trim();
+    if (!id) return json({ error: "agent_id_required" }, 422);
+    const raw = Number(b?.max_parallel_tasks);
+    if (!Number.isFinite(raw) || raw < 0 || raw > MAX_PARALLEL_TASKS || Math.floor(raw) !== raw)
+      return json({ error: "bad_max_parallel_tasks", min: 0, max: MAX_PARALLEL_TASKS }, 422);
+    const rec: any = await this.st.get(`agent:${id}`);
+    if (!rec) return json({ error: "agent_not_found", agent_id: id }, 404);
+    // 0 = 清除覆盖，回到按 surface 类型自动取默认。
+    const next = { ...rec, max_parallel_tasks: raw > 0 ? raw : null, updated_at: Date.now() };
+    await this.st.put(`agent:${id}`, next);
+    // 调高上限后要立刻补发排队任务，否则管理员改完看不到任何变化。
+    const promoted = await this.promoteQueue(this.projectName(), id);
+    return json({ ok: true, agent_id: id, max_parallel_tasks: raw,
+                  effective: await this.agentMaxParallel(id), promoted });
   }
 
   private async agents() {
@@ -1118,6 +1319,7 @@ export class ProjectRoom implements DurableObject {
             payload: {
               title: "空闲提醒：去公共池找任务或上报 Issue",
               body: message,
+              notice: true,
               agent_id: agentId,
               task_endpoint: `/p/${project}/tasks`,
               issue_endpoint: `/p/${project}/issues`,
@@ -1236,6 +1438,7 @@ export class ProjectRoom implements DurableObject {
         payload: {
           title: "空闲提醒：去公共池找任务或上报 Issue",
           body: message,
+          notice: true,
           agent_id: agentId,
           task_endpoint: `/p/${project}/tasks`,
           issue_endpoint: `/p/${project}/issues`,
@@ -1288,10 +1491,14 @@ export class ProjectRoom implements DurableObject {
       if (t.state === "claimed" && t.lease_until < now) {
         const prevOwner = t.owner;
         const draft: any = { ...t, state: "open", owner: null, lease_until: 0,
-                             updated_at: now, reclaimed_at: now, reclaimed_from: prevOwner };
+                             updated_at: now, reclaimed_at: now, reclaimed_from: prevOwner,
+                             // 定向任务过期后仍占着原目标的槽位，避免自动把下一条灌给
+                             // 可能已经失联的同一个窗口；管理员 reclaim 后再放行。
+                             ...(t.to ? { dispatch_state: "notified" } : {}) };
         await this.st.put(k, draft);
         await this.append({ project: (t as any).project ?? this.projectName(),
                             sender: "system", topic: "task", kind: "reclaimed",
+                            to: prevOwner ?? (t as any).to ?? undefined,
                             payload: { task_id: (t as any).task_id ?? (t as any).id, prev_owner: prevOwner },
                             max_per_min: 1000,
                             dedupe_key: `reclaim:${(t as any).task_id ?? (t as any).id}:${now}` });

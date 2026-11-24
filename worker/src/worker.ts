@@ -340,7 +340,7 @@ export default {
 
     // 交付创建在 Worker 侧完成（需查 R2 + 写 D1），不转发给 DO
     if (action === "submissions" && req.method === "POST")
-      return createSubmission(req, env, project, auth.agentId!);
+      return createSubmission(req, env, project, auth.agentId!, auth.role === "admin");
 
     // 交付只读在 Worker 侧查 D1 / 拼 bundle，不转发给 DO（DO 没有 submissions 动作，
     // 此前 GET /p/<proj>/submissions 只会得到 404 unknown_action）。
@@ -1210,6 +1210,14 @@ async function admin(req: Request, env: Env, url: URL) {
       return json(d, r?.status || 503);
     }
     if (action === "agents") return stub.fetch(new Request("https://do/agent/list"));
+    if (action === "agents/config" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      const r = await stub.fetch(new Request("https://do/agents/config", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...b, project }),
+      }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
     if (action === "tasks" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
       const quota = await projectQuota(env, project);
@@ -1513,13 +1521,19 @@ async function admin(req: Request, env: Env, url: URL) {
       if (!b.body && !b.title) return err(422, "empty_message");
       const out = [];
       for (const t of targets) {
+        const kind = String(b.kind ?? "notice");
+        const workItem = b.work_item === true && !!b.task_id;
         const r = await stub.fetch(new Request("https://do/publish", {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({
-            project, sender: "admin", topic: b.topic ?? "task", kind: b.kind ?? "task",
+            project, sender: "admin", topic: b.topic ?? "admin", kind,
             to: t,
             payload: { title: b.title ?? "", body: b.body ?? "",
-                       action_required: { kind: b.kind ?? "task", ack_required: !!b.ack_required } },
+                       // 非任务消息走通知 lane，允许在任务执行期间注入窗口；但仍标明
+                       // “不是新任务”，避免 TUI 把它当成下一条派单。
+                       notice: b.notice !== false && !workItem,
+                       ...(workItem ? { work_item: true, task_id: b.task_id } : {}),
+                       action_required: { kind, ack_required: !!b.ack_required } },
             max_per_min: (await projectQuota(env, project)).maxMsgsPerMin,
             dedupe_key: `dm:${t}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
           }),
@@ -1569,7 +1583,8 @@ async function admin(req: Request, env: Env, url: URL) {
         if (!obj) return err(422, `blob_missing:${r.sha256}`);
       }
       const kind = String(b.kind ?? "patch");
-      const allowOvertake = b.allow_overtake === true;
+      // 越单只能由管理侧显式发起；普通 agent 不能自报 allow_overtake 绕过绑定。
+      const allowOvertake = isAdmin && b.allow_overtake === true;
       const overtakeReason = String(b.overtake_reason ?? "").trim().slice(0, 240);
       if (allowOvertake && !overtakeReason) return err(422, "overtake_reason_required");
       const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, allowOvertake, false);
@@ -1939,6 +1954,10 @@ function agentTaskView(t: any, agentId: string) {
     state: t.state ?? "",
     owner: t.owner ?? null,
     to: t.to ?? null,
+    dispatch_state: t.dispatch_state ?? (t.to && t.state === "claimed" ? "active"
+      : t.to && t.state === "open" ? "notified" : "closed"),
+    queue_position: Number(t.queue_position ?? 0),
+    dispatch_count: Number(t.dispatch_count ?? 0),
     issue_id: t.issue_id ?? null,
     created_at: t.created_at ?? 0,
     updated_at: t.updated_at ?? 0,
@@ -2111,36 +2130,40 @@ type TaskBinding = {
 
 /**
  * S1/S2：交付绑定与越单校验。
- * - 显式 task_id：校验存在、非 done、提交者是 owner 或被指派者；
- * - 缺省 task_id：该 agent 名下恰好一件 claimed 任务时自动绑定，多件则要求显式指定；
+ * - task_id 必填；不再按“名下只有一个 claimed”猜测，猜错会把交付挂到旧任务；
+ * - 显式 task_id 必须是该 agent 当前 active/已 claim 的任务；当前 active 由派单队列
+ *   （notified/active）或 claim（claimed）决定，别的 assigned 任务不接收交付；
  * - 管理侧代建可显式 allowOvertake，落库标记「越单」并留理由。
  */
 async function resolveSubmissionTask(
   env: Env, project: string, agentId: string, rawTaskId: unknown,
   allowOvertake = false, requireClaimed = true
 ): Promise<TaskBinding> {
-  let taskId = rawTaskId === undefined || rawTaskId === null || String(rawTaskId).trim() === ""
+  const taskId = rawTaskId === undefined || rawTaskId === null || String(rawTaskId).trim() === ""
     ? null : String(rawTaskId).trim();
-  let autoBound = false;
+  const autoBound = false;
+  const all = await projectTasks(env, project);
+  const activeIds = all
+    .filter((t: any) => t?.state !== "done"
+      && ((t.state === "claimed" && t.owner === agentId)
+        || (t.to === agentId && t.state === "open"
+          && (!t.dispatch_state || ["notified", "active"].includes(t.dispatch_state)))))
+    .map((t: any) => String(t.task_id ?? t.id ?? ""))
+    .filter(Boolean)
+    .slice(0, 20);
   if (taskId === null) {
-    const mine = (await projectTasks(env, project))
-      .filter((t: any) => t.state === "claimed" && t.owner === agentId);
-    if (mine.length === 1) {
-      taskId = String(mine[0].task_id ?? mine[0].id ?? "").trim() || null;
-      autoBound = taskId !== null;
-    } else if (mine.length > 1) {
-      return { taskId: null, task: null, autoBound: false, overtake: false, assigneeAtSubmit: null,
-        error: json({ error: "task_id_required", reason: "当前有多件 claimed 任务，必须显式带 task_id",
-                      candidates: mine.map((t: any) => t.task_id ?? t.id).slice(0, 20) }, 409) };
-    }
+    return { taskId: null, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
+      error: json({ error: "task_id_required",
+                    reason: "提交必须显式指定当前任务；服务端不再按 claimed 数量自动绑定",
+                    active_task_ids: activeIds,
+                    hint: "用任务消息里的 [task:<id>]，或让 CLI 从 active_task.json 读取；多任务并发时尤其不能省略" }, 422) };
   }
-  if (taskId === null)
-    return { taskId: null, task: null, autoBound: false, overtake: false, assigneeAtSubmit: null };
 
   if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId))
     return { taskId: null, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
              error: err(422, "bad_task_id") };
-  const t = await taskMeta(env, project, taskId);
+  let t: any = all.find((x: any) => String(x.task_id ?? x.id ?? "") === taskId) ?? null;
+  if (!t) t = await taskMeta(env, project, taskId);
   if (!t)
     return { taskId, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
              error: err(422, `task_not_found:${taskId}`) };
@@ -2150,17 +2173,33 @@ async function resolveSubmissionTask(
 
   const isOwner = t.state === "claimed" && t.owner === agentId;
   const isAssigned = t.to === agentId && t.state !== "done";
-  const assigned = requireClaimed ? isOwner : (isOwner || isAssigned);
-  if (!assigned && !allowOvertake) {
-    return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
-      error: json({ error: requireClaimed && isAssigned ? "task_not_claimed" : "task_not_assignee",
-                    task_id: taskId, task_state: t.state,
-                    task_owner: t.owner ?? null, task_to: t.to ?? null,
-                    hint: requireClaimed
-                      ? "交付前先 task-claim，且只能交自己 claim 的任务"
-                      : "只能交付自己 owner 或被指派的任务；管理侧代建可用 allow_overtake 留痕" }, 409) };
+  const isActive = activeIds.includes(taskId);
+  // 管理侧显式越单：仍要求任务存在且未 done，但跳过“当前上下文”限制并留痕。
+  if (allowOvertake) {
+    return { taskId, task: t, autoBound, overtake: true, assigneeAtSubmit: t.owner ?? t.to ?? null };
   }
-  return { taskId, task: t, autoBound, overtake: !assigned,
+  // 先查上下文，再查是否 claimed：错误信息要能区分“你拿错任务了”和“你没 claim”。
+  if (!isActive) {
+    return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
+      error: json({ error: "task_context_mismatch", task_id: taskId,
+                    task_state: t.state, task_owner: t.owner ?? null, task_to: t.to ?? null,
+                    active_task_ids: activeIds,
+                    hint: "只能交付当前 active/已 claim 的任务；如果确实要越单，管理侧代建需带 allow_overtake + overtake_reason" }, 409) };
+  }
+  if (requireClaimed && !isOwner) {
+    return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
+      error: json({ error: "task_not_claimed", task_id: taskId,
+                    task_state: t.state, task_to: t.to ?? null,
+                    active_task_ids: activeIds,
+                    hint: "该任务已经下发但还没有 claim；先 task-claim，再交付" }, 409) };
+  }
+  if (!isOwner && !isAssigned) {
+    return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
+      error: json({ error: "task_not_assignee", task_id: taskId,
+                    task_state: t.state, task_owner: t.owner ?? null, task_to: t.to ?? null,
+                    hint: "只能交付自己 owner 或被指派的任务；管理侧代建可用 allow_overtake 留痕" }, 409) };
+  }
+  return { taskId, task: t, autoBound, overtake: false,
            assigneeAtSubmit: t.owner ?? t.to ?? null };
 }
 
@@ -2239,7 +2278,7 @@ async function publishTaskBrief(
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ project, sender: "admin", topic: "task", kind: "task", to,
                            payload: { task_id: taskId, title: t.title ?? "", body: t.body ?? "",
-                                      reassigned: true, reason },
+                                      reassigned: true, work_item: true, reason },
                            max_per_min: quota.maxMsgsPerMin,
                            dedupe_key: `task-brief:${taskId}:${to}:${Date.now()}` }),
   }));
@@ -2298,7 +2337,7 @@ async function settleTaskAfterSubmission(
   return { ...d, pending_review: pendingReview, unapproved_reports: unapproved };
 }
 
-async function createSubmission(req: Request, env: Env, project: string, agentId: string) {
+async function createSubmission(req: Request, env: Env, project: string, agentId: string, isAdmin = false) {
   const b: any = await req.json().catch(() => ({}));
   if (!b.base_sha) return err(422, "base_sha_required");
   if (!/^[a-f0-9]{7,64}$/.test(String(b.base_sha))) return err(422, "base_sha_not_hex");

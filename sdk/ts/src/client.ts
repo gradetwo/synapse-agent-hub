@@ -2,7 +2,7 @@
  * Agent Hub SDK（TypeScript）。与 Python 版同构：心跳托管、游标续传、离线队列。
  * 在 Cloudflare Workers 内使用时不要起定时器，改由 ctx.waitUntil 驱动 tick()。
  */
-import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, existsSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, existsSync, chmodSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -103,6 +103,7 @@ export class Client {
     this.hb++;
     return this.post(`/p/${this.opts.project}/heartbeat`, {
       hb: this.hb, agent_id: this.opts.agentId, work: this.work,
+      surface: { kind: "none" }, max_parallel_tasks: 2,
       load: await this.collectLoad(), env: this.collectEnv(), sdk_version: VERSION,
     }).catch((e) => ({ ok: false, error: String(e) }));
   }
@@ -241,11 +242,33 @@ export class Client {
   async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {}, taskId?: string) {
     const base = baseSha || this.collectEnv().git_head || "";
     if (!base) throw new Error("base_sha required: pass baseSha or run inside a git repo");
+    const boundTaskId = taskId || this.activeTaskId();
     return this.post(`/p/${this.opts.project}/submissions`, {
       submission_id: `sub-${this.opts.agentId}-${crypto.randomUUID().slice(0, 8)}`,
       agent_id: this.opts.agentId, kind, title, refs, base_sha: base, checks,
-      ...(taskId ? { task_id: taskId } : {}),
+      ...(boundTaskId ? { task_id: boundTaskId } : {}),
     });
+  }
+
+  // ── active task：CLI/SDK 共享同一份“当前任务”上下文 ─────────
+  activeTaskPath() { return join(this.opts.stateDir, "active_task.json"); }
+  activeTaskId(): string | undefined {
+    try {
+      const body = JSON.parse(readFileSync(this.activeTaskPath(), "utf8"));
+      const id = String(body.task_id ?? "").trim();
+      return id || undefined;
+    } catch { return undefined; }
+  }
+  activeTaskSet(taskId: string, seq = 0, title = "") {
+    const file = this.activeTaskPath();
+    const tmp = file + ".tmp";
+    writeFileSync(tmp, JSON.stringify({ task_id: taskId, seq, title, since: Date.now(),
+                                        agent_id: this.opts.agentId }));
+    renameSync(tmp, file);
+  }
+  activeTaskClear(taskId?: string) {
+    if (taskId && this.activeTaskId() !== taskId) return;
+    try { unlinkSync(this.activeTaskPath()); } catch {}
   }
 
   // ── 任务租约 ────────────────────────────────────────────
@@ -365,6 +388,7 @@ export class TaskLease {
   async enter(): Promise<this> {
     const r = await this.client.claimTask(this.taskId);
     if (!r?.ok) throw new Error(`claim failed: ${JSON.stringify(r)}`);
+    this.client.activeTaskSet(this.taskId);
     this.client.setWork({ state: "busy", taskId: this.taskId });
     this.timer = setInterval(() => {
       this.client.claimTask(this.taskId).catch(() => {});   // 网络抖动下一轮再续
@@ -375,9 +399,12 @@ export class TaskLease {
 
   async release(state: "done" | "open" | "blocked" = "done") {
     this.stop();
-    const r = await this.client.releaseTask(this.taskId, state);
-    this.client.setWork({ state: "idle" });
-    return r;
+    try {
+      return await this.client.releaseTask(this.taskId, state);
+    } finally {
+      this.client.activeTaskClear(this.taskId);
+      this.client.setWork({ state: "idle" });
+    }
   }
 
   stop() {

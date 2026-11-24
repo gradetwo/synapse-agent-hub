@@ -59,6 +59,7 @@ class TaskLease:
         r = self.c._post(f"/p/{self.c.project}/tasks/claim", {"task_id": self.task_id})
         if not r.get("ok"):
             raise RuntimeError(f"claim failed: {r}")
+        self.c._active_task_set(self.task_id)
         self.c.work(Work(state="busy", task_id=self.task_id))
         self._renew = threading.Thread(target=self._renew_loop, daemon=True, name="synapse-task-lease")
         self._renew.start()
@@ -69,8 +70,11 @@ class TaskLease:
         if self._renew and self._renew.is_alive():
             self._renew.join(timeout=1)
         state = "done" if exc_type is None else "blocked"
-        self.c._post(f"/p/{self.c.project}/tasks/release", {"task_id": self.task_id, "state": state})
-        self.c.work(Work(state="idle"))
+        try:
+            self.c._post(f"/p/{self.c.project}/tasks/release", {"task_id": self.task_id, "state": state})
+        finally:
+            self.c._active_task_clear(self.task_id)
+            self.c.work(Work(state="idle"))
 
 
 class Client:
@@ -157,6 +161,8 @@ class Client:
     def heartbeat_once(self) -> dict:
         self._hb_seq += 1
         payload = {"hb": self._hb_seq, "agent_id": self.agent_id, "work": asdict(self._work),
+                   "surface": {"kind": "none"},
+                   "max_parallel_tasks": 2,
                    "load": self._collect_load(), "env": self._collect_env(), "sdk_version": __version__}
         try:
             return self._post(f"/p/{self.project}/heartbeat", payload)
@@ -372,9 +378,38 @@ class Client:
             "submission_id": sid, "agent_id": self.agent_id, "kind": kind, "title": title,
             "refs": refs, "base_sha": base_sha or self._git_head(), "checks": checks or {}, "notes": notes,
         }
+        task_id = task_id or self._active_task_id()
         if task_id:
             body["task_id"] = task_id
         return self._post(f"/p/{self.project}/submissions", body)
+
+    # ── active task：CLI/SDK 共享同一份“当前任务”上下文 ─────────
+    def _active_task_path(self) -> Path:
+        return self.state_dir / "active_task.json"
+
+    def _active_task_id(self) -> str | None:
+        try:
+            body = json.loads(self._active_task_path().read_text())
+            tid = str(body.get("task_id") or "").strip()
+            return tid or None
+        except Exception:
+            return None
+
+    def _active_task_set(self, task_id: str, seq: int = 0, title: str = "") -> None:
+        body = {"task_id": task_id, "seq": int(seq), "title": title,
+                "since": int(time.time() * 1000), "agent_id": self.agent_id}
+        tmp = self._active_task_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(body, ensure_ascii=False))
+        os.replace(tmp, self._active_task_path())
+
+    def _active_task_clear(self, task_id: str | None = None) -> None:
+        path = self._active_task_path()
+        if task_id and self._active_task_id() != task_id:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
     def task(self, task_id: str) -> TaskLease:
         return TaskLease(self, task_id)

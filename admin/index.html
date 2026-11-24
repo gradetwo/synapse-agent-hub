@@ -753,6 +753,14 @@ if (location.search.includes("reset=1")) {
       <button class="ghost" data-dq="status" data-da="__AGENT__">汇报状态</button>
       <button class="ghost" data-dq="pause" data-da="__AGENT__">暂停任务</button>
       <button class="ghost" id="dIdleRemind" hidden>重发提醒</button>
+      <button class="ghost" id="dNotice">发提醒（非任务）</button>
+    </div>
+    <div class="permBar" style="margin-top:8px">
+      <label class="permTtl">定向并发上限
+        <input id="dMaxParallel" type="number" min="0" max="8" step="1" style="width:64px" title="0=自动；窗口/tmux 默认 1，无窗口循环默认 2">
+      </label>
+      <div class="permActions"><button class="ghost" id="dSaveMaxParallel">保存</button></div>
+      <span class="scopeHint">0=自动（window/tmux 默认 1，headless 默认 2）；上限 8。</span>
     </div>
     <details class="permDetails" id="dPermDetails">
       <summary><span>权限与 token 管理</span><span id="dPermSummary" class="muted">—</span><span class="lead">展开</span></summary>
@@ -1185,6 +1193,13 @@ function taskRow(t, isAll) {
   stateBadge.className = `badge ${known.includes(st) ? st : "open"}`;
   stateBadge.textContent = taskStateLabel(st);
   cells[1].append(stateBadge);
+  if (t.dispatch_state === "queued") {
+    const q = document.createElement("span");
+    q.className = "badge released";
+    q.style.marginLeft = "4px";
+    q.textContent = Number(t.queue_position ?? 0) > 0 ? `排队 #${Number(t.queue_position)}` : "排队";
+    cells[1].append(q);
+  }
 
   if (t.owner) {
     const owner = document.createElement("span");
@@ -1334,7 +1349,7 @@ function taskStateLabel(s) {
 // 滞留：派了没人领，或领了但节点离线/租约过期。和“回收滞留”按钮共用同一口径。
 function taskIsStale(t) {
   if (!t) return false;
-  if (t.state === "open") return !!t.to;
+  if (t.state === "open") return !!t.to && t.dispatch_state !== "queued";
   if (t.state === "claimed") return t.owner_online === false || Number(t.lease_left_ms) <= 0;
   return false;
 }
@@ -1461,6 +1476,35 @@ async function loadIdle() {
       <td><button class="ghost mini" data-idle-remind="${esc(a.agent_id)}" data-project="${esc(project)}">重发提醒</button></td>
     </tr>`).join("")
     : `<tr><td colspan="10" class="empty">${IDLE_CONFIG.enabled ? "暂无上榜节点" : "自动提醒关闭中"}</td></tr>`;
+}
+
+async function sendAgentNotice(agentId) {
+  const p = current;
+  if (!p || p === "*") return alert("先选择具体项目再发提醒");
+  const body = prompt(`给 ${agentId} 发一条提醒（非任务，可在任务执行中送达）：`);
+  if (!body || !body.trim()) return;
+  try {
+    const r = await api(`/admin/p/${p}/send`, "POST", {
+      to: agentId, title: "管理提醒（不是新任务）", body: body.trim(),
+      kind: "notice", notice: true, ack_required: false,
+    });
+    showToast(`提醒已发送：${r.sent?.[0]?.seq ? "#" + r.sent[0].seq : "已入队"}`, 5000);
+    if (detailAgent === agentId) await openAgent(agentId);
+  } catch (e) { alert(`发送失败：${e.message || e}`); }
+}
+
+async function saveAgentMaxParallel(agentId) {
+  const p = current;
+  if (!p || p === "*") return alert("先选择具体项目");
+  const raw = $("dMaxParallel").value.trim();
+  const n = raw === "" ? 0 : Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 8) return alert("并发上限需为 0-8 的整数（0=自动）");
+  try {
+    await api(`/admin/p/${p}/agents/config`, "POST", { agent_id: agentId, max_parallel_tasks: n });
+    showToast(`已保存 ${agentId} 的定向并发上限：${n || "自动"}`, 4000);
+    await refresh();
+    if (detailAgent === agentId) await openAgent(agentId);
+  } catch (e) { alert(`保存失败：${e.message || e}`); }
 }
 
 async function resendIdleReminder(agentId, project, fromDetail = false) {
@@ -1832,7 +1876,7 @@ async function quickRun() {
   else targets = pick(() => true);
   if (!targets.length) { $("sndHint").textContent = "该分组下没有 agent"; return; }
   const r = await api(`/admin/p/${current}/send`, "POST",
-    { to: targets, title: cmd.title, body: cmd.body, kind: cmd.kind || "task", ack_required: cmd.ack });
+    { to: targets, title: cmd.title, body: cmd.body, kind: cmd.kind || "notice", notice: true, ack_required: cmd.ack });
   $("sndHint").textContent = `已发 ${r.sent.length} 个：${r.sent.map((x) => x.to + "#" + x.seq).join(" ")}（已刷新列表）`;
   if (detailAgent && $("detail") && !$("detail").hidden) await openAgent(detailAgent); // 详情里的"最近消息"同步刷新
   await refresh();
@@ -1852,7 +1896,7 @@ async function sendTargeted() {
     const r = await api(`/admin/p/${current}/broadcast`, "POST", {
       broadcast_id: `bc-${Date.now()}`,
       title: title || "(无标题)", body,
-      action_required: { kind: "task", ack_required: ack },
+      action_required: { kind: "notice", ack_required: ack },
     });
     $("sndHint").textContent = `已广播 seq=${r.seq}（已刷新列表）`;
     await refresh();
@@ -1860,7 +1904,7 @@ async function sendTargeted() {
     return;
   }
   const r = await api(`/admin/p/${current}/send`, "POST",
-    { to: who, title, body, ack_required: ack });
+    { to: who, title, body, kind: "notice", notice: true, ack_required: ack });
   $("sndHint").textContent = `已发送 ${r.sent.length} 个：${r.sent.map((x) => x.to + "#" + x.seq).join(" ")}`;
   $("sndTitle").value = ""; $("sndBody").value = "";
   await refresh();
@@ -2203,6 +2247,7 @@ function renderAgentWork(d, live) {
     return `<div class="workRow"><span class="badge ${esc(t.state || "open")}">${esc(taskStateLabel(t.state))}</span>
       <span class="tid">${esc(id)}</span><span class="wtitle">${esc(t.title || "—")}</span>
       ${role ? `<span class="muted">${role}</span>` : ""}
+      ${t.dispatch_state === "queued" ? `<span class="badge released">排队${Number(t.queue_position || 0) ? ` #${Number(t.queue_position)}` : ""}</span>` : ""}
       ${Number(t.pending_submissions || 0) ? `<span class="warnv">待取 ${Number(t.pending_submissions)}</span>` : ""}
       <span class="when" title="${ts ? new Date(ts).toLocaleString() : ""}">${ts ? ago((Date.now() - ts) / 1000) + "前" : "—"}</span></div>`;
   }).join("") : `<div class="muted">暂无任务记录</div>`;
@@ -2220,7 +2265,7 @@ function renderAgentWork(d, live) {
 let detailAgent = null;
 let detailRole = "agent";
 let detailReady = false;
-const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes", "dIdleRemind"];
+const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes", "dIdleRemind", "dNotice", "dSaveMaxParallel"];
 const TASK_SCOPES = ["tasks.claim", "tasks.release"];
 const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TASK_SCOPES,
                       "tasks.read","issues.read","artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
@@ -2303,6 +2348,16 @@ function openAgent(id, project) {
     const sdkNote = live?.sdk_version
       ? ` · SDK ${live.sdk_version}${live.sdk_outdated ? "（旧版）" : ""}` : "";
     $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样${sdkNote}`;
+    const maxInput = $("dMaxParallel");
+    if (maxInput) {
+      const n = Number(live?.max_parallel_tasks ?? 0);
+      maxInput.value = n > 0 ? String(n) : "";
+      maxInput.placeholder = live?.surface?.kind ? `自动（${live.surface.kind}）` : "自动";
+    }
+    const noticeBtn = $("dNotice");
+    if (noticeBtn) noticeBtn.onclick = () => sendAgentNotice(id);
+    const maxBtn = $("dSaveMaxParallel");
+    if (maxBtn) maxBtn.onclick = () => saveAgentMaxParallel(id);
     detailRole = role;
     $("dPermSummary").textContent = `${role} · ${scopes.length} 项权限`;
     renderAgentWork(d, live);
@@ -3300,7 +3355,10 @@ $("btnTaskCreate").onclick = async () => {
   try {
     const r = await api(`/admin/p/${current}/tasks`, "POST", { task_id: id, title, body, to });
     const warn = r.warning?.message ? `；⚠️ ${r.warning.message}` : "";
-    showToast(`已派单 ${r.task_id || id}${to ? " → " + to : ""}${warn}`, warn ? 12000 : 6000);
+    const queue = r.dispatch_state === "queued"
+      ? `；已排队${Number(r.queue_position) ? ` #${Number(r.queue_position)}` : ""}（并发上限 ${r.max_parallel_tasks || 1}，前序释放后自动下发）`
+      : "";
+    showToast(`已派单 ${r.task_id || id}${to ? " → " + to : ""}${queue}${warn}`, queue || warn ? 12000 : 6000);
     $("taskId").value = ""; $("taskTitle").value = ""; $("taskBody").value = "";
     await loadTasks();
     setCardOpen("任务", true);

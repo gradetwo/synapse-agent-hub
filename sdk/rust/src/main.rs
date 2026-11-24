@@ -346,6 +346,299 @@ fn journal_save(dir: &PathBuf, items: &[Value]) {
 
 fn seq_of(m: &Value) -> Option<u64> { m["seq"].as_u64() }
 
+/// 任务/提醒分流：窗口客户端只对“任务”做单飞，提醒类消息可以在任务执行中插入。
+/// 兼容旧管理端的 `topic=task, kind=task` 私信：没有 task_id 的不算任务。
+fn task_id_of(m: &Value) -> Option<&str> {
+    m["payload"]["task_id"].as_str()
+        .or_else(|| m["payload"]["task"]["task_id"].as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn is_work_item(m: &Value) -> bool {
+    let topic = m["topic"].as_str().unwrap_or("");
+    let kind = m["kind"].as_str().unwrap_or("");
+    if topic != "task" || !matches!(kind, "task" | "reassigned") { return false; }
+    if m["payload"]["notice"].as_bool() == Some(true) { return false; }
+    m["payload"]["work_item"].as_bool() == Some(true) || task_id_of(m).is_some()
+}
+
+/// 任务正文必须点名到本 agent；旧版任务广播（to=null）不能进窗口，否则
+/// 升级后旧收件箱里的历史任务会被 dispatcher 当成“当前任务”永久占住。
+fn directed_to_me(cfg: &Cfg, m: &Value) -> bool {
+    match &m["to"] {
+        Value::String(t) => t == &cfg.agent_id,
+        Value::Array(a) => a.iter().any(|x| x.as_str() == Some(cfg.agent_id.as_str())),
+        _ => false,
+    }
+}
+
+fn is_notice(m: &Value) -> bool {
+    if m["payload"]["notice"].as_bool() == Some(true) { return true; }
+    if matches!(m["kind"].as_str(), Some("notice") | Some("idle_reminder")) { return true; }
+    if matches!(m["topic"].as_str(), Some("system") | Some("announce") | Some("admin")) { return true; }
+    // 旧管理端把私信写成 topic=task/kind=task，但没有 task_id：它只是聊天/提醒。
+    m["topic"].as_str() == Some("task") && m["kind"].as_str() == Some("task") && task_id_of(m).is_none()
+}
+
+fn is_task_lifecycle(m: &Value) -> bool {
+    if m["topic"].as_str() != Some("task") { return false; }
+    !matches!(m["kind"].as_str(), Some("task") | Some("reassigned")) || m["payload"]["work_item"].as_bool() == Some(false)
+}
+
+fn active_task_path(dir: &PathBuf) -> PathBuf { dir.join("active_task.json") }
+
+fn active_task_load(dir: &PathBuf) -> Option<Value> {
+    let v: Value = fs::read_to_string(active_task_path(dir)).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    let id = v["task_id"].as_str().filter(|s| !s.is_empty())?;
+    Some(json!({
+        "task_id": id,
+        "seq": v["seq"].as_u64().unwrap_or(0),
+        "title": v["title"].as_str().unwrap_or(""),
+        "since": v["since"].as_u64().unwrap_or(0),
+    }))
+}
+
+fn active_task_set_id(cfg: &Cfg, id: &str, seq: u64, title: &str) {
+    if id.trim().is_empty() { return; }
+    let body = json!({
+        "task_id": id,
+        "seq": seq,
+        "title": title,
+        "since": now_ms(),
+        "agent_id": cfg.agent_id,
+    });
+    atomic_write(&active_task_path(&cfg.dir), body.to_string().as_bytes());
+}
+
+fn active_task_set(cfg: &Cfg, m: &Value) {
+    let Some(id) = task_id_of(m) else { return; };
+    active_task_set_id(cfg, id, seq_of(m).unwrap_or(0),
+                       m["payload"]["title"].as_str().unwrap_or(""));
+}
+
+fn active_task_clear(cfg: &Cfg, only: Option<&str>) {
+    if let Some(id) = only {
+        if let Some(cur) = active_task_load(&cfg.dir) {
+            if cur["task_id"].as_str() != Some(id) { return; }
+        }
+    }
+    let _ = fs::remove_file(active_task_path(&cfg.dir));
+}
+
+fn active_task_id(cfg: &Cfg) -> Option<String> {
+    active_task_load(&cfg.dir).and_then(|v| v["task_id"].as_str().map(|s| s.to_string()))
+}
+
+fn lifecycle_task_id(m: &Value) -> Option<&str> {
+    task_id_of(m).or_else(|| m["payload"]["task"]["task_id"].as_str())
+}
+
+#[derive(Default, Clone)]
+struct SurfaceStatus {
+    active_task: Option<String>,
+    active_seq: u64,
+    queue_len: usize,
+    state: String,
+}
+
+/// 外部投递面的单飞调度器。WS 收件线程只把消息放进这里；真正粘贴/回车由
+/// run/ws 主线程或 poll 主循环做，保证同一目标同时只有一条任务在途。
+struct SurfacePump {
+    cfg: Cfg,
+    journal: Arc<Mutex<Vec<Value>>>,
+    status: Arc<Mutex<SurfaceStatus>>,
+    pending: Vec<Value>,
+}
+
+impl SurfacePump {
+    fn new(cfg: &Cfg, journal: Arc<Mutex<Vec<Value>>>, status: Arc<Mutex<SurfaceStatus>>) -> Self {
+        let mut st = status.lock().unwrap();
+        if let Some(active) = active_task_load(&cfg.dir) {
+            st.active_task = active["task_id"].as_str().map(|s| s.to_string());
+            st.active_seq = active["seq"].as_u64().unwrap_or(0);
+            st.state = "busy".into();
+        } else {
+            st.state = "idle".into();
+        }
+        drop(st);
+        SurfacePump { cfg: cfg.clone_lite(), journal, status, pending: Vec::new() }
+    }
+
+    fn push(&mut self, m: Value) {
+        if self.pending.iter().any(|x| same_message(x, &m)) { return; }
+        self.pending.push(m);
+        self.pending.sort_by_key(|x| seq_of(x).unwrap_or(0));
+        self.set_queue();
+    }
+
+    fn pending_len(&self) -> usize { self.pending.len() }
+
+    fn set_queue(&self) {
+        let mut st = self.status.lock().unwrap();
+        st.queue_len = self.pending.len();
+        if st.active_task.is_none() { st.state = "idle".into(); }
+        else { st.state = "busy".into(); }
+    }
+
+    /// 本地 active_task.json 是跨进程的完成信号：CLI task-release / 管理侧
+    /// 生命周期事件删掉它之后，dispatcher 才能放行下一条任务。
+    fn refresh_active(&self) {
+        let file = active_task_load(&self.cfg.dir);
+        let mut st = self.status.lock().unwrap();
+        match file {
+            Some(v) => {
+                let id = v["task_id"].as_str().unwrap_or("").to_string();
+                if st.active_task.as_deref() != Some(id.as_str()) {
+                    st.active_task = Some(id);
+                    st.active_seq = v["seq"].as_u64().unwrap_or(0);
+                }
+                st.state = "busy".into();
+            }
+            None => {
+                if st.active_task.is_some() {
+                    st.active_task = None;
+                    st.active_seq = 0;
+                }
+                st.state = "idle".into();
+            }
+        }
+    }
+
+    fn deliver(&mut self, m: &Value, notice_prefix: bool,
+               agent: &Agent, base: &str, last_msg: &AtomicU64) -> bool {
+        let mut mm = m.clone();
+        if notice_prefix { mm["_surface_notice"] = json!(true); }
+        let delivered = {
+            let _gate = SURFACE_SEND_LOCK.lock().unwrap();
+            forward_to_surface_impl(&self.cfg, &mm)
+        };
+        if !delivered { return false; }
+        if addressed_to_me(&self.cfg, m) {
+            mark_surface_delivered(&self.cfg.dir, &self.journal, m);
+        }
+        if let Some(seq) = seq_of(m) {
+            let _ = ack_message(&self.cfg, agent, base, seq, "done",
+                                &json!({"note": ack_note(&self.cfg, "run 收到（已投递）", "run 收到（receipt）")}), ack_required(m));
+        }
+        last_msg.store(now_ms() as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// 处理队列里所有现在能处理的消息；返回本轮处理条数。
+    fn pump(&mut self, agent: &Agent, base: &str, last_msg: &AtomicU64) -> usize {
+        let mut handled = 0usize;
+        loop {
+            self.refresh_active();
+            let mut active = self.status.lock().unwrap().active_task.clone();
+            let mut progressed = false;
+            let mut idx = 0usize;
+            while idx < self.pending.len() {
+                let m = self.pending[idx].clone();
+                let seq = seq_of(&m).unwrap_or(0);
+                // 任务生命周期必须先处理：它负责清 active、删同任务的待投递项。
+                if is_task_lifecycle(&m) {
+                    let tid = lifecycle_task_id(&m).map(|s| s.to_string());
+                    let closes = matches!(m["kind"].as_str(),
+                        Some("done" | "released" | "blocked" | "open" | "reclaimed"
+                             | "reassigned_away" | "reclaimed_away" | "closed"));
+                    if let Some(id) = &tid {
+                        if active.as_deref() == Some(id.as_str()) {
+                            active_task_clear(&self.cfg, Some(id));
+                            active = None;
+                            let mut st = self.status.lock().unwrap();
+                            st.active_task = None; st.active_seq = 0; st.state = "idle".into();
+                        }
+                        if closes {
+                            // 已经结束/被收回的任务不能因为 WAL 里还排着就再次注进窗口。
+                            self.pending.retain(|p| {
+                                if same_message(p, &m) { return false; }
+                                !(is_work_item(p) && task_id_of(p) == Some(id.as_str())
+                                  && seq_of(p).map(|s| s <= seq).unwrap_or(true))
+                            });
+                            dequeue_task_messages(&self.cfg.dir, &self.journal, id, seq);
+                        }
+                    }
+                    dequeue_message(&self.cfg.dir, &self.journal, &m);
+                    // retain 可能已把当前项删掉；从头继续扫，避免下标错位。
+                    progressed = true;
+                    idx = 0;
+                    continue;
+                }
+
+                if is_work_item(&m) {
+                    if !directed_to_me(&self.cfg, &m) {
+                        // 旧版广播任务没有收件人，不能当作当前任务注入。
+                        dequeue_message(&self.cfg.dir, &self.journal, &m);
+                        self.pending.remove(idx);
+                        progressed = true;
+                        continue;
+                    }
+                    if active.is_some() {
+                        idx += 1;
+                        continue;
+                    }
+                    if surface_was_delivered(&m) {
+                        // 崩溃后恢复：消息已经上屏，不要再贴一遍；只恢复本地 active。
+                        if let Some(id) = task_id_of(&m) {
+                            active_task_set(&self.cfg, &m);
+                            let mut st = self.status.lock().unwrap();
+                            st.active_task = Some(id.to_string());
+                            st.active_seq = seq;
+                            st.state = "busy".into();
+                            active = Some(id.to_string());
+                        }
+                        self.pending.remove(idx);
+                        progressed = true;
+                        continue;
+                    }
+                    if !self.deliver(&m, false, agent, base, last_msg) {
+                        eprintln!("[surface] seq={seq} 任务投递失败，保留 WAL、不 ACK");
+                        idx += 1;
+                        continue;
+                    }
+                    if let Some(id) = task_id_of(&m) {
+                        active_task_set(&self.cfg, &m);
+                        let mut st = self.status.lock().unwrap();
+                        st.active_task = Some(id.to_string());
+                        st.active_seq = seq;
+                        st.state = "busy".into();
+                        active = Some(id.to_string());
+                    }
+                    // 保留 WAL 里的任务项，等生命周期事件确认完成后再删。
+                    self.pending.remove(idx);
+                    handled += 1;
+                    progressed = true;
+                    // 任务一次只能投一条；继续扫后面的提醒，但不再投任务。
+                    continue;
+                }
+
+                // 非任务消息（提醒/广播/系统事件）走独立 lane，可在任务执行中插入。
+                let notice = is_notice(&m);
+                let mut already = surface_was_delivered(&m);
+                if is_surface_noise(&self.cfg, &m) { already = true; }
+                if !already {
+                    if !self.deliver(&m, notice && active.is_some(), agent, base, last_msg) {
+                        eprintln!("[surface] seq={seq} 提醒投递失败，保留 WAL、不 ACK");
+                        idx += 1;
+                        continue;
+                    }
+                } else if let Some(s) = seq_of(&m) {
+                    let _ = ack_message(&self.cfg, agent, base, s, "done",
+                                        &json!({"note": "run 外部投递过滤（非本窗口消息）"}), ack_required(&m));
+                }
+                dequeue_message(&self.cfg.dir, &self.journal, &m);
+                self.pending.remove(idx);
+                handled += 1;
+                progressed = true;
+            }
+            self.set_queue();
+            if !progressed { break; }
+        }
+        handled
+    }
+}
+
 /// 消息身份：优先 dedupe_key（内容身份，seq 归零/重投都不变）；旧消息没有才退回 seq。
 fn dedupe_key_of(m: &Value) -> Option<&str> {
     m["dedupe_key"].as_str().filter(|s| !s.is_empty())
@@ -377,6 +670,9 @@ fn is_noise(cfg: &Cfg, m: &Value) -> bool {
     if m["sender"].as_str() == Some(cfg.agent_id.as_str())
         && std::env::var("SYNAPSE_INCLUDE_SELF").ok().as_deref() != Some("1")
     {
+        // release/claim 等任务生命周期事件由 agent 自己落库，sender 就是自己。
+        // 不能被“过滤自发消息”挡掉，否则窗口永远不知道自己已完成，active 锁死。
+        if is_task_lifecycle(m) && task_id_of(m).is_some() { return false; }
         return true;
     }
     false
@@ -451,14 +747,23 @@ fn format_hub_message(m: &Value) -> Option<String> {
         return None;
     }
     // 统一用方括号标签，send_text_click_paste_checked 会把它当作重试去重标记。
-    let seq = seq_of(m).map(|s| format!("[Synapse #{s}] ")).unwrap_or_default();
+    // 任务消息额外带 [task:<id>]，既让 agent 能直接 --task 提交，也让窗口里
+    // 一眼能区分“任务”和“执行中的提醒”。
+    let mut tags = String::new();
+    if let Some(s) = seq_of(m) { tags.push_str(&format!("[Synapse #{s}] ")); }
+    if is_work_item(m) {
+        if let Some(id) = task_id_of(m) { tags.push_str(&format!("[task:{id}] ")); }
+    }
+    if m["_surface_notice"].as_bool() == Some(true) {
+        tags.push_str("[提醒，不是新任务] ");
+    }
     let mut text = String::new();
     if !title.trim().is_empty() {
         text.push_str(title.trim());
         if !body.trim().is_empty() { text.push('\n'); }
     }
     text.push_str(body.trim());
-    Some(format!("{seq}{text}"))
+    Some(format!("{tags}{text}"))
 }
 
 /// tmux/TUI 默认压成单行：TUI 的输入框不一定支持 bracketed paste，
@@ -738,6 +1043,18 @@ fn enqueue_message(cfg: &Cfg, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) -> bo
 fn dequeue_message(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>, m: &Value) {
     let mut items = journal.lock().unwrap();
     items.retain(|x| !same_message(x, m));
+    journal_save(dir, &items);
+}
+
+/// 任务完成/收回时删掉 WAL 里该任务已投递的项；未投递的排队消息由 server
+/// 队列管理，不在客户端重复保留。
+fn dequeue_task_messages(dir: &PathBuf, journal: &Arc<Mutex<Vec<Value>>>,
+                          task_id: &str, max_seq: u64) {
+    let mut items = journal.lock().unwrap();
+    // 只删生命周期事件之前的旧派单：任务被拒收重开时，服务端会先发 open
+    // 再发新的 task-dispatch；新消息 seq 更大，不能被旧 open/done 一起删掉。
+    items.retain(|x| !(task_id_of(x) == Some(task_id)
+        && seq_of(x).map(|s| s <= max_seq).unwrap_or(true)));
     journal_save(dir, &items);
 }
 
@@ -1273,7 +1590,15 @@ fn main() {
             if id.trim().is_empty() { eprintln!("task-claim 需要 --task <id>"); std::process::exit(2); }
             match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/claim", cfg.project),
                              json!({ "task_id": id })) {
-                Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+                Ok(v) => {
+                    let claimed = v["task"]["task_id"].as_str()
+                        .or_else(|| v["task_id"].as_str()).unwrap_or(&id);
+                    let seq = v["task"]["seq"].as_u64().or_else(|| v["seq"].as_u64()).unwrap_or(0);
+                    let title = v["task"]["payload"]["title"].as_str()
+                        .or_else(|| v["task"]["title"].as_str()).unwrap_or("");
+                    active_task_set_id(&cfg, claimed, seq, title);
+                    println!("{}", serde_json::to_string(&v).unwrap_or_default());
+                }
                 Err(e) => { eprintln!("task-claim 失败：{e}"); std::process::exit(1); }
             }
             return;
@@ -1287,7 +1612,10 @@ fn main() {
             }
             match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/release", cfg.project),
                              json!({ "task_id": id, "state": state })) {
-                Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+                Ok(v) => {
+                    active_task_clear(&cfg, Some(&id));
+                    println!("{}", serde_json::to_string(&v).unwrap_or_default());
+                }
                 Err(e) => { eprintln!("task-release 失败：{e}"); std::process::exit(1); }
             }
             return;
@@ -1298,7 +1626,9 @@ fn main() {
             let base_sha = args_map.get("base-sha").cloned();
             let notes = args_map.get("notes").cloned().unwrap_or_default();
             let sid = args_map.get("sid").cloned();
-            let task = args_map.get("task").or_else(|| args_map.get("task-id")).cloned();
+            let task = args_map.get("task").or_else(|| args_map.get("task-id"))
+                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                .or_else(|| active_task_id(&cfg));
             let checks: Value = args_map.get("checks")
                 .and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}));
             // 支持多个 --ref：--ref <sha256> 或 --ref <sha256>:<name>
@@ -1333,7 +1663,9 @@ fn main() {
             let base_sha = args_map.get("base-sha").cloned();
             let notes = args_map.get("notes").cloned().unwrap_or_default();
             let sid = args_map.get("sid").cloned();
-            let task = args_map.get("task").or_else(|| args_map.get("task-id")).cloned();
+            let task = args_map.get("task").or_else(|| args_map.get("task-id"))
+                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                .or_else(|| active_task_id(&cfg));
             let checks: Value = args_map.get("checks")
                 .and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| json!({}));
             let mut refs = Vec::new();
@@ -2365,12 +2697,32 @@ fn ws_ticket(cfg: &Cfg, agent: &Agent, base: &str) -> Result<String, String> {
         .ok_or_else(|| "ws-ticket 响应里没有 ticket".to_string())
 }
 
-fn heartbeat_payload(cfg: &Cfg, hb: u64, queue: usize, journal: &Arc<Mutex<Vec<Value>>>) -> Value {
+fn surface_kind(cfg: &Cfg) -> &'static str {
+    if cfg.window_forward { "window" } else if cfg.tmux_forward { "tmux" } else { "none" }
+}
+
+fn surface_target(cfg: &Cfg) -> String {
+    if cfg.window_forward { cfg.window_app.clone() }
+    else if cfg.tmux_forward { cfg.tmux_target.clone() }
+    else { String::new() }
+}
+
+fn heartbeat_payload(cfg: &Cfg, hb: u64, queue: usize, journal: &Arc<Mutex<Vec<Value>>>,
+                     surface: &Arc<Mutex<SurfaceStatus>>) -> Value {
     let mut load = json!({});
     if let Some(l) = load1() { load["load1"] = json!(l); }
     if let Some((u, t)) = mem_mb() { load["mem_used_mb"] = json!(u); load["mem_total_mb"] = json!(t); }
     load["disk"] = disk();
-    json!({"hb": hb, "agent_id": cfg.agent_id, "work": {"state": "idle"},
+    let st = surface.lock().unwrap().clone();
+    let active = st.active_task.clone();
+    json!({"hb": hb, "agent_id": cfg.agent_id,
+           "work": {"state": if active.is_some() { "busy" } else { "idle" },
+                     "phase": if active.is_some() { "task" } else { "idle" },
+                     "task_id": active},
+           "surface": {"kind": surface_kind(cfg), "target": surface_target(cfg),
+                        "state": st.state, "active_task_id": st.active_task,
+                        "queue": st.queue_len},
+           "max_parallel_tasks": if surface_kind(cfg) == "none" { 2 } else { 1 },
            "load": load, "env": {"git_head": git_head()}, "sdk_version": env!("CARGO_PKG_VERSION"),
            "queue": queue, "unacked": journal.lock().unwrap().len()})
 }
@@ -2391,12 +2743,30 @@ fn exec_task(cmd: &str, task: &str) {
     }
 }
 
+enum InboxEvent {
+    Raw(String, bool),
+    Surface(Value),
+}
+
 /// 把一条消息投递出去：先 WAL（inflight）落盘，再回执“已收到”，最后入队给主线程。
+/// 外部投递面不在这里直接注入：任务/提醒统一交给 SurfacePump，否则收件线程
+/// 会在第一条长任务还没结束时把后续 N 条全部粘进同一个窗口/tmux。
 fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
               journal: &Arc<Mutex<Vec<Value>>>, m: &Value,
-              tx: &mpsc::Sender<(String, bool)>, queue: &AtomicUsize, last_msg: &AtomicU64) {
+              tx: &mpsc::Sender<InboxEvent>, queue: &AtomicUsize, last_msg: &AtomicU64) {
     if is_noise(cfg, m) || !for_me(cfg, m) { return; }
     if !enqueue_message(cfg, journal, m) { return; }
+    if cfg.surface_forward() {
+        // 收件线程只负责落 WAL 和唤醒 dispatcher；真正注入/ACK 在主线程做。
+        queue.fetch_add(1, Ordering::Relaxed);
+        if tx.send(InboxEvent::Surface(m.clone())).is_err() {
+            let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
+                                     |x| Some(x.saturating_sub(1)));
+        } else {
+            last_msg.store(now_ms() as u64, Ordering::Relaxed);
+        }
+        return;
+    }
     // 关键顺序：先真的把消息送进目标窗口/tmux，再 ACK。以前这里先 ACK，投递失败时
     // 服务端仍显示已送达，用户只看到 ACK、看不到消息。
     let delivered = {
@@ -2418,7 +2788,7 @@ fn deliver_ws(cfg: &Cfg, agent: &Agent, base: &str,
     let text = serde_json::to_string(m).unwrap_or_default();
     // 先加计数再入队：主线程可能在 send 返回前就取走并减计数，顺序反了会把 queue 卡在虚高值
     queue.fetch_add(1, Ordering::Relaxed);
-    if tx.send((text, false)).is_err() {
+    if tx.send(InboxEvent::Raw(text, false)).is_err() {
         let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
                                  |x| Some(x.saturating_sub(1)));
     }
@@ -2432,19 +2802,24 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
     let journal: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(journal_load(&cfg.dir)));
     let last_msg = Arc::new(AtomicU64::new(0));
     let poll_stop = Arc::new(AtomicBool::new(false));
+    let surface_status = Arc::new(Mutex::new(SurfaceStatus::default()));
+    let mut surface_pump = if cfg.surface_forward() {
+        Some(SurfacePump::new(cfg, journal.clone(), surface_status.clone()))
+    } else { None };
 
     // 心跳独立于收件/执行：长任务不能把 heartbeat 压住。
     let hb_handle = {
-        let (cfg2, agent2, base2, journal2, last2, stop2) =
+        let (cfg2, agent2, base2, journal2, last2, stop2, surface2) =
             (cfg.clone_lite(), agent.clone(), base.to_string(), journal.clone(),
-             last_msg.clone(), poll_stop.clone());
+             last_msg.clone(), poll_stop.clone(), surface_status.clone());
         thread::spawn(move || {
             let mut hb: u64 = 0;
             loop {
                 if stop2.load(Ordering::Relaxed) { break; }
                 hb += 1;
-                let queue_len = journal2.lock().unwrap().len();
-                let body = heartbeat_payload(&cfg2, hb, queue_len, &journal2);
+                let st = surface2.lock().unwrap().clone();
+                let queue_len = if cfg2.surface_forward() { st.queue_len } else { journal2.lock().unwrap().len() };
+                let body = heartbeat_payload(&cfg2, hb, queue_len, &journal2, &surface2);
                 let ok = agent2
                     .post(&format!("{}/p/{}/heartbeat", base2, cfg2.project))
                     .set("authorization", &format!("Bearer {}", cfg2.token))
@@ -2456,7 +2831,10 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
                     "connected": ok, "transport": "poll", "last_hb_ok": ok,
                     "last_hb_ms": now_ms() as u64,
                     "last_msg_ms": last2.load(Ordering::Relaxed),
-                    "queue": queue_len, "unacked": queue_len, "pid": std::process::id(),
+                    "queue": queue_len, "unacked": journal2.lock().unwrap().len(),
+                    "surface": {"kind": surface_kind(&cfg2), "state": st.state,
+                                 "active_task_id": st.active_task, "queue": st.queue_len},
+                    "pid": std::process::id(),
                 }));
                 // 分片睡眠，让 run_poll 到点返回时最多等 1s，不必等满一个心跳周期。
                 let wait_until = Instant::now() + Duration::from_secs(cfg2.heartbeat_s.max(1));
@@ -2472,24 +2850,33 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
         .map(|v| v == "1").unwrap_or(false);
     // 先启动心跳，再重放 WAL：重放里的 exec 任务再慢，也不会让心跳停摆。
     let replay: Vec<Value> = if hb_only_poll { Vec::new() } else { journal.lock().unwrap().clone() };
-    for m in replay {
-        // 外部投递成功之前绝不 ACK；失败就继续留在 WAL，下一轮重试。
-        if !forward_to_surface(cfg, &m) {
-            eprintln!("[poll] seq={} 重放投递失败，保留 WAL、不 ACK",
-                      seq_of(&m).unwrap_or(0));
-            continue;
+    if let Some(pump) = surface_pump.as_mut() {
+        if !hb_only_poll {
+            for m in replay { pump.push(m); }
+            pump.pump(agent, base, &last_msg);
         }
-        if cfg.surface_forward() && addressed_to_me(cfg, &m) {
-            mark_surface_delivered(&cfg.dir, &journal, &m);
+    } else {
+        for m in replay {
+            // 外部投递成功之前绝不 ACK；失败就继续留在 WAL，下一轮重试。
+            if !forward_to_surface(cfg, &m) {
+                eprintln!("[poll] seq={} 重放投递失败，保留 WAL、不 ACK",
+                          seq_of(&m).unwrap_or(0));
+                continue;
+            }
+            if cfg.surface_forward() && addressed_to_me(cfg, &m) {
+                mark_surface_delivered(&cfg.dir, &journal, &m);
+            }
+            if let Some(seq) = seq_of(&m) {
+                let _ = ack_message(cfg, agent, base, seq, "done",
+                                    &json!({"note": ack_note(cfg, "poll 启动重放（已投递）", "poll 启动重放（receipt）")}), ack_required(&m));
+            }
+            let text = serde_json::to_string(&m).unwrap_or_default();
+            if is_work_item(&m) { active_task_set(cfg, &m); }
+            if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
+            dequeue_message(&cfg.dir, &journal, &m);
+            if is_work_item(&m) { active_task_clear(cfg, task_id_of(&m)); }
+            last_msg.store(now_ms() as u64, Ordering::Relaxed);
         }
-        if let Some(seq) = seq_of(&m) {
-            let _ = ack_message(cfg, agent, base, seq, "done",
-                                &json!({"note": ack_note(cfg, "poll 启动重放（已投递）", "poll 启动重放（receipt）")}), ack_required(&m));
-        }
-        let text = serde_json::to_string(&m).unwrap_or_default();
-        if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
-        dequeue_message(&cfg.dir, &journal, &m);
-        last_msg.store(now_ms() as u64, Ordering::Relaxed);
     }
 
     // YANSHI_HB_ONLY=1：心跳线程已在上面启动并保持在线，主线程只阻塞休眠，绝不消费 inbox。
@@ -2503,12 +2890,20 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
         if let Some(limit) = max_duration {
             if started.elapsed() >= limit { break; }
         }
-        let retried = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
-        if retried > 0 { eprintln!("[poll] 重试补发 {retried} 条外部投递消息"); }
+        if let Some(pump) = surface_pump.as_mut() {
+            pump.pump(agent, base, &last_msg);
+        } else {
+            let retried = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
+            if retried > 0 { eprintln!("[poll] 重试补发 {retried} 条外部投递消息"); }
+        }
         if let Some(msgs) = fetch_inbox(&cfg, &agent, &base, cursor_get(&cfg.dir), 5, Some(&journal), true) {
             for m in msgs {
                 if is_noise(&cfg, &m) || !for_me(&cfg, &m) { continue; }
                 if !enqueue_message(&cfg, &journal, &m) { continue; }
+                if let Some(pump) = surface_pump.as_mut() {
+                    pump.push(m);
+                    continue;
+                }
                 let seq = seq_of(&m).unwrap_or(0);
                 if !forward_to_surface(cfg, &m) {
                     eprintln!("[poll] seq={seq} 外部投递失败，保留 WAL、不 ACK");
@@ -2520,10 +2915,15 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
                 let _ = ack_message(&cfg, &agent, &base, seq, "done",
                                     &json!({"note": ack_note(cfg, "poll 收到（已投递）", "poll 收到（receipt）")}), ack_required(&m));
                 let text = serde_json::to_string(&m).unwrap_or_default();
+                if is_work_item(&m) { active_task_set(cfg, &m); }
                 if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &text); } else { println!("{text}"); }
                 dequeue_message(&cfg.dir, &journal, &m);
+                if is_work_item(&m) { active_task_clear(cfg, task_id_of(&m)); }
                 last_msg.store(now_ms() as u64, Ordering::Relaxed);
             }
+        }
+        if let Some(pump) = surface_pump.as_mut() {
+            pump.pump(agent, base, &last_msg);
         }
         thread::sleep(Duration::from_secs(poll_s));
     }
@@ -2550,8 +2950,12 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
     let pending: Vec<Value> = { let g = journal.lock().unwrap(); g.clone() };
     // 无界队列：收件线程绝不因主线程在跑长任务而阻塞。磁盘 WAL 仍是上限，
     // queue 只保存消息 JSON，积压几百条也不会把 WS 读取/心跳卡死。
-    let (tx, rx) = mpsc::channel::<(String, bool)>();
+    let (tx, rx) = mpsc::channel::<InboxEvent>();
     let state = Arc::new(Mutex::new(("idle".to_string(), String::new(), 0usize)));
+    let surface_status = Arc::new(Mutex::new(SurfaceStatus::default()));
+    let mut surface_pump = if cfg.surface_forward() {
+        Some(SurfacePump::new(cfg, journal.clone(), surface_status.clone()))
+    } else { None };
     let connected = Arc::new(AtomicBool::new(false));
     let queue = Arc::new(AtomicUsize::new(0));
     let last_msg = Arc::new(AtomicU64::new(0));
@@ -2561,11 +2965,16 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
 
     // 重放先入队（此时收件线程还没启动，保证 replay 排在新消息前面）。
     for m in pending {
-        let text = serde_json::to_string(&m).unwrap_or_default();
-        if tx.send((text, true)).is_ok() {
-            queue.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = surface_pump.as_mut() {
+            p.push(m);
+        } else {
+            let text = serde_json::to_string(&m).unwrap_or_default();
+            if tx.send(InboxEvent::Raw(text, true)).is_ok() {
+                queue.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
+    if let Some(p) = surface_pump.as_ref() { queue.store(p.pending_len(), Ordering::Relaxed); }
 
     // 收件线程：连接、收、断线重连；任务执行期间照常入队
     {
@@ -2713,6 +3122,8 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         let journal3 = journal.clone();
         let stop3 = stop.clone();
         let gate3 = state_gate.clone();
+        let surface4 = surface_status.clone();
+        let cfg4 = cfg.clone_lite();
         thread::spawn(move || {
             let mut hb = 0u64;
             loop {
@@ -2721,7 +3132,13 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                 let (ws, ph, _q) = { let g = st.lock().unwrap(); (g.0.clone(), g.1.clone(), g.2) };
                 let queue_now = q3.load(Ordering::Relaxed);
                 let unacked = journal3.lock().unwrap().len();
-                let body = json!({"hb": hb, "agent_id": aid, "work": {"state": ws, "phase": ph},
+                let surf = surface4.lock().unwrap().clone();
+                let body = json!({"hb": hb, "agent_id": aid,
+                                  "work": {"state": ws, "phase": ph, "task_id": surf.active_task.clone()},
+                                  "surface": {"kind": surface_kind(&cfg4), "target": surface_target(&cfg4),
+                                               "state": surf.state, "active_task_id": surf.active_task.clone(),
+                                               "queue": surf.queue_len},
+                                  "max_parallel_tasks": if surface_kind(&cfg4) == "none" { 2 } else { 1 },
                                   "load": {"disk": disk()}, "sdk_version": env!("CARGO_PKG_VERSION"),
                                   "queue": queue_now, "unacked": unacked});
                 let ok = agent2.post(&format!("{}/p/{}/heartbeat", base2, proj))
@@ -2738,6 +3155,8 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                     "last_msg_ms": last3.load(Ordering::Relaxed),
                     "queue": queue_now,
                     "unacked": unacked,
+                    "surface": {"kind": surface_kind(&cfg4), "state": surf.state,
+                                 "active_task_id": surf.active_task.clone(), "queue": surf.queue_len},
                     "pid": std::process::id(),
                 }));
                 thread::sleep(Duration::from_secs(period));
@@ -2745,50 +3164,78 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         });
     }
 
-    // 主线程：取任务 → 执行（inflight 已在启动时先入队，保留 seq 顺序）
+    // 主线程：非外部面走原来的逐条执行；窗口/tmux 走 SurfacePump 单飞。
     loop {
-        let (task, replay) = match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(x) => x,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let n = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
-                if n > 0 { eprintln!("[ws] 空闲重试补发 {n} 条外部投递消息"); }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        let parsed = serde_json::from_str::<Value>(&task).ok();
-        let title = parsed.as_ref()
-            .and_then(|v| v["payload"]["title"].as_str().map(|x| x.to_string()))
-            .unwrap_or_default();
-        { let mut g = state.lock().unwrap(); g.0 = "busy".into(); g.1 = title.clone(); }
-        let mut delivered = true;
-        if replay {
-            // 重放消息尚未经过 deliver_ws 的外部投递；先投窗口/tmux，再补 ACK。
-            if let Some(v) = &parsed {
-                if !forward_to_surface(cfg, v) { delivered = false; }
-                else if cfg.surface_forward() && addressed_to_me(cfg, v) {
-                    mark_surface_delivered(&cfg.dir, &journal, v);
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(InboxEvent::Surface(v)) => {
+                if let Some(pump) = surface_pump.as_mut() {
+                    pump.push(v);
+                    pump.pump(agent, base, &last_msg);
+                    queue.store(pump.pending_len(), Ordering::Relaxed);
+                    let st = surface_status.lock().unwrap().clone();
+                    let mut g = state.lock().unwrap();
+                    g.0 = if st.active_task.is_some() { "busy".into() } else { "idle".into() };
+                    g.1 = st.active_task.clone().unwrap_or_else(|| "等指令".into());
+                    g.2 = pump.pending_len();
                 }
             }
-            if delivered {
-                if let Some(v) = &parsed {
-                    if let Some(seq) = seq_of(v) {
-                        let _ = ack_message(cfg, agent, base, seq, "done",
-                                            &json!({"note": ack_note(cfg, "run 启动重放（已投递）", "run 启动重放（receipt）")}), ack_required(v));
+            Ok(InboxEvent::Raw(task, replay)) => {
+                let parsed = serde_json::from_str::<Value>(&task).ok();
+                let title = parsed.as_ref()
+                    .and_then(|v| v["payload"]["title"].as_str().map(|x| x.to_string()))
+                    .unwrap_or_default();
+                { let mut g = state.lock().unwrap(); g.0 = "busy".into(); g.1 = title.clone(); }
+                let mut delivered = true;
+                if replay {
+                    // 重放消息尚未经过 deliver_ws 的外部投递；先投窗口/tmux，再补 ACK。
+                    if let Some(v) = &parsed {
+                        if !forward_to_surface(cfg, v) { delivered = false; }
+                        else if cfg.surface_forward() && addressed_to_me(cfg, v) {
+                            mark_surface_delivered(&cfg.dir, &journal, v);
+                        }
+                    }
+                    if delivered {
+                        if let Some(v) = &parsed {
+                            if let Some(seq) = seq_of(v) {
+                                let _ = ack_message(cfg, agent, base, seq, "done",
+                                                    &json!({"note": ack_note(cfg, "run 启动重放（已投递）", "run 启动重放（receipt）")}), ack_required(v));
+                            }
+                        }
                     }
                 }
+                if delivered {
+                    if let Some(v) = &parsed {
+                        if is_work_item(v) { active_task_set(cfg, v); }
+                    }
+                    if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &task); } else { println!("{task}"); }
+                    if let Some(v) = &parsed {
+                        dequeue_message(&cfg.dir, &journal, v);
+                        if is_work_item(v) { active_task_clear(cfg, task_id_of(v)); }
+                    }
+                } else if let Some(v) = &parsed {
+                    eprintln!("[ws] seq={} 重放投递失败，保留 WAL、不 ACK",
+                              seq_of(v).unwrap_or(0));
+                }
+                let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
+                                         |x| Some(x.saturating_sub(1)));
+                { let mut g = state.lock().unwrap(); g.0 = "idle".into(); g.1 = "等指令".into(); }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(pump) = surface_pump.as_mut() {
+                    pump.pump(agent, base, &last_msg);
+                    queue.store(pump.pending_len(), Ordering::Relaxed);
+                    let st = surface_status.lock().unwrap().clone();
+                    let mut g = state.lock().unwrap();
+                    g.0 = if st.active_task.is_some() { "busy".into() } else { "idle".into() };
+                    g.1 = st.active_task.clone().unwrap_or_else(|| "等指令".into());
+                    g.2 = pump.pending_len();
+                } else {
+                    let n = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
+                    if n > 0 { eprintln!("[ws] 空闲重试补发 {n} 条外部投递消息"); }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if delivered {
-            if let Some(cmd) = &cfg.exec_cmd { exec_task(cmd, &task); } else { println!("{task}"); }
-            if let Some(v) = &parsed { dequeue_message(&cfg.dir, &journal, v); }
-        } else if let Some(v) = &parsed {
-            eprintln!("[ws] seq={} 重放投递失败，保留 WAL、不 ACK",
-                      seq_of(v).unwrap_or(0));
-        }
-        let _ = queue.try_update(Ordering::Relaxed, Ordering::Relaxed,
-                                 |x| Some(x.saturating_sub(1)));
-        { let mut g = state.lock().unwrap(); g.0 = "idle".into(); g.1 = "等指令".into(); }
     }
     stop.store(true, Ordering::Relaxed);
     connected.store(false, Ordering::Relaxed);
@@ -3101,6 +3548,20 @@ mod tests {
         assert!(is_task_notice(&json!({"kind": "task_notice"})));
         assert!(is_task_notice(&json!({"topic": "task", "kind": "released"})));
         assert!(!is_task_notice(&json!({"kind": "task", "payload": {"title": "x"}})));
+
+        let work = json!({"seq": 9, "topic": "task", "kind": "task",
+                          "payload": {"task_id": "T-1", "title": "do", "body": "it",
+                                      "work_item": true}});
+        assert!(is_work_item(&work));
+        assert_eq!(format_hub_message(&work).as_deref(),
+                   Some("[Synapse #9] [task:T-1] do\nit"));
+
+        let mut notice = json!({"seq": 10, "topic": "admin", "kind": "notice",
+                                "payload": {"title": "提醒", "body": "继续", "notice": true}});
+        assert!(is_notice(&notice));
+        notice["_surface_notice"] = json!(true);
+        assert_eq!(format_hub_message(&notice).as_deref(),
+                   Some("[Synapse #10] [提醒，不是新任务] 提醒\n继续"));
     }
 }
 

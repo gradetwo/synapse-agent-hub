@@ -48,6 +48,16 @@ export interface Task {
   pending_submissions?: number;
   /** 指派目标；空表示公共池，可被任意 agent claim */
   to?: string | null;
+  /**
+   * 定向任务的派发状态。state 仍表示任务生命周期；dispatch_state 只表示
+   * “是否已经下发到目标窗口/循环”，用于单飞队列。
+   * queued: 已创建但未下发；notified: 已下发消息、尚未 claim；
+   * active: 已被目标 agent claim；closed: 已释放/关闭/完成，不再占并发槽。
+   */
+  dispatch_state?: "queued" | "notified" | "active" | "closed";
+  /** 同一条任务第几次下发；每次重新下发递增，用于消息去重。 */
+  dispatch_count?: number;
+  notified_at?: number;
   project?: string;
   created_at?: number;
   updated_at?: number;
