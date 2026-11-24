@@ -11,7 +11,8 @@
 //! 非 Windows 平台回退到 Unix Domain Socket（路径 `<状态目录>/agent_<agent-id>.sock`，
 //! 状态目录缺省 `~/.synapse-agent`，可用 --config-dir / SYNAPSE_AGENT_DIR 覆盖），
 //! 让协议与逻辑可以在 Linux/macOS 上开发与测试；Windows 用命名管道
-//! `\\.\pipe\synapse_agent_<sanitized-agent-id>`。
+//! `\\.\pipe\synapse_agent_<sanitized-agent-id>`；非缺省状态目录再追加目录哈希，
+//! 避免同一 agent id 在不同 --config-dir 下抢同一个 pipe。
 
 use serde_json::{json, Value};
 #[cfg(windows)]
@@ -44,12 +45,56 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// 管道/套接口名字。Windows 用命名管道（按 agent id 区分，与状态目录无关）；
-/// 非 Windows 的套接字放在状态目录下（缺省 ~/.synapse-agent，可用 --config-dir /
-/// SYNAPSE_AGENT_DIR 覆盖），文件名按 agent id 区分，同机多身份互不冲突。
+/// Windows 的缺省状态目录候选：保留旧 pipe 名，避免升级后现有 bridge 失联。
 #[cfg(windows)]
-pub fn endpoint_name(_dir: &std::path::Path, agent_id: &str) -> String {
-    format!(r"\\.\pipe\synapse_agent_{}", sanitize(agent_id))
+fn default_state_dirs() -> Vec<std::path::PathBuf> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+    if home.is_empty() { return vec![]; }
+    vec![std::path::PathBuf::from(&home).join(".synapse-agent"),
+         std::path::PathBuf::from(&home).join(".yanshi-agent")]
+}
+
+#[cfg(windows)]
+fn normalized_path(p: &std::path::Path) -> String {
+    // 不能 canonicalize：目录首次启动时可能还不存在，之后存在了会解析出不同路径，
+    // 导致同一实例的 pipe 名在重启后变化。这里只做词法绝对化 + 大小写归一。
+    use std::path::Component;
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    let mut clean = std::path::PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => { clean.pop(); }
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    clean.to_string_lossy().to_lowercase()
+}
+
+/// 稳定目录短哈希（FNV-1a 64 位），只用于命名空间，不做安全用途。
+#[cfg(windows)]
+fn dir_tag(p: &std::path::Path) -> String {
+    let text = normalized_path(p);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+    format!("{h:016x}")
+}
+
+/// 管道/套接口名字。Windows 用命名管道：缺省状态目录保持旧名（兼容已有 bridge），
+/// 非缺省目录追加目录哈希，避免同一 agent id 在不同 --config-dir 下抢同一个 pipe；
+/// 非 Windows 的套接字放在状态目录下，文件名按 agent id 区分。
+#[cfg(windows)]
+pub fn endpoint_name(dir: &std::path::Path, agent_id: &str) -> String {
+    let legacy = default_state_dirs().iter().any(|d| normalized_path(d) == normalized_path(dir));
+    if legacy {
+        format!(r"\\.\pipe\synapse_agent_{}", sanitize(agent_id))
+    } else {
+        format!(r"\\.\pipe\synapse_agent_{}_{}", sanitize(agent_id), dir_tag(dir))
+    }
 }
 
 #[cfg(not(windows))]
@@ -317,11 +362,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn endpoint_name_windows_pipe_ignores_state_dir() {
-        let d = std::path::PathBuf::from(r"C:\whatever");
-        assert_eq!(
-            endpoint_name(&d, "agent-1"),
-            r"\\.\pipe\synapse_agent_agent-1"
-        );
+    fn endpoint_name_windows_pipe_isolated_by_state_dir() {
+        let d1 = std::path::PathBuf::from(r"C:\instance-a");
+        let d2 = std::path::PathBuf::from(r"C:\instance-b");
+        let p1 = endpoint_name(&d1, "agent-1");
+        let p2 = endpoint_name(&d2, "agent-1");
+        assert!(p1.starts_with(r"\\.\pipe\synapse_agent_agent-1_"));
+        assert_ne!(p1, p2, "different state dirs must not share one Windows pipe");
+        assert_ne!(endpoint_name(&d1, "agent-1"), endpoint_name(&d1, "agent-2"),
+                  "different agent ids must not share one Windows pipe");
     }
 }

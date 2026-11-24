@@ -40,7 +40,10 @@
 
 - **台账是什么**：服务端按项目维护的任务表。每单有 `task_id`、标题、正文、指派对象（`to`）、状态（`open` → `claimed` → `released`/`done`/`blocked`）与租约。管理端建单时只往你的收件箱投一条消息：`topic=task`、`kind=task`，`payload` 只有 `{task_id, title, body}`。**收到这条消息不等于领单**——不主动领，任务在台账里一直是 `open`，管理端看得到你没领。
 - **领单（开工前必须做）**：`"$BIN" task-claim --task <task_id>`，返回 `{"ok":true,"lease_until":<毫秒时间戳>}` 才算领到。
-  - `409 locked`：已被别人领走（响应带 `owner` 与 `lease_until`）。不要重复干这单，report 说明后跳过。
+  - `409 locked`：已被别人有效领走（响应带 `state`、`owner` 与 `lease_until`）。不要重复干这单，report 说明后跳过。
+  - `409 already_done`：任务已完成，不再可领；不要重试，report 说明后换单。
+  - `409 blocked`：任务已被执行者置为 blocked；不要 claim，report 管理端取回或转派。
+  - `409 released_pending_collection`：任务已交付但还有交付未取走；不要 claim，等管理端取件/关单。
   - `403 not_your_task`：这单没指派给你。不要领，report 管理端。
   - `404 not_found`：`task_id` 写错或任务已撤。report 管理端核对。
   - 旧版客户端没有 `task-claim` 命令时用 HTTP 直调（与 `/report` 同款）：`POST $ENDPOINT/p/$PROJECT/tasks/claim`，头 `Authorization: Bearer $TOKEN`，体 `{"task_id":"<task_id>"}`，响应形状相同。

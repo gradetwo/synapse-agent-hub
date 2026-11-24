@@ -5,12 +5,12 @@ import CONSOLE_HTML from "../../admin/index.html";
 export { ProjectRoom } from "./project-room";
 
 const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "tasks.claim", "tasks.release",
-                      "artifact.write", "submissions.create", "issues.report"];
+                      "artifact.write", "submissions.read", "submissions.create", "issues.report"];
 const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "task-lease-guard-20261123";
+const BUILD_TAG = "review-fixes-20261124";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.4";
 
@@ -297,12 +297,14 @@ export default {
 
     const auth = await authenticate(req, env, project);
     if (!auth.ok) return err(auth.status, auth.reason!);
-    // 交付只读（GET submissions / bundle）对所有已认证的项目 agent 放行，与
-    // issues.report 同口径：返工节点要按真实补丁开工，必须能列交付、下载 bundle，
-    // 不能要求 admin token（ISS-MWSZPB49-B96120）。写路径仍按 submissions.create 查。
-    const subRead = req.method === "GET" && action.startsWith("submissions");
-    if (!subRead && !inScope(auth.scopes!, need(action)))
-      return err(403, `insufficient_scope: 需要 ${need(action)}，当前 [${(auth.scopes || []).join(",")}]`);
+    // 交付只读（仅精确的 list / bundle 两个 GET）走 submissions.read：
+    // 返工节点要按真实补丁开工，不能要求 admin token（ISS-MWSZPB49-B96120）；
+    // 写路径仍按 submissions.create 查，其它 submissions GET 不在这里放行。
+    const subRead = req.method === "GET" &&
+      (action === "submissions" || /^submissions\/[^/]+\/bundle$/.test(action));
+    const requiredScope = subRead ? "submissions.read" : need(action);
+    if (!inScope(auth.scopes!, requiredScope))
+      return err(403, `insufficient_scope: 需要 ${requiredScope}，当前 [${(auth.scopes || []).join(",")}]`);
     if (auth.projectStatus === "paused" && req.method !== "GET") return err(423, "project_paused");
 
     // 交付创建在 Worker 侧完成（需查 R2 + 写 D1），不转发给 DO
@@ -312,7 +314,7 @@ export default {
     // 交付只读在 Worker 侧查 D1 / 拼 bundle，不转发给 DO（DO 没有 submissions 动作，
     // 此前 GET /p/<proj>/submissions 只会得到 404 unknown_action）。
     if (action === "submissions" && req.method === "GET")
-      return listSubmissions(env, project, url);
+      return listSubmissions(env, project, url, auth.role === "admin");
     const subBundle = action.match(/^submissions\/([^/]+)\/bundle$/);
     if (subBundle && req.method === "GET")
       return bundleSubmission(env, project, subBundle[1]);
@@ -462,7 +464,7 @@ async function enroll(req: Request, env: Env, url: URL, path: string) {
     : String(rawScopes ?? "").split(",").map((x) => x.trim());
   const allowed = ["heartbeat", "poll", "publish", "report", "ack",
                    "tasks.claim", "tasks.release",
-                   "submissions.create", "artifact.write", "artifact.read"];
+                   "submissions.read", "submissions.create", "artifact.write", "artifact.read"];
   const bad = listScopes.filter((x) => x && !allowed.includes(x));
   if (bad.length) return err(422, `bad_scope:${bad.join(",")}`);
   const scopes = listScopes.filter(Boolean).length
@@ -574,6 +576,10 @@ const inScope = (s: string[], n: string) => {
   // 需求：上报 issue 默认对所有 agent 开放。不能只靠新 token 的 scope，
   // 存量 token 的 scopes 里没有 issues.report，也必须在数据面放行。
   if (n === "issues.report") return true;
+  // 交付只读：存量 token 没有新加的 submissions.read，但默认都有 submissions.create，
+  // 用 create 作为兼容别名，避免升级后返工节点突然看不到补丁。
+  if (n === "submissions.read")
+    return s.includes("submissions.read") || s.includes("submissions.create") || s.includes("admin");
   return s.includes(n) || s.includes("admin") ||
     // 兼容：存量 token 只有 publish，给它们继续走 claim/release 的过渡期。
     ((n === "tasks.claim" || n === "tasks.release") && s.includes("publish"));
@@ -1330,7 +1336,7 @@ async function admin(req: Request, env: Env, url: URL) {
     if (bun && req.method === "GET") return bundleSubmission(env, project, bun[1]);
 
     if (action === "submissions" && req.method === "GET")
-      return listSubmissions(env, project, url);
+      return listSubmissions(env, project, url, true);
 
     const col = action.match(/^submissions\/([^/]+)\/(collect|archive|result)$/);
     if (col && req.method === "POST") {
@@ -1616,8 +1622,10 @@ function zipStore(files: { name: string; data: Uint8Array }[]): Uint8Array {
   return out;
 }
 
-/** 交付列表（只读）：管理面与数据面共用同一查询，过滤口径保持一致。 */
-async function listSubmissions(env: Env, project: string, url: URL) {
+/** 交付列表（只读）：管理面与数据面共用查询；数据面只返回返工需要的字段。
+ *  `result`、`reviewed_by`、`reviewed_at`、`overtake_reason` 属于管理侧审计信息，
+ *  不返回给普通 agent。 */
+async function listSubmissions(env: Env, project: string, url: URL, full = false) {
   const state = url.searchParams.get("state") ?? "";
   const taskId = url.searchParams.get("task_id") ?? "";
   const review = url.searchParams.get("review_state") ?? "";
@@ -1628,8 +1636,10 @@ async function listSubmissions(env: Env, project: string, url: URL) {
   if (valid) { cond.push("state = ?"); vals.push(state); }
   if (taskId && /^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) { cond.push("task_id = ?"); vals.push(taskId); }
   if (validReview) { cond.push("review_state = ?"); vals.push(review); }
+  const cols = full ? "*" : "submission_id,agent_id,task_id,base_sha,kind,title,refs_json," +
+    "checks_json,review_state,task_assignee,overtake,state,created_at,updated_at";
   const rows = await env.DB.prepare(
-    `SELECT * FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
+    `SELECT ${cols} FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
   ).bind(...vals).all();
   return Response.json(rows.results);
 }

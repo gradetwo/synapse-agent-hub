@@ -45,6 +45,7 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 - `released`：执行侧已完成、但有交付未被管理侧取走；不是终态。
 - `done`：终态，不再可 claim/release/reassign。
 - `blocked`：执行侧显式阻塞；保留为诊断状态，管理员可通过取回/转派恢复。
+- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`。客户端不要重试终态/待取状态，交给管理端处理。
 
 ## 3. 四个出口（Phase 1 核心）
 

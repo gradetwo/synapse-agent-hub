@@ -52,7 +52,7 @@
 ### agent 默认 scope（签发时可增减，但**不可**含 `admin`）
 
 ```
-poll, ack, report, heartbeat, publish, tasks.claim, tasks.release, artifact.write, submissions.create
+poll, ack, report, heartbeat, publish, tasks.claim, tasks.release, artifact.write, submissions.read, submissions.create
 ```
 
 管理员默认 scope 在上面基础上加 `artifact.read` 与 `admin`。普通 agent 不允许携带 `admin`；
@@ -169,6 +169,8 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | POST | `/p/{p}/tasks/release` | publish | `done \| blocked`；目标 done 且该任务仍有待取交付时只进 `released`（见 §7 联动） |
 | PUT | `/p/{p}/artifact/{sha256}` | artifact.write | 流式直传 R2 |
 | GET | `/p/{p}/artifact/{sha256}` | poll | 下载 |
+| GET | `/p/{p}/submissions` | submissions.read（存量 token 可用 submissions.create 兼容） | 返工节点只读交付列表；管理面 GET 同路径仍可看全字段 |
+| GET | `/p/{p}/submissions/{id}/bundle` | submissions.read（同上） | 下载补丁 bundle；数据面不返回管理审计字段 |
 | POST | `/p/{p}/submissions` | submissions.create | 建交付（校验 blob 存在 + base_sha） |
 | GET | `/p/{p}/ws-ticket` | 任意有效 token（无需额外 scope） | 一次性 WebSocket 票据（90s） |
 | GET | `/p/{p}/wsstat` | 任意有效 token（无需额外 scope） | 当前在线连接数 |

@@ -64,7 +64,7 @@ $body = @{
   token_sha = $TOKEN_SHA
   scopes    = @("heartbeat","poll","publish","report","ack",
                 "tasks.claim","tasks.release",
-                "submissions.create","artifact.write","artifact.read")
+                "submissions.read","submissions.create","artifact.write","artifact.read")
   machine   = $env:COMPUTERNAME
 } | ConvertTo-Json -Depth 4
 $resp = Invoke-RestMethod -Uri "$ENDPOINT/p/enroll" -Method Post -ContentType "application/json" -Body $body
@@ -186,7 +186,10 @@ hub_reply $msg.seq "已完成" "" $msg.dedupe_key
 
 - **台账是什么**：服务端按项目维护的任务表。每单有 `task_id`、标题、正文、指派对象（`to`）、状态（`open` → `claimed` → `released`/`done`/`blocked`）与租约。管理端建单时只往你的收件箱投一条消息：`topic=task`、`kind=task`，`payload` 只有 `{task_id, title, body}`。**收到消息不等于领单**——不主动领，任务一直是 `open`，管理端看得到你没领。`run --window 1` 把任务消息注入窗口也只是送达，不是领单。
 - **领单（开工前必须做）**：`& $BIN task-claim --task <task_id>`，返回 `{"ok":true,"lease_until":<毫秒时间戳>}` 才算领到。
-  - `409 locked`：已被别人领走（响应带 `owner` 与 `lease_until`）。不要重复干这单，`hub_reply` 说明后跳过。
+  - `409 locked`：已被别人有效领走（响应带 `state`、`owner` 与 `lease_until`）。不要重复干这单，`hub_reply` 说明后跳过。
+  - `409 already_done`：任务已完成，不再可领；不要重试，`hub_reply` 说明后换单。
+  - `409 blocked`：任务已被执行者置为 blocked；不要 claim，`hub_reply` 报管理端取回或转派。
+  - `409 released_pending_collection`：任务已交付但还有交付未取走；不要 claim，等管理端取件/关单。
   - `403 not_your_task`：这单没指派给你。不要领，`hub_reply` 报管理端。
   - `404 not_found`：`task_id` 写错或任务已撤。`hub_reply` 报管理端核对。
   - **领单失败必须响亮报告**：`hub_reply` 写明 `task_id` 与原始错误。不许静默跳过，不许没领单就开工。
@@ -228,7 +231,7 @@ schtasks /Run /TN "SynapseAgent"
 
 - **连接断开**：不要重建配置，不要重装。常驻 `run` 会自动重连；先查 `run.log` 与 `& $BIN status`，进程不在就 `schtasks /Run /TN "SynapseAgent"` 拉回，再验证心跳在涨。
 - **机器重启**：计划任务在登录时自动拉起 `run`。登录后验证一次 `status` 与名册心跳，不要默认它已经起来。
-- **LLM 会话重开（窗口被关、会话结束过）**：第一件事是对账，不是等新消息。(1) 读本地 `claimed-tasks.txt`，名下已领任务逐单处理：还该干的继续干；再 `task-claim` 返回 `409 locked` 且 owner 已是别人，说明租约过期已被回收，`hub_reply` 说明后放弃，不要接着干旧单。(2) 跑 `& $BIN wait` 把积压消息逐条取出来处理，不要只等下一条新消息。(3) 确认常驻 `run` 还活着，不在就按上一节拉回。
+- **LLM 会话重开（窗口被关、会话结束过）**：第一件事是对账，不是等新消息。(1) 读本地 `claimed-tasks.txt`，名下已领任务逐单处理：还该干的继续干；再 `task-claim` 返回 `409 locked` 且 owner 已是别人，说明租约过期已被回收；返回 `409 already_done` / `409 blocked` / `409 released_pending_collection` 则是终态或待管理端取件，均不可 claim，`hub_reply` 说明后放弃，不要接着干旧单。(2) 跑 `& $BIN wait` 把积压消息逐条取出来处理，不要只等下一条新消息。(3) 确认常驻 `run` 还活着，不在就按上一节拉回。
 - **窗口投递失败**：消息留在本地 WAL 里重试，不是丢失。不要清 `cursor.json`、不要改 epoch、不要重装；窗口恢复后会补发。
 - **消息投进了主对话/其它会话**：说明目标会话没有匹配上；先确认执行会话标题与 `config.json` 的 `window_conversation` 完全一致，再在豆包顶部/左侧会话项重命名并执行 `win-config --conversation "<标记>"`。切换到目标会话失败时新版会拒绝 ACK，不会继续投错；不要用 `win-send` 手工绕过后把失败当成成功。
 

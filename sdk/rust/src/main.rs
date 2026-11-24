@@ -2191,7 +2191,8 @@ fn probe_direct_once(endpoint: &str) -> Option<Duration> {
 #[cfg(not(windows))]
 fn apply_upgrade_mode(tmp: &str, current: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(current).map(|m| m.permissions().mode()).unwrap_or(0o755);
+    // 只继承普通权限位，不把旧二进制的 setuid/setgid/sticky 位复制到刚下载的新文件。
+    let mode = fs::metadata(current).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o755);
     fs::set_permissions(tmp, fs::Permissions::from_mode(mode | 0o111))
 }
 
@@ -2837,6 +2838,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn upgrade_mode_preserves_exec_bit() {
         use std::os::unix::fs::PermissionsExt;
@@ -2851,6 +2853,21 @@ mod tests {
         apply_upgrade_mode(tmp.to_str().unwrap(), &current).unwrap();
         let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o751, "tmp must inherit the old binary's mode before rename");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_mode_strips_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("upgrade-mode-special");
+        let current = dir.join("synapse-agent");
+        let tmp = dir.join("synapse-agent.new");
+        fs::write(&current, b"old").unwrap();
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o4751)).unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        apply_upgrade_mode(tmp.to_str().unwrap(), &current).unwrap();
+        let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o751, "special bits must not be copied to the downloaded binary");
     }
 
     #[test]

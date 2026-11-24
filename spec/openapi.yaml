@@ -373,6 +373,17 @@ paths:
         '200': { description: 二进制流 }
         '404': { description: 不存在 }
   /p/{project}/submissions:
+    get:
+      summary: 项目 agent 只读交付列表
+      description: 需要 submissions.read；存量 token 可用 submissions.create 兼容。只返回返工需要的字段，不返回 result/reviewed_by/reviewed_at/overtake_reason 等管理审计字段。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: state, in: query, schema: { type: string, enum: [delivered, collected, archived] } }
+        - { name: task_id, in: query, schema: { type: string } }
+        - { name: review_state, in: query, schema: { type: string, enum: [pending, accepted, approved, rejected] } }
+      responses:
+        '200': { description: 交付数组（最多 100 条，按创建时间倒序） }
+        '403': { description: 缺少 submissions.read / submissions.create }
     post:
       summary: 建交付（校验 blob 存在 + base_sha）
       parameters:
@@ -385,6 +396,17 @@ paths:
       responses:
         '200': { description: 已创建或幂等返回 }
         '422': { description: base_sha 缺失 / blob_missing / secret_detected }
+  /p/{project}/submissions/{id}/bundle:
+    get:
+      summary: 项目 agent 下载交付 bundle
+      description: 需要 submissions.read；存量 token 可用 submissions.create 兼容。返回 zip（含原 refs 文件与 PROVENANCE.json）。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: application/zip }
+        '404': { description: submission_not_found }
+        '413': { description: bundle_too_large / bundle_too_many_files }
   /p/{project}/issues:
     post:
       summary: 上报 Issue（所有 agent 默认可上报）

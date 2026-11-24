@@ -140,7 +140,7 @@ print(json.dumps({
     "project": project, "agent_id": agent_id, "token_sha": token_sha,
     "scopes": ["heartbeat","poll","publish","report","ack",
                "tasks.claim","tasks.release",
-               "submissions.create","artifact.write","artifact.read"],
+               "submissions.read","submissions.create","artifact.write","artifact.read"],
     "machine": machine
 }))
 PY
@@ -235,12 +235,15 @@ curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" -H "Authorization: Bearer $TOKEN" \
 
 - **台账是什么**：服务端按项目维护的任务表。每单有 `task_id`、标题、正文、指派对象（`to`）、状态（`open` → `claimed` → `released`/`done`/`blocked`）与租约。管理端建单时只往你的收件箱投一条消息：`topic=task`、`kind=task`，`payload` 只有 `{task_id, title, body}`。**收到这条消息不等于领单**——不主动领，任务在台账里一直是 `open`，管理端看得到你没领。
 - **领单（开工前必须做）**：`HOME="$STATE" "$BIN" task-claim --task <task_id>`，返回 `{"ok":true,"lease_until":<毫秒时间戳>}` 才算领到。
-  - `409 locked`：已被别人领走（响应带 `owner` 与 `lease_until`）。不要重复干这单，report 说明后跳过。
+  - `409 locked`：已被别人有效领走（响应带 `state`、`owner` 与 `lease_until`）。不要重复干这单，report 说明后跳过。
+  - `409 already_done`：任务已完成，不再可领；不要重试，report 说明后换单。
+  - `409 blocked`：任务已被执行者置为 blocked；不要 claim，report 管理端取回或转派。
+  - `409 released_pending_collection`：任务已交付但还有交付未取走；不要 claim，等管理端取件/关单。
   - `403 not_your_task`：这单没指派给你。不要领，report 管理端。
   - `404 not_found`：`task_id` 写错或任务已撤。report 管理端核对。
   - 旧版客户端没有 `task-claim` 命令时用 HTTP 直调（与 `/report` 同款）：`POST $ENDPOINT/p/$PROJECT/tasks/claim`，头 `Authorization: Bearer $TOKEN`，体 `{"task_id":"<task_id>"}`，响应形状相同。
   - **领单失败必须响亮报告**：report 写明 `task_id` 与原始错误。不许静默跳过，不许没领单就开工。
-- **租约与续租**：claim 租约现行口径 600 秒（10 分钟）。实际到期时间以 claim 响应里的 `lease_until` 为准，不要自己估算。租约靠心跳续租；沙箱休眠期间后台 `run` 可能被回收、心跳中断，租约可能在你睡着时到期、任务被回收给别人。每轮醒来第一件事：对名下已领的 `task_id` 再跑一次 `task-claim`——返回 `already:true` 是单还在；返回 `409 locked` 且 owner 是别人，就是已被回收，report 说明，不要接着干旧单。把名下已领的 `task_id` 与 `lease_until` 记进 `$STATE/.synapse-agent/claimed-tasks.txt`，跨轮可查。
+- **租约与续租**：claim 租约现行口径 600 秒（10 分钟）。实际到期时间以 claim 响应里的 `lease_until` 为准，不要自己估算。租约靠心跳续租；沙箱休眠期间后台 `run` 可能被回收、心跳中断，租约可能在你睡着时到期、任务被回收给别人。每轮醒来第一件事：对名下已领的 `task_id` 再跑一次 `task-claim`——返回 `already:true` 是单还在；返回 `409 locked` 且 owner 是别人，就是已被回收；返回 `409 already_done` / `409 blocked` / `409 released_pending_collection`，就是终态或待管理端取件，均不可 claim，report 说明后不要接着干旧单。把名下已领的 `task_id` 与 `lease_until` 记进 `$STATE/.synapse-agent/claimed-tasks.txt`，跨轮可查。
 - **交付必须挂单**：`deliver`/`submit` 带 `--task <task_id>`，交付才挂到这单名下；不带 `--task` 的交付，管理端对不上单。
 - **关单（release）**：交付完成、report 发出之后才关单：`HOME="$STATE" "$BIN" task-release --task <task_id> --state done`。
   - 有交付还没被管理侧取走时，服务端返回 `state=released`（已交付待取）；最后一件被取走后自动转 `done`。这是正常状态，不是失败，不要重复 release。

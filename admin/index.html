@@ -1660,16 +1660,16 @@ let detailReady = false;
 const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes"];
 const TASK_SCOPES = ["tasks.claim", "tasks.release"];
 const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TASK_SCOPES,
-                      "artifact.read","artifact.write","submissions.create","issues.report"];
+                      "artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
 const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",...TASK_SCOPES,
-                           "artifact.read","artifact.write","submissions.create","issues.report"];
+                           "artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
 // 详情页可编辑的权限：管理员身份本身用“授予/收回管理”切换，不混进这里。
 const SCOPE_OPTIONS = [...TASK_SCOPES, "heartbeat", "poll", "report", "ack", "publish",
-                       "submissions.create", "artifact.write", "artifact.read", "issues.report"];
+                       "submissions.read", "submissions.create", "artifact.write", "artifact.read", "issues.report"];
 const SCOPE_LABELS = {
   "tasks.claim": "领取任务", "tasks.release": "完成任务",
   heartbeat: "心跳", poll: "收件", report: "上报", ack: "回执",
-  publish: "广播（旧任务权限）", "submissions.create": "创建交付",
+  publish: "广播（旧任务权限）", "submissions.read": "读取交付（返工用）", "submissions.create": "创建交付",
   "artifact.write": "上传产物", "artifact.read": "读取产物", "issues.report": "上报 Issue",
 };
 function scopeList(raw) {

@@ -103,14 +103,14 @@ export class ProjectRoom implements DurableObject {
     return true;
   }
 
-  /** 任务播报（topic=task, kind=task, 无 to）在创建时冻结收件范围：无主任务先
-   * 播报给全员，之后被指派给别人、被别人领走或已关闭时，播报仍留在其他人的
-   * inbox 里，点了只会吃 not_your_task / locked（ISS-MWSO8HVB-A957CB）。
-   * 这里按任务的当前记录复核这三类失效；任务记录查不到时保留（fail-open），
-   * 管理员视角（me="*"/null）在调用处已跳过，不过滤。 */
+  /** 任务播报（topic=task, kind=task）在创建时冻结收件范围：无主任务先播报给
+   * 全员，定向任务只投给目标；之后被转派、被别人领走或已关闭时，旧播报仍留在
+   * 原收件人的 inbox 里，点了只会吃 not_your_task / locked / 终态 409
+   * （ISS-MWSO8HVB-A957CB）。这里按任务的当前记录复核失效；任务记录查不到时
+   * 保留（fail-open），管理员视角（me="*"/null）在调用处已跳过，不过滤。 */
   private async dropStaleTaskAnnouncements(messages: Msg[], me: string): Promise<Msg[]> {
     const isAnnouncement = (m: any) =>
-      m.topic === "task" && m.kind === "task" && !m.to && !!(m.payload as any)?.task_id;
+      m.topic === "task" && m.kind === "task" && !!(m.payload as any)?.task_id;
     if (!messages.some(isAnnouncement)) return messages;
     const out: Msg[] = [];
     const cache = new Map<string, any>();
@@ -121,8 +121,12 @@ export class ProjectRoom implements DurableObject {
       const t: any = cache.get(id);
       if (!t) { out.push(m); continue; }
       if (t.to && !this.isToMe(t.to, me)) continue;
-      if (t.state === "claimed" && t.owner && t.owner !== me) continue;
-      if (t.state === "done") continue;
+      // 只隐藏“仍被别人有效持有”的任务；已过期 lease 可被重新 claim，播报仍有效。
+      if (t.state === "claimed" && t.owner && t.owner !== me
+          && Number(t.lease_until ?? 0) > Date.now()) continue;
+      // done / blocked / released 都不可 claim，留在别人 inbox 只会换来 409：
+      // done=already_done，blocked=blocked，released=released_pending_collection。
+      if (t.state === "done" || t.state === "blocked" || t.state === "released") continue;
       out.push(m);
     }
     return out;

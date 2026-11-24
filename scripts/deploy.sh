@@ -788,7 +788,7 @@ bootstrap_flow() {
     token="$(openssl rand -hex 16)"
     sha="$(sha256_text "$token")"
     now="$(( $(date +%s) * 1000 ))"
-    sql="INSERT INTO agents (project,agent_id,role,scopes,token_sha,created_at) VALUES ('bootstrap','bootstrap-admin','admin','admin,poll,ack,report,heartbeat,publish,artifact.write,submissions.create,artifact.read','$sha',$now);"
+    sql="INSERT INTO agents (project,agent_id,role,scopes,token_sha,created_at) VALUES ('bootstrap','bootstrap-admin','admin','admin,poll,ack,report,heartbeat,publish,artifact.write,submissions.read,submissions.create,artifact.read','$sha',$now);"
     info "创建 bootstrap admin token"
     run_wrangler d1 execute "$D1" --remote --command "$sql"
     if [ "$DRY_RUN" = 1 ]; then
