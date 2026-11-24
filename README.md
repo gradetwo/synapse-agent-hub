@@ -11,7 +11,9 @@
 | SDK version | `0.5.6` |
 | 安装入口 | `https://synapse.wangda.today/dl/install.sh` |
 | Linux x64 二进制 | `/dl/synapse-agent-x86_64-linux-musl` |
+| Linux x64 glibc 二进制 | `/dl/synapse-agent-x86_64-linux-gnu` |
 | Linux ARM64 二进制 | `/dl/synapse-agent-aarch64-linux-musl` |
+| Linux ARM64 glibc 二进制 | `/dl/synapse-agent-aarch64-linux-gnu` |
 | Windows x64 二进制 | `/dl/synapse-agent-x86_64-windows-msvc.exe` |
 | 校验值 | 以 `/dl/<name>.sha256` 和 `/sdk/manifest` 为准 |
 | 设计单源 | [`DESIGN.md`](./DESIGN.md) |
@@ -132,7 +134,7 @@ printf 'admin token: %s\n' "$TOKEN"
 
 ## 客户端安装（唯一入口）
 
-Linux x86_64 / ARM64（静态 musl，免 Python / 免编译）：
+Linux x86_64 / ARM64（静态 musl，免 Python / 免编译；受限 DNS 环境可加 `--libc gnu` 走动态 glibc）：
 
 ```bash
 curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \

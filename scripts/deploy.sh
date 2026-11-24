@@ -5,14 +5,14 @@
 #   bootstrap  空 Cloudflare 账号初始化：建 D1/R2、建表、设 secret、首次 deploy
 #   release    线上增量更新：只重建/上传变化的 binary，按需 deploy Worker
 #
-# 默认发布四套二进制：
-#   linux-x64 / linux-arm64 / linux-x64-gnu / win-x64
+# 默认发布五套二进制：
+#   linux-x64 / linux-arm64 / linux-x64-gnu / linux-arm64-gnu / win-x64
 #
 # 用法：
 #   ./scripts/deploy.sh bootstrap --fresh --yes
 #   ./scripts/deploy.sh release --yes
 #   ./scripts/deploy.sh release --since HEAD~1 --dry-run
-#   ./scripts/deploy.sh release --targets linux-x64,linux-arm64,linux-x64-gnu,win-x64 --yes
+#   ./scripts/deploy.sh release --targets linux-x64,linux-arm64,linux-x64-gnu,linux-arm64-gnu,win-x64 --yes
 #
 # 说明：
 # - release 不会创建 D1/R2，不会重跑 schema.sql，不会轮换 SESSION_SECRET。
@@ -40,7 +40,7 @@ FRESH=0
 SINCE=""
 ALL=0
 ALL_TARGETS=0
-TARGETS="linux-x64 linux-arm64 linux-x64-gnu win-x64"
+TARGETS="linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64"
 WIN_TOOLCHAIN="msvc"
 SKIP_BUILD=0
 SKIP_WORKER=0
@@ -83,7 +83,7 @@ release 选项：
   --since REF          指定对比基线，例如 HEAD~1、origin/main 或某个 commit
   --all                强制认为 Worker/Rust/安装脚本都变了
   --targets LIST       编译/上传目标，逗号或空格分隔
-                       默认 linux-x64 linux-arm64 linux-x64-gnu win-x64
+                       默认 linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64
                        all = linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64 macos-arm64 macos-x64
   --win-toolchain msvc|gnu   Windows 工具链，默认 msvc
   --skip-build         跳过编译，直接用 dist/ 现有产物
@@ -114,7 +114,7 @@ bootstrap 选项：
   -h, --help
 
 示例：
-  # 日常线上更新：自动检测变化，编译/上传三套 binary，必要时 deploy Worker
+  # 日常线上更新：自动检测变化，编译/上传五套 binary，必要时 deploy Worker
   ./scripts/deploy.sh release --yes
 
   # 只发 Windows 窗口桥

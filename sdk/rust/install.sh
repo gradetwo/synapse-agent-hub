@@ -30,8 +30,7 @@ ARCH=$(uname -m)
 
 case "$OS-$ARCH" in
   linux-x86_64|linux-amd64) ASSET="synapse-agent-x86_64-linux-${LIBC}" ;;
-  linux-aarch64|linux-arm64)
-    die "aarch64 版未发布；请由维护者按 BUILD.md 编译，客户端不要在本机编译" ;;
+  linux-aarch64|linux-arm64) ASSET="synapse-agent-aarch64-linux-${LIBC}" ;;
   darwin-*)
     die "macOS 版未发布；请由维护者按 BUILD.md 编译，客户端不要在本机编译" ;;
   *)

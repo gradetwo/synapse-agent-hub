@@ -8,7 +8,7 @@
 # 目标列表：逗号或空格分隔
 # linux-x64 / linux-arm64 / linux-x64-gnu / linux-arm64-gnu / win-x64 / macos-arm64 / macos-x64
 # （linux-*-gnu 是动态 glibc 版，给 musl 静态版自带 DNS 解析不可用的受限环境）
-targets = linux-x64, linux-arm64, win-x64
+targets = linux-x64, linux-arm64, linux-x64-gnu, linux-arm64-gnu, win-x64
 
 # Linux 交叉工具链：
 #   zigbuild -> 需要 brew install zig + cargo install cargo-zigbuild（推荐）

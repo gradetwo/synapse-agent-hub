@@ -75,10 +75,10 @@ RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
   cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-macOS 主机可以用交叉编译脚本一次生成 Linux x64、Linux ARM64、Windows x64 和 macOS：
+macOS 主机可以用交叉编译脚本一次生成 Linux x64、Linux ARM64（musl + glibc）、Windows x64 和 macOS：
 
 ```bash
-./scripts/build-cross.sh linux-x64 linux-arm64 win-x64 macos-arm64 macos-x64 \
+./scripts/build-cross.sh linux-x64 linux-arm64 linux-x64-gnu linux-arm64-gnu win-x64 macos-arm64 macos-x64 \
   --win-toolchain msvc
 ```
 
@@ -87,6 +87,8 @@ macOS 主机可以用交叉编译脚本一次生成 Linux x64、Linux ARM64、Wi
 ```text
 dist/synapse-agent-x86_64-linux-musl
 dist/synapse-agent-aarch64-linux-musl
+dist/synapse-agent-x86_64-linux-gnu
+dist/synapse-agent-aarch64-linux-gnu
 dist/synapse-agent-x86_64-windows-msvc.exe
 dist/synapse-agent-aarch64-apple-darwin
 dist/synapse-agent-x86_64-apple-darwin
@@ -229,7 +231,7 @@ cd ../.. && npx wrangler deploy --dry-run --outdir /tmp/synapse-worker-dry
 - 执行 `worker/schema.sql`
 - 首次 `wrangler deploy`
 - 生成 bootstrap admin token
-- 默认继续编译并上传 Linux x64 / ARM64 / Windows x64 三套 binary
+- 默认继续编译并上传 Linux x64 / ARM64（musl + glibc）/ Windows x64 五套 binary
 
 ### 线上增量更新
 
@@ -240,7 +242,7 @@ cd ../.. && npx wrangler deploy --dry-run --outdir /tmp/synapse-worker-dry
 默认行为：
 
 - 从 `.deploy-state` 记录的上次发布 commit 到当前 HEAD 检测变化
-- 默认编译并上传 `linux-x64`、`linux-arm64`、`win-x64`
+- 默认编译并上传 `linux-x64`、`linux-arm64`、`linux-x64-gnu`、`linux-arm64-gnu`、`win-x64`
 - 只有 `worker/src/*`、`admin/*` 或 `wrangler.toml` 变化时才 `wrangler deploy`
 - 只有 `scripts/install.sh` / `scripts/install.ps1` 变化时才重传安装脚本
 - 更新 `BUILD.txt`，写入 build / commit / sdk_version
