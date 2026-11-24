@@ -4,6 +4,7 @@ import { Env, Msg, Task } from "./types";
 
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
 const DEFAULT_TASK_LEASE_MS = 12 * 60 * 60_000; // 任务 claim 默认租约 12h；心跳会续，LEASE_TTL_S 可调
+export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任务/Issue 时，名下未完成任务上限
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
@@ -61,6 +62,7 @@ export class ProjectRoom implements DurableObject {
       case "tasks/release":return this.release(body);
       case "tasks/submission-settled": return this.submissionSettled(body);
       case "tasks/list":   return this.listTasks();
+      case "tasks/active-load": return this.activeLoad(body);
       case "tasks/get":    return this.getTask(body);
       case "tasks/create": return this.createTask(body);
       case "tasks/admin-close": return this.adminClose(body);
@@ -380,6 +382,15 @@ export class ProjectRoom implements DurableObject {
            AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`
       ).bind(project, to, now).first<any>().catch(() => null);
       if (!active) return json({ error: "target_not_found", to }, 422);
+      // Issue 自助认领（sender=agent，enforce_agent_limit=true）走这里；管理员派单不传该标记，
+      // 只由 Worker 在响应里提醒，不阻断管理员。
+      if (b.enforce_agent_limit === true) {
+        const load = await this.activeTaskLoad(to);
+        if (load.active_tasks >= ACTIVE_TASK_LIMIT)
+          return json({ error: "agent_task_limit_exceeded", active_tasks: load.active_tasks,
+                        limit: ACTIVE_TASK_LIMIT, task_ids: load.task_ids,
+                        message: `你当前名下未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再认领 Issue。` }, 409);
+      }
     }
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
                      project: b.project ?? this.projectName(),
@@ -449,6 +460,15 @@ export class ProjectRoom implements DurableObject {
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
     if (t.state === "claimed" && t.owner === b.agent_id && Number(t.lease_until ?? 0) > now)
       return json({ ok: true, lease_until: t.lease_until, already: true });
+    // 自领公共任务前检查名下未完成任务；定向任务不受此限（管理员派单只提醒不拦截）。
+    // 过期后重领自己原来的任务时，把该任务本身从计数里排除。
+    if (!t.to && (t.state === "open" || (t.state === "claimed" && Number(t.lease_until ?? 0) < now))) {
+      const load = await this.activeTaskLoad(b.agent_id, String(t.task_id ?? t.id ?? ""));
+      if (load.active_tasks >= ACTIVE_TASK_LIMIT)
+        return json({ error: "agent_task_limit_exceeded", active_tasks: load.active_tasks,
+                      limit: ACTIVE_TASK_LIMIT, task_ids: load.task_ids,
+                      message: `你当前名下未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再领取公共任务。` }, 409);
+    }
     // 非 open 状态按真实原因报错，不能一律说 locked：done/blocked/released 的
     // owner 与 lease_until 都是空值，旧实现会拼出“被锁定但 owner=null、租约 0”的
     // 假象，让节点以为任务被不存在的人占着（ISS-MWSSGUQ1-88BD71）。
@@ -634,6 +654,27 @@ export class ProjectRoom implements DurableObject {
       to: t.to ?? null,
       project: t.project ?? this.projectName(),
     });
+  }
+
+  /** 名下未完成任务：只统计 open/claimed/blocked 且 owner 或 to 指向该 agent 的任务；
+   * released（已交付待管理侧取件）和 done 不再占用名额。 */
+  private async activeTaskLoad(agentId: string, excludeTaskId = ""): Promise<{ active_tasks: number; task_ids: string[] }> {
+    const rows = await this.st.list<any>({ prefix: "task:" });
+    const ids: string[] = [];
+    for (const t of rows.values()) {
+      if (!t || t.state === "done" || t.state === "released") continue;
+      if (excludeTaskId && String(t.task_id ?? t.id ?? "") === excludeTaskId) continue;
+      const owns = t.owner === agentId;
+      const to = Array.isArray(t.to) ? t.to.includes(agentId) : t.to === agentId;
+      if (owns || (!t.owner && to)) ids.push(String(t.task_id ?? t.id ?? ""));
+    }
+    return { active_tasks: ids.length, task_ids: ids.filter(Boolean).slice(0, 20) };
+  }
+
+  private async activeLoad(b: any) {
+    const agentId = String(b?.agent_id ?? "").trim();
+    if (!agentId) return json({ error: "agent_id_required" }, 422);
+    return json({ agent_id: agentId, ...(await this.activeTaskLoad(agentId)) });
   }
 
   private async listTasks() {

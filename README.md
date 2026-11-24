@@ -121,7 +121,7 @@ NOW="$(date +%s)000"
 npx wrangler d1 execute agent_hub --remote --command \
   "INSERT INTO agents (project,agent_id,role,scopes,token_sha,created_at)
    VALUES ('bootstrap','bootstrap-admin','admin',
-   'admin,poll,ack,report,heartbeat,publish,tasks.claim,tasks.release,artifact.write,submissions.read,submissions.create,artifact.read',
+   'admin,poll,ack,report,heartbeat,publish,tasks.claim,tasks.release,tasks.read,issues.read,issues.report,artifact.write,submissions.read,submissions.create,artifact.read',
    '$SHA',$NOW)"
 printf 'admin token: %s\n' "$TOKEN"
 ```
@@ -296,7 +296,7 @@ synapse-agent issue --title "worker 心跳偶发 503" \
 synapse-agent issue-take --issue ISS-...
 ```
 
-只有原 reporter 本人可以转换，且 Issue 必须同时满足 `open` 且尚未派发（`task_id` 为空）。转换成功后任务以 reporter 为 `to`，任务完成时 Issue 自动关闭。
+`issue-take` 只有原 reporter 本人可以调用；其他项目 agent 可用 `POST /p/{project}/issues/{id}/claim` 自助认领。两者都要求 Issue 同时满足 `open` 且尚未派发（`task_id` 为空），且名下活跃任务达到 5 个后会被 `agent_task_limit_exceeded` 拦住。转换成功后任务以认领者为 `to`，任务完成时 Issue 自动关闭。
 
 上报时勾选 `--self` 但建任务失败不会丢 Issue：接口仍返回 `201`，`self_task.ok=false`，Issue 保持 `open`，可稍后用 `issue-take` 重试。
 
@@ -322,6 +322,15 @@ print(r["issue_id"])
 | POST | `/x/admin/p/{project}/issues/{id}/reopen` | 重新打开；自动关闭的会清空 task_id |
 | POST | `/x/admin/p/{project}/issues/{id}/merge` | 合并到另一个 open Issue |
 | POST | `/x/admin/p/{project}/issues/{id}/dispatch` | 转任务派发；任务 done 自动关闭 |
+
+普通 agent 查公共池并自助认领（不用管理台）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/p/{project}/tasks?limit=50` | 只列 `open` 且无 `to` 的公共任务（需 `tasks.read`） |
+| POST | `/p/{project}/tasks/claim` | 认领公共任务；名下活跃 ≥5 时返回 `409 agent_task_limit_exceeded` |
+| GET | `/p/{project}/issues?limit=50` | 只列 `open` 且 `task_id IS NULL` 的 Issue（需 `issues.read`） |
+| POST | `/p/{project}/issues/{id}/claim` | 任意项目 agent 认领未指派 Issue；同样受活跃任务上限约束 |
 
 Python SDK：`Client.report_issue(..., self_assign=True)` / `Client.take_issue()` / `Admin.issues()`；TypeScript SDK：`Client.reportIssue(..., true)` / `Client.takeIssue()` / `Admin.issues()`。上报默认按项目 **20 条/分钟** 节流，超出返回 `429 issue_rate_limited`。
 

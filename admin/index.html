@@ -1660,14 +1660,16 @@ let detailReady = false;
 const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes"];
 const TASK_SCOPES = ["tasks.claim", "tasks.release"];
 const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TASK_SCOPES,
-                      "artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
+                      "tasks.read","issues.read","artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
 const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",...TASK_SCOPES,
-                           "artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
+                           "tasks.read","issues.read","artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
 // 详情页可编辑的权限：管理员身份本身用“授予/收回管理”切换，不混进这里。
 const SCOPE_OPTIONS = [...TASK_SCOPES, "heartbeat", "poll", "report", "ack", "publish",
-                       "submissions.read", "submissions.create", "artifact.write", "artifact.read", "issues.report"];
+                       "tasks.read", "issues.read", "submissions.read", "submissions.create",
+                       "artifact.write", "artifact.read", "issues.report"];
 const SCOPE_LABELS = {
   "tasks.claim": "领取任务", "tasks.release": "完成任务",
+  "tasks.read": "查看公共任务池", "issues.read": "查看 open Issue",
   heartbeat: "心跳", poll: "收件", report: "上报", ack: "回执",
   publish: "广播（旧任务权限）", "submissions.read": "读取交付（返工用）", "submissions.create": "创建交付",
   "artifact.write": "上传产物", "artifact.read": "读取产物", "issues.report": "上报 Issue",
@@ -2659,7 +2661,8 @@ $("btnTaskCreate").onclick = async () => {
   $("btnTaskCreate").disabled = true;
   try {
     const r = await api(`/admin/p/${current}/tasks`, "POST", { task_id: id, title, body, to });
-    showToast(`已派单 ${r.task_id || id}${to ? " → " + to : ""}`, 6000);
+    const warn = r.warning?.message ? `；⚠️ ${r.warning.message}` : "";
+    showToast(`已派单 ${r.task_id || id}${to ? " → " + to : ""}${warn}`, warn ? 12000 : 6000);
     $("taskId").value = ""; $("taskTitle").value = ""; $("taskBody").value = "";
     await loadTasks();
     setCardOpen("任务", true);
@@ -2745,7 +2748,8 @@ document.addEventListener("click", async (e) => {
       if (!confirm(`把 ${idp} 转成任务派发${to ? `给 ${to}` : "到公共池"}？任务完成后会自动关闭 Issue。`)) return;
       try {
         const r = await api(`/admin/p/${current}/issues/${encodeURIComponent(idp)}/dispatch`, "POST", { to: to || null });
-        showToast(`已派发 ${idp} → ${r.task_id || "任务"}${to ? " · " + to : ""}`, 6000);
+        const warn = r.warning?.message ? `；⚠️ ${r.warning.message}` : "";
+        showToast(`已派发 ${idp} → ${r.task_id || "任务"}${to ? " · " + to : ""}${warn}`, warn ? 12000 : 6000);
         await refresh(true);
       } catch (e) { alert(`派发失败：${e.message || e}`); }
       return;
@@ -2809,7 +2813,8 @@ document.addEventListener("click", async (e) => {
       if (reason === null) return;
       const r = await adminTaskAction(`/admin/p/${current}/tasks/reassign`, { task_id: tas, to, reason }, "转派");
       if (!r) return;
-      showToast(`已转派 ${tas} → ${to}`, 5000);
+      const warn = r.warning?.message ? `；⚠️ ${r.warning.message}` : "";
+      showToast(`已转派 ${tas} → ${to}${warn}`, warn ? 12000 : 5000);
       return refresh();
     }
     return;

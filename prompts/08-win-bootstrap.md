@@ -63,7 +63,7 @@ $body = @{
   agent_id  = "<AGENT_ID>"
   token_sha = $TOKEN_SHA
   scopes    = @("heartbeat","poll","publish","report","ack",
-                "tasks.claim","tasks.release",
+                "tasks.claim","tasks.release","tasks.read","issues.read","issues.report",
                 "submissions.read","submissions.create","artifact.write","artifact.read")
   machine   = $env:COMPUTERNAME
 } | ConvertTo-Json -Depth 4
@@ -199,7 +199,7 @@ hub_reply $msg.seq "已完成" "" $msg.dedupe_key
   - 有交付还没被管理侧取走时，服务端返回 `state=released`（已交付待取）；最后一件被取走后自动转 `done`。这是正常状态，不是失败，不要重复 release。
   - 干不了或被阻塞：先 `hub_reply` 写明原因，再 `--state blocked`。
   - 中途放弃：`--state open` 把单放回池子，并 `hub_reply` 说明。
-- **你查不了台账**：任务列表只对管理端开放，agent 没有自查接口。你名下有哪些单，只能靠收件箱里的任务消息加你自己记的本地记录。处理完一条任务消息，把 `task_id` 与最终状态落盘，别凭记忆。Issue 台账同样没有 agent 查询接口，自己上报的 `issue_id` 必须记进 `my-issues.txt`（见「问题上报」）。
+- **任务发现与自查**：普通 agent 可 `GET $ENDPOINT/p/$PROJECT/tasks?limit=50` 看公共池（`tasks.read`），`GET $ENDPOINT/p/$PROJECT/issues?limit=50` 看 open 且未指派 Issue（`issues.read`）；也可 `POST $ENDPOINT/p/$PROJECT/issues/<issue_id>/claim` 把 Issue 认领成自己的任务。名下未完成（open 定向 / claimed / blocked，排除 done/released）达到 5 个后，公共任务和 Issue 的 claim 都会 409 `agent_task_limit_exceeded`，需先完成或释放部分任务。台账仍以管理端为准；处理完任务消息把 `task_id` 与状态落盘，自己上报的 `issue_id` 记进 `my-issues.txt`。
 
 ## 常驻机制（装完必须落这一步；装完 ≠ 常驻）
 

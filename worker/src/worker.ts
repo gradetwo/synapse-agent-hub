@@ -2,15 +2,17 @@
 //                      control plane = /admin/…（admin token 或 Access 已通过）
 import { Env } from "./types";
 import CONSOLE_HTML from "../../admin/index.html";
+import { ACTIVE_TASK_LIMIT } from "./project-room";
 export { ProjectRoom } from "./project-room";
 
 const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "tasks.claim", "tasks.release",
-                      "artifact.write", "submissions.read", "submissions.create", "issues.report"];
+                      "tasks.read", "issues.read", "issues.report",
+                      "artifact.write", "submissions.read", "submissions.create"];
 const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "agent-quota-200-upgrade-exec-20261124";
+const BUILD_TAG = "agent-pool-read-task-limit-20261124";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.5";
 
@@ -302,10 +304,19 @@ export default {
     // 写路径仍按 submissions.create 查，其它 submissions GET 不在这里放行。
     const subRead = req.method === "GET" &&
       (action === "submissions" || /^submissions\/[^/]+\/bundle$/.test(action));
-    const requiredScope = subRead ? "submissions.read" : need(action);
+    const taskPoolRead = req.method === "GET" && action === "tasks";
+    const issuePoolRead = req.method === "GET" && action === "issues";
+    const requiredScope = taskPoolRead ? "tasks.read"
+      : issuePoolRead ? "issues.read"
+      : subRead ? "submissions.read" : need(action);
     if (!inScope(auth.scopes!, requiredScope))
       return err(403, `insufficient_scope: 需要 ${requiredScope}，当前 [${(auth.scopes || []).join(",")}]`);
     if (auth.projectStatus === "paused" && req.method !== "GET") return err(423, "project_paused");
+
+    // 公共池只读发现：普通 agent 先看再 claim；接口只返回未指派 open 任务。
+    if (taskPoolRead) return listPublicTasks(env, project, url);
+    // open 且未指派 Issue 只读发现；不发正文之外的审计字段。
+    if (issuePoolRead) return listOpenIssues(env, project, url);
 
     // 交付创建在 Worker 侧完成（需查 R2 + 写 D1），不转发给 DO
     if (action === "submissions" && req.method === "POST")
@@ -328,6 +339,10 @@ export default {
     const issueTake = action.match(/^issues\/([A-Za-z0-9._:-]{1,128})\/take$/);
     if (issueTake && req.method === "POST")
       return takeIssue(req, env, project, auth.agentId!, issueTake[1]);
+    // 任意项目 agent 认领一条 open 且未指派的 Issue；等价于转成自己的定向任务。
+    const issueClaim = action.match(/^issues\/([A-Za-z0-9._:-]{1,128})\/claim$/);
+    if (issueClaim && req.method === "POST")
+      return takeIssue(req, env, project, auth.agentId!, issueClaim[1], false);
 
     let pubMaxPerMin = 0;
     if (["publish", "report"].includes(action) && req.method === "POST") {
@@ -463,7 +478,7 @@ async function enroll(req: Request, env: Env, url: URL, path: string) {
     ? rawScopes.map((x: any) => String(x).trim())
     : String(rawScopes ?? "").split(",").map((x) => x.trim());
   const allowed = ["heartbeat", "poll", "publish", "report", "ack",
-                   "tasks.claim", "tasks.release",
+                   "tasks.claim", "tasks.release", "tasks.read", "issues.read", "issues.report",
                    "submissions.read", "submissions.create", "artifact.write", "artifact.read"];
   const bad = listScopes.filter((x) => x && !allowed.includes(x));
   if (bad.length) return err(422, `bad_scope:${bad.join(",")}`);
@@ -566,7 +581,8 @@ function need(action: string) {
   if (action === "tasks/claim") return "tasks.claim";
   if (action === "tasks/release") return "tasks.release";
   if (action.startsWith("tasks/admin-")) return "admin";
-  if (action === "tasks/list" || action === "tasks/get") return "admin"; // 台账/单任务元数据不对普通 agent 开放
+  if (action === "tasks/list" || action === "tasks/get" || action === "tasks/active-load") return "admin";
+  // 台账/单任务元数据/内部 active-load 不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
   if (action === "issues" || action.startsWith("issues/")) return "issues.report";
   if (action.startsWith("submissions")) return "submissions.create";
@@ -593,6 +609,27 @@ async function projectQuota(env: Env, project: string) {
     maxAgents: Number(r?.max_agents ?? 200),
     maxStorageMb: Number(r?.max_storage_mb ?? 2048),
     maxMsgsPerMin: Number(r?.max_msgs_per_min ?? 60),
+  };
+}
+
+/** 管理侧派单提醒：只提醒，不阻断。读取 DO 的 active-load，按同一口径统计。 */
+async function taskLoadWarning(stub: any, agentId: string): Promise<any | null> {
+  if (!agentId) return null;
+  const r = await stub.fetch(new Request("https://do/tasks/active-load", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ agent_id: agentId }),
+  })).catch(() => null);
+  if (!r || !r.ok) return null;
+  const d: any = await r.json().catch(() => ({}));
+  const active = Number(d.active_tasks ?? 0);
+  if (active <= ACTIVE_TASK_LIMIT) return null;
+  return {
+    code: "agent_task_load_high",
+    agent_id: agentId,
+    active_tasks: active,
+    limit: ACTIVE_TASK_LIMIT,
+    task_ids: Array.isArray(d.task_ids) ? d.task_ids : [],
+    message: `${agentId} 当前名下未完成任务 ${active} 个，超过建议上限 ${ACTIVE_TASK_LIMIT}；仍已派发，请提醒其先完成或释放部分任务。`,
   };
 }
 
@@ -1023,7 +1060,8 @@ async function admin(req: Request, env: Env, url: URL) {
       const quota = await projectQuota(env, project);
       const r = await stub.fetch(new Request("https://do/tasks/create", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...b, project, sender: "admin", max_per_min: quota.maxMsgsPerMin }),
+        body: JSON.stringify({ ...b, project, sender: "admin", max_per_min: quota.maxMsgsPerMin,
+                               enforce_agent_limit: false }),
       }));
       const d: any = await r.json().catch(() => ({}));
       // S5：旧 DO 实例不带 wake 时由 Worker 补齐；定向消息本身已经落库。
@@ -1034,6 +1072,8 @@ async function admin(req: Request, env: Env, url: URL) {
         const age = hb?.last_hb_ms ? Date.now() - Number(hb.last_hb_ms) : Infinity;
         d.wake = d.wake ?? { channel: "inbox", target: b.to, online: age <= 300_000,
                              alive: age <= 120_000 ? "alive" : age <= 300_000 ? "late" : "offline" };
+        const warning = await taskLoadWarning(stub, String(b.to));
+        if (warning) d.warning = warning;
       }
       return Response.json(d, { status: r.status });
     }
@@ -1087,6 +1127,10 @@ async function admin(req: Request, env: Env, url: URL) {
           brief = { error: "brief_failed", detail: String(e?.message ?? e) };
         }
         d.brief = brief;
+      }
+      if (action === "tasks/reassign" && dr.ok && b.to) {
+        const warning = await taskLoadWarning(stub, String(b.to));
+        if (warning) d.warning = warning;
       }
       return Response.json(d, { status: dr.status });
     }
@@ -1179,8 +1223,11 @@ async function admin(req: Request, env: Env, url: URL) {
         body: b.body,
       });
       if (!out.ok) return out.detail ? json(out.detail, out.status) : err(out.status, out.error);
+      const target = b.to === undefined || b.to === null || String(b.to).trim() === ""
+        ? "" : String(b.to).trim();
+      const warning = target ? await taskLoadWarning(stub, target) : null;
       return json({ ok: true, issue_id: issueId, status: "open", task_id: out.task_id,
-                    dispatched: true, task_link: out.task });
+                    dispatched: true, task_link: out.task, ...(warning ? { warning } : {}) });
     }
 
     if (action === "snapshot") return stub.fetch(new Request("https://do/snapshot"));
@@ -1622,6 +1669,42 @@ function zipStore(files: { name: string; data: Uint8Array }[]): Uint8Array {
   return out;
 }
 
+/** 普通 agent 的公共任务池：只读、只返回 open 且无 to 的任务，按创建时间先到先得。 */
+async function listPublicTasks(env: Env, project: string, url: URL) {
+  const raw = Number(url.searchParams.get("limit") ?? 50);
+  const limit = Number.isFinite(raw) ? Math.max(1, Math.min(100, raw)) : 50;
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  const r = await stub.fetch(new Request("https://do/tasks/list"));
+  if (!r.ok) return err(r.status, "task_list_failed");
+  const d: any = await r.json().catch(() => ({ tasks: [] }));
+  const tasks = (d.tasks ?? [])
+    .filter((t: any) => t && t.state === "open" && !t.to && !t.owner)
+    .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
+    .slice(0, limit)
+    .map((t: any) => ({
+      task_id: t.task_id ?? t.id,
+      title: t.title ?? "",
+      body: t.body ?? "",
+      created_at: t.created_at ?? 0,
+      updated_at: t.updated_at ?? 0,
+      ...(t.issue_id ? { issue_id: t.issue_id } : {}),
+    }));
+  return json({ tasks, count: tasks.length, limit });
+}
+
+/** 普通 agent 的 Issue 池：只列 open 且尚未生成任务的 Issue。 */
+async function listOpenIssues(env: Env, project: string, url: URL) {
+  const raw = Number(url.searchParams.get("limit") ?? 50);
+  const limit = Number.isFinite(raw) ? Math.max(1, Math.min(100, raw)) : 50;
+  const rows = await env.DB.prepare(
+    `SELECT issue_id, title, body, status, priority, labels, reporter, created_at, updated_at
+       FROM issues
+      WHERE project = ? AND status = 'open' AND task_id IS NULL
+      ORDER BY created_at ASC LIMIT ?`
+  ).bind(project, limit).all<any>();
+  return json({ issues: rows.results ?? [], count: (rows.results ?? []).length, limit });
+}
+
 /** 交付列表（只读）：管理面与数据面共用查询；数据面只返回返工需要的字段。
  *  `result`、`reviewed_by`、`reviewed_at`、`overtake_reason` 属于管理侧审计信息，
  *  不返回给普通 agent。 */
@@ -1995,7 +2078,8 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
  */
 async function dispatchIssueToTask(
   env: Env, project: string, issueId: string,
-  opts: { to: string | null; sender: string; taskId?: string; title?: string; body?: string },
+  opts: { to: string | null; sender: string; taskId?: string; title?: string; body?: string;
+          enforceAgentLimit?: boolean },
 ): Promise<{ ok: true; task_id: string; task: any }
         | { ok: false; status: number; error: string; detail?: any }> {
   const row = await env.DB.prepare(
@@ -2024,7 +2108,8 @@ async function dispatchIssueToTask(
     dr = await stub.fetch(new Request("https://do/tasks/create", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ task_id: taskId, title, body, to: opts.to, issue_id: issueId,
-                             project, sender: opts.sender, max_per_min: quota.maxMsgsPerMin }),
+                             project, sender: opts.sender, max_per_min: quota.maxMsgsPerMin,
+                             enforce_agent_limit: opts.enforceAgentLimit === true }),
     }));
   } catch (e) {
     await env.DB.prepare(
@@ -2043,16 +2128,18 @@ async function dispatchIssueToTask(
   return { ok: true, task_id: taskId, task: d };
 }
 
-/** 上报者把一条 open issue 转成自己的任务；只有 reporter 本人可以调用。 */
-async function takeIssue(req: Request, env: Env, project: string, agentId: string, issueId: string) {
+/** 把一条 open issue 转成自己的任务：/take 仅 reporter（requireReporter=true），/claim 任意项目 agent。 */
+async function takeIssue(req: Request, env: Env, project: string, agentId: string, issueId: string,
+                         requireReporter = true) {
   const row = await env.DB.prepare(
     "SELECT issue_id, reporter, status, task_id FROM issues WHERE project = ? AND issue_id = ?"
   ).bind(project, issueId).first<any>();
   if (!row) return err(404, "issue_not_found");
-  if (row.reporter !== agentId) return err(403, "not_issue_reporter");
+  if (requireReporter && row.reporter !== agentId) return err(403, "not_issue_reporter");
   const b: any = await req.json().catch(() => ({}));
   const out = await dispatchIssueToTask(env, project, issueId, {
     to: agentId, sender: agentId, taskId: String(b.task_id ?? "").trim() || undefined,
+    enforceAgentLimit: true,
   });
   if (!out.ok) return out.detail ? json(out.detail, out.status) : err(out.status, out.error);
   return json({ ok: true, issue_id: issueId, status: "open", task_id: out.task_id,

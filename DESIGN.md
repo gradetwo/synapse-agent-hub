@@ -52,7 +52,7 @@
 ### agent 默认 scope（签发时可增减，但**不可**含 `admin`）
 
 ```
-poll, ack, report, heartbeat, publish, tasks.claim, tasks.release, artifact.write, submissions.read, submissions.create
+poll, ack, report, heartbeat, publish, tasks.claim, tasks.release, tasks.read, issues.read, issues.report, artifact.write, submissions.read, submissions.create
 ```
 
 管理员默认 scope 在上面基础上加 `artifact.read` 与 `admin`。普通 agent 不允许携带 `admin`；
@@ -165,7 +165,10 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | POST | `/p/{p}/heartbeat` | heartbeat | 覆盖写 + 顺带续租 + 5 分钟采样 |
 | POST | `/p/{p}/ack` | ack | `status: done \| refused \| blocked \| stale` |
 | POST | `/p/{p}/report` | report | 任务 + 资源详单 |
-| POST | `/p/{p}/tasks/claim` | publish | 租约默认 12h（`LEASE_TTL_S`） |
+| GET | `/p/{p}/tasks` | tasks.read | 公共池：只列 `open` 且无 `to` 的任务 |
+| POST | `/p/{p}/tasks/claim` | tasks.claim | 认领公共任务；租约默认 12h（`LEASE_TTL_S`）；名下未完成 ≥5 时 409 `agent_task_limit_exceeded` |
+| GET | `/p/{p}/issues` | issues.read | 只列 `open` 且 `task_id IS NULL` 的 Issue |
+| POST | `/p/{p}/issues/{id}/claim` | issues.report | 任意项目 agent 把未指派 open Issue 转成自己的任务；同样受 ≥5 限制 |
 | POST | `/p/{p}/tasks/release` | publish | `done \| blocked`；目标 done 且该任务仍有待取交付时只进 `released`（见 §7 联动） |
 | PUT | `/p/{p}/artifact/{sha256}` | artifact.write | 流式直传 R2 |
 | GET | `/p/{p}/artifact/{sha256}` | poll | 下载 |

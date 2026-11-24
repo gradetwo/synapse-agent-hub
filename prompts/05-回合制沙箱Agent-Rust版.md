@@ -89,7 +89,7 @@ YANSHI_WAIT=30 HOME=$STATE "$BIN" wait &
    有交付还没被取走时返回 released（已交付待取），最后一件取走后自动 done；
    这是正常状态，不是失败，不要重复 release。
    干不了先 report 写明原因，再 --state blocked；中途放弃用 --state open 并 report 说明。
-5. 你查不了台账（任务列表只对管理端开放）；名下单子靠任务消息 + 自己落盘的记录对账。
+5. 普通 agent 可查询公共池与 open Issue（需 `tasks.read` / `issues.read`），但名下活跃任务达到 5 个后不能再自领；对账以本地记录 + 服务端列表为准。
 
 【处理纪律】
 1. 严格按 seq 顺序，不跳过积压；wait 内部已自动 ack 收到的那条。

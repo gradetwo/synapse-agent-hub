@@ -45,7 +45,10 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 - `released`：执行侧已完成、但有交付未被管理侧取走；不是终态。
 - `done`：终态，不再可 claim/release/reassign。
 - `blocked`：执行侧显式阻塞；保留为诊断状态，管理员可通过取回/转派恢复。
-- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`。客户端不要重试终态/待取状态，交给管理端处理。
+- 普通 agent 可先只读发现再 claim：`GET /p/{project}/tasks?limit=50` 只返回 `state=open` 且 `to=null` 的公共任务（需要 `tasks.read`）；`GET /p/{project}/issues?limit=50` 只返回 `status=open` 且 `task_id IS NULL` 的 Issue（需要 `issues.read`）。列表是建议入口，claim 时仍以 DO 状态为准。
+- 任意项目 agent 可 `POST /p/{project}/issues/{id}/claim` 把 open 未指派 Issue 转成自己的任务；reporter 的 `/take` 行为不变。
+- **名下未完成上限**：同一 agent 的活跃任务（`open` 定向、`claimed`、`blocked`，排除 `done`/`released`）达到 5 个后，不能再 claim 公共任务或认领 Issue，返回 `409 agent_task_limit_exceeded`，带 `active_tasks`、`limit`、`task_ids`、`message`。需先完成或释放部分任务。管理员派单不受限，只在响应 `warning` 和 Web 管理台 toast 中提醒。
+- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`；公共任务另有 `agent_task_limit_exceeded`。客户端不要重试终态/待取状态，交给管理端处理。
 
 ## 3. 四个出口（Phase 1 核心）
 
@@ -91,7 +94,7 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 
 | 当前 | 动作 | 结果 | 谁可执行 |
 |---|---|---|---|
-| open | claim | claimed | 目标 agent / 任意 agent（`to=null`） |
+| open | claim | claimed | 目标 agent / 任意 agent（`to=null`，名下活跃 <5） |
 | claimed | release done | done / released | 当前 owner |
 | claimed | release open | open | 当前 owner |
 | open/claimed/released/blocked | close | done | admin |

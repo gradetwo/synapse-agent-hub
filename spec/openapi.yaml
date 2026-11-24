@@ -321,6 +321,16 @@ paths:
                 env: { type: object }
       responses:
         '200': { description: ok }
+  /p/{project}/tasks:
+    get:
+      summary: 普通 agent 查询公共任务池
+      description: 只返回 state=open 且无 to 的任务（未指派、可被任意项目成员认领），按创建时间升序；需要 tasks.read。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200': { description: '返回 tasks[]（task_id/title/body/created_at/updated_at/issue_id），count、limit' }
+        '403': { description: 缺少 tasks.read }
   /p/{project}/tasks/claim:
     post:
       summary: 认领任务（租约默认 12h，心跳续租）
@@ -336,8 +346,8 @@ paths:
               properties:
                 task_id: { type: string }
       responses:
-        '200': { description: 成功，返回 lease_until }
-        '409': { description: 已被他人持有 }
+        '200': { description: 成功，返回 lease_until；已在名下且租约有效时 already=true }
+        '409': { description: locked / already_done / blocked / released_pending_collection / agent_task_limit_exceeded（公共任务且名下未完成≥5，带 active_tasks、limit、task_ids、message） }
   /p/{project}/tasks/release:
     post:
       summary: 交还 / 完成
@@ -408,6 +418,15 @@ paths:
         '404': { description: submission_not_found }
         '413': { description: bundle_too_large / bundle_too_many_files }
   /p/{project}/issues:
+    get:
+      summary: 普通 agent 查询 open 未指派 Issue
+      description: 只返回 status=open 且 task_id IS NULL 的 Issue，按创建时间升序；需要 issues.read。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200': { description: '返回 issues[]（issue_id/title/body/status/priority/labels/reporter/created_at/updated_at），count、limit' }
+        '403': { description: 缺少 issues.read }
     post:
       summary: 上报 Issue（所有 agent 默认可上报）
       description: reporter 由服务端从 token 注入，忽略客户端提交的同名字段。
@@ -439,7 +458,25 @@ paths:
       responses:
         '200': { description: 已创建任务，返回 task_id / assigned_to / task_link }
         '403': { description: not_issue_reporter }
-        '409': { description: issue_not_open / issue_already_dispatched }
+        '409': { description: issue_not_open / issue_already_dispatched / agent_task_limit_exceeded（名下未完成≥5，带 active_tasks、limit、task_ids、message） }
+  /p/{project}/issues/{issueId}/claim:
+    post:
+      summary: 任意项目 agent 认领 open 未指派 Issue
+      description: 等价于把 Issue 转成自己的定向任务；只有 status=open 且 task_id IS NULL 时可认领，成功后任务完成的联动与原 take 相同。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: issueId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task_id: { type: string, maxLength: 64, description: 可选；不填由服务端生成 }
+      responses:
+        '200': { description: 已创建任务，返回 task_id / assigned_to / task_link }
+        '404': { description: issue_not_found }
+        '409': { description: issue_not_open / issue_already_dispatched / agent_task_limit_exceeded }
   /p/{project}/ws-ticket:
     get:
       summary: 用 Bearer 换一次性 WebSocket 票据
@@ -626,7 +663,7 @@ paths:
                 body: { type: string }
                 to: { type: string, nullable: true }
       responses:
-        '200': { description: 任务创建成功 }
+        '200': { description: '任务创建成功；目标 agent 活跃任务>5 时附 warning（agent_task_load_high），仍创建' }
         '409': { description: task_exists }
   /admin/p/{project}/tasks/reclaim:
     post:
@@ -667,7 +704,7 @@ paths:
                 reason: { type: string, maxLength: 240 }
                 force: { type: boolean, default: false, description: 覆盖有效租约时必须显式置 true }
       responses:
-        '200': { description: 已转派，返回 task }
+        '200': { description: '已转派，返回 task；目标活跃任务>5 时附 warning，仍转派' }
         '409': { description: task_done / task_active_lease }
   /admin/p/{project}/issues:
     get:
@@ -741,7 +778,7 @@ paths:
                 title: { type: string }
                 body: { type: string }
       responses:
-        '200': { description: 已派发，返回 task_id / task_link }
+        '200': { description: '已派发，返回 task_id / task_link；目标活跃任务>5 时附 warning，仍派发' }
         '409': { description: issue_not_open / issue_already_dispatched }
   /admin/p/{project}/broadcast:
     post:

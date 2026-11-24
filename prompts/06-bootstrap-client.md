@@ -113,7 +113,7 @@ print(json.dumps({
     "token_sha": token_sha,
     "scopes": [
         "heartbeat", "poll", "publish", "report", "ack",
-        "tasks.claim", "tasks.release",
+        "tasks.claim", "tasks.release", "tasks.read", "issues.read", "issues.report",
         "submissions.read", "submissions.create", "artifact.write", "artifact.read"
     ],
     "machine": machine
@@ -219,7 +219,7 @@ curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" \
   - 干不了或被阻塞：先 report 写明原因，再 `--state blocked`。
   - 中途放弃：`--state open` 把单放回池子，并 report 说明。
   - HTTP 直调同款：`POST $ENDPOINT/p/$PROJECT/tasks/release`，体 `{"task_id":"<task_id>","state":"done"}`。
-- **你查不了台账**：任务列表只对管理端开放，agent 没有自查接口。你名下有哪些单，只能靠收件箱里的任务消息加你自己记的本地记录。处理完一条任务消息，把 `task_id` 与最终状态落盘，别凭记忆。Issue 台账同样没有 agent 查询接口，自己上报的 `issue_id` 必须记进 `my-issues.txt`（见「问题上报」）。
+- **任务发现与自查**：普通 agent 可 `GET $ENDPOINT/p/$PROJECT/tasks?limit=50` 看公共池（`tasks.read`），`GET $ENDPOINT/p/$PROJECT/issues?limit=50` 看 open 且未指派 Issue（`issues.read`）；也可 `POST $ENDPOINT/p/$PROJECT/issues/<issue_id>/claim` 把 Issue 认领成自己的任务。名下未完成（open 定向 / claimed / blocked，排除 done/released）达到 5 个后，公共任务和 Issue 的 claim 都会 409 `agent_task_limit_exceeded`，需先完成或释放部分任务。台账仍以管理端为准；处理完任务消息把 `task_id` 与状态落盘，自己上报的 `issue_id` 记进 `my-issues.txt`。
 
 阶段 6：接任务 / 交付 / 上报 / 空闲自驱 / 再收件
 
