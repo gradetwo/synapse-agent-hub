@@ -36,7 +36,7 @@ export default {
           const pl = JSON.parse(new TextDecoder().decode(b64urlToBytes(p2)));
           out.aud = pl.aud; out.iss = pl.iss; out.email = pl.email; out.exp_ok = pl.exp * 1000 > Date.now();
           out.verified = !!(await verifyAccessJwt(req, env));
-        } catch (e) { out.decode_error = String(e); }
+        } catch { out.decode_error = "invalid_assertion"; }
       }
       out.session = !!(await readSession(req, env));
       out.ok = out.verified || out.session;
@@ -1279,7 +1279,7 @@ async function admin(req: Request, env: Env, url: URL) {
           brief = await publishTaskBrief(env, project, String(b.task_id), String(b.to),
                                          String(b.reason ?? "").slice(0, 240));
         } catch (e: any) {
-          brief = { error: "brief_failed", detail: String(e?.message ?? e) };
+          brief = { error: "brief_failed" };
         }
         d.brief = brief;
       }
@@ -1644,7 +1644,7 @@ async function admin(req: Request, env: Env, url: URL) {
         let taskLink: any = null;
         if (verdict === "approved" && row.task_id) {
           try { taskLink = await settleTaskAfterSubmission(env, project, row.task_id, "approval"); }
-          catch (e: any) { taskLink = { error: "settle_unreachable", detail: String(e?.message ?? e) }; }
+          catch (e: any) { taskLink = { error: "settle_unreachable" }; }
         }
         return json({ ok: true, review_state: verdict, task_id: row.task_id ?? null, task_link: taskLink });
       }
@@ -1669,7 +1669,7 @@ async function admin(req: Request, env: Env, url: URL) {
         try {
           taskLink = await settleTaskAfterSubmission(env, project, row.task_id, "collection");
         } catch (e: any) {
-          taskLink = { error: "settle_unreachable", detail: String(e?.message ?? e) };
+          taskLink = { error: "settle_unreachable" };
         }
       }
       return Response.json({ ok: true, task_link: taskLink });
@@ -2716,8 +2716,13 @@ async function sha256(s: string) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+/** 统一响应序列化：不输出异常堆栈字段（错误响应只留稳定的 error code）。 */
+function jsonBody(value: unknown): string {
+  return JSON.stringify(value, (key, val) =>
+    key === "stack" || key === "stackTrace" ? undefined : val);
+}
 const json = (o: unknown, status = 200) =>
-  new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json", "x-hub": "1" } });
+  new Response(jsonBody(o), { status, headers: { "content-type": "application/json", "x-hub": "1" } });
 const err = (status: number, reason: string) => {
   const r = json({ error: reason }, status);
   if (status === 503) r.headers.set("retry-after", "30");

@@ -38,6 +38,17 @@ class DoError extends Error {
   }
 }
 
+/** 错误详情只透传已知数值字段，绝不把异常对象/消息/堆栈带进响应。 */
+function publicErrorDetail(detail: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!detail || typeof detail !== "object") return out;
+  for (const key of ["size", "cap", "minute_count"]) {
+    const value = (detail as Record<string, unknown>)[key];
+    if (typeof value === "number" && Number.isFinite(value)) out[key] = value;
+  }
+  return out;
+}
+
 function utf8Bytes(text: string): number {
   return new TextEncoder().encode(text).length;
 }
@@ -60,7 +71,7 @@ export class ProjectRoom implements DurableObject {
     try {
       return await this.handle(req);
     } catch (e: any) {
-      if (e instanceof DoError) return json({ error: e.code, ...e.detail }, e.status);
+      if (e instanceof DoError) return json({ error: e.code, ...publicErrorDetail(e.detail) }, e.status);
       throw e;
     }
   }
@@ -1235,7 +1246,7 @@ export class ProjectRoom implements DurableObject {
       } as any);
     } catch (e: any) {
       console.warn("idle reminder manual append failed", project, agentId, e);
-      return json({ error: "idle_remind_failed", detail: String(e?.message ?? e) }, 503);
+      return json({ error: "idle_remind_failed" }, 503);
     }
     try {
       await this.env.DB.prepare(
@@ -1293,6 +1304,12 @@ export class ProjectRoom implements DurableObject {
   }
 }
 
+/** 统一响应序列化：不输出异常堆栈字段（错误响应只留稳定的 error code）。 */
+function jsonBody(value: unknown): string {
+  return JSON.stringify(value, (key, val) =>
+    key === "stack" || key === "stackTrace" ? undefined : val);
+}
+
 function json(o: unknown, status = 200) {
-  return new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
+  return new Response(jsonBody(o), { status, headers: { "content-type": "application/json" } });
 }

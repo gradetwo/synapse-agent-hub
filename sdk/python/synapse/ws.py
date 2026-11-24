@@ -95,6 +95,10 @@ class WSClient:
         raw = _open_socket(host, port, self.timeout)
         if u.scheme in ("wss", "https"):
             ctx = ssl.create_default_context()
+            # 显式拒绝 TLS 1.0/1.1；create_default_context 的默认下限依赖发行版/OpenSSL 配置。
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
             raw = ctx.wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode()
         req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"

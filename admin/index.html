@@ -802,6 +802,11 @@ let token = "";
 try { localStorage.removeItem(KEY); } catch {}
 // 统一转义：服务端数据一律不可信，进 DOM 前先变成实体
 const esc = (v) => String(v).replace(/[&<>"'`]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;","`":"&#96;"}[c]));
+// api() 已经对服务端字符串做过 deepEsc；DOM textContent 不会解码实体，展示前还原一次。
+const decEsc = (v) => String(v == null ? "" : v)
+  .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+  .replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&#96;/g, "`")
+  .replace(/&amp;/g, "&");
 function messageText(m) {
   const pl = (m && m.payload) || {};
   const task = pl.task && typeof pl.task === "object" ? pl.task : {};
@@ -973,7 +978,7 @@ async function loadProjects() {
   allProjects = d.projects || [];
   const sel = $("proj");
   sel.innerHTML = `<option value="*">全部项目</option>` + d.projects.map(p =>
-    `<option value="${p.project}">${p.display_name}</option>`).join("");
+    `<option value="${esc(p.project)}">${esc(decEsc(p.display_name))}</option>`).join("");
   // 记住上次选的项目；否则刷新后总是回到最早创建的项目，容易把新项目里的 agent 看漏。
   let saved = "";
   try { saved = localStorage.getItem("hub.project") || ""; } catch {}
@@ -1005,7 +1010,7 @@ function fillDetailProjects() {
   if (!sel) return;
   const list = (allProjects || []).filter((p) => p.project !== current);
   sel.innerHTML = list.length
-    ? list.map((p) => `<option value="${p.project}">${p.display_name}</option>`).join("")
+    ? list.map((p) => `<option value="${esc(p.project)}">${esc(decEsc(p.display_name))}</option>`).join("")
     : `<option value="">无可选项目</option>`;
   sel.disabled = !list.length;
 }
@@ -1029,6 +1034,254 @@ function activateProject(project) {
   connectLive();
 }
 
+/** 表格行全部用 DOM API 组装：服务端字段只进 textContent / setAttribute，绝不拼进 innerHTML。 */
+function makeTableRow(cellClasses) {
+  const tr = document.createElement("tr");
+  const cells = cellClasses.map((cls) => {
+    const td = document.createElement("td");
+    if (cls) td.className = cls;
+    tr.append(td);
+    return td;
+  });
+  return { tr, cells };
+}
+
+function emptyTableRow(cols, text) {
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = cols;
+  td.className = "empty";
+  td.textContent = text;
+  tr.append(td);
+  return tr;
+}
+
+function setPctCell(td, value, bad) {
+  td.replaceChildren();
+  if (value == null) { td.textContent = "—"; return; }
+  const span = document.createElement("span");
+  if (Number(value) >= bad) span.className = "badv";
+  span.textContent = `${value}%`;
+  td.append(span);
+}
+
+function offlineChip() {
+  const span = document.createElement("span");
+  span.className = "warnv";
+  span.title = "节点最近心跳超过 5 分钟或从未上线";
+  span.textContent = "离线";
+  return span;
+}
+
+function agentRow(a) {
+  const w = a.work || {}, l = a.load || {}, dk = (l.disk || [{}])[0];
+  const cls = a.alive === "alive" ? "alive" : a.alive === "late" ? "late" : "offline";
+  const projectName = (allProjects.find((p) => p.project === a.project)?.display_name) || a.project;
+  const { tr, cells } = makeTableRow(["", "muted", "", "", "num", "num", "num", "mono", "muted", ""]);
+  tr.classList.add("clickable");
+  if ((w.state || "idle") === "idle") tr.classList.add("idle");
+  tr.dataset.agent = String(a.agent_id ?? "");
+  tr.dataset.project = String(a.project ?? "");
+  tr.dataset.alive = String(a.alive ?? "offline");
+  tr.dataset.work = a.alive === "alive" ? String(w.state || "idle") : "";
+
+  const dot = document.createElement("span");
+  dot.className = `dot ${cls}`;
+  cells[0].append(dot);
+  const idText = document.createElement("span");
+  idText.textContent = decEsc(a.agent_id);
+  cells[0].append(idText);
+  if (a.sdk_outdated) {
+    const badge = document.createElement("span");
+    badge.className = "badge released";
+    badge.textContent = "旧版";
+    badge.title = `当前 SDK ${decEsc(a.sdk_version || "未上报")}，最新 ${decEsc(a.sdk_latest || "未知")}`;
+    cells[0].append(" ", badge);
+  }
+  cells[1].textContent = decEsc(projectName);
+  cells[2].textContent = a.alive === "alive" ? "忙" : a.alive === "late" ? "迟到" : "失联";
+  cells[3].textContent = a.alive === "alive" ? decEsc(w.phase || w.state || "—") : "—";
+  setPctCell(cells[4], l.cpu_pct, 85);
+  cells[5].textContent = l.mem_used_mb != null ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
+  if (dk && dk.used_pct != null) {
+    setPctCell(cells[6], dk.used_pct, 90);
+    if (dk.free_gb != null) {
+      const free = document.createElement("span");
+      free.className = "muted";
+      free.textContent = `${dk.free_gb}G`;
+      cells[6].append(" ", free);
+    }
+  } else {
+    cells[6].textContent = "—";
+  }
+  cells[7].textContent = decEsc((a.env || {}).git_head || "—");
+  cells[8].textContent = `${ago(a.age_s)}前`;
+
+  cells[9].style.whiteSpace = "nowrap";
+  const detail = document.createElement("button");
+  detail.type = "button";
+  detail.className = "ghost mini";
+  detail.textContent = "详情";
+  detail.dataset.detail = String(a.agent_id ?? "");
+  detail.dataset.project = String(a.project ?? "");
+  const revoke = document.createElement("button");
+  revoke.type = "button";
+  revoke.className = "ghost mini";
+  revoke.textContent = "×";
+  revoke.title = "吊销该 agent 凭据";
+  revoke.dataset.revoke = String(a.agent_id ?? "");
+  revoke.dataset.project = String(a.project ?? "");
+  cells[9].append(detail, document.createTextNode(" "), revoke);
+  return tr;
+}
+
+function fillAgentOptions(select, selected, allowOffline = false) {
+  select.replaceChildren();
+  select.add(new Option("不指派（公共池）", ""));
+  for (const a of (window._agents || [])) {
+    if (current && current !== "*" && a.project !== current) continue;
+    const mark = a.alive === "alive" ? "" : a.alive === "late" ? "（迟到）" : "（离线）";
+    const isCurrent = a.agent_id === selected;
+    const opt = new Option(`${decEsc(a.agent_id)}${mark}`, decEsc(a.agent_id));
+    opt.selected = isCurrent && !(a.alive !== "alive" && !allowOffline);
+    opt.disabled = a.alive !== "alive" && (!allowOffline || isCurrent);
+    select.add(opt);
+  }
+}
+
+function taskRow(t, isAll) {
+  const id = String(t.task_id || t.id || "");
+  const st = String(t.state || "open");
+  const assigned = String(t.to || t.owner || "");
+  const { tr, cells } = makeTableRow(["", "", "", "", "num", "num", "muted", ""]);
+  tr.dataset.taskId = id;
+  tr.dataset.state = st;
+  tr.dataset.stale = taskIsStale(t) ? "1" : "0";
+  tr.dataset.review = String(Number(t.pending_review ?? 0));
+  tr.dataset.project = String(t.project || current);
+
+  const proj = document.createElement("span");
+  proj.className = "muted";
+  proj.style.fontSize = "10px";
+  const br = document.createElement("br");
+  if (isAll) {
+    proj.textContent = decEsc(t.project || "—");
+  } else {
+    proj.hidden = true;
+    br.hidden = true;
+  }
+  const idSpan = document.createElement("span");
+  idSpan.className = "mono";
+  idSpan.textContent = decEsc(id);
+  const title = document.createElement("div");
+  title.className = "muted";
+  title.style.whiteSpace = "normal";
+  title.style.maxWidth = "240px";
+  title.textContent = decEsc(t.title || "");
+  cells[0].append(proj, br, idSpan, title);
+
+  const stateBadge = document.createElement("span");
+  const known = ["open", "claimed", "released", "blocked", "done"];
+  stateBadge.className = `badge ${known.includes(st) ? st : "open"}`;
+  stateBadge.textContent = taskStateLabel(st);
+  cells[1].append(stateBadge);
+
+  if (t.owner) {
+    const owner = document.createElement("span");
+    owner.className = "mono";
+    owner.textContent = decEsc(t.owner);
+    cells[2].append(owner);
+    if (t.owner_online === false) cells[2].append(" ", offlineChip());
+  } else if (t.to) {
+    const arrow = document.createElement("span");
+    arrow.className = "muted";
+    arrow.textContent = "→ ";
+    const to = document.createElement("span");
+    to.className = "mono";
+    to.textContent = decEsc(t.to);
+    cells[2].append(arrow, to);
+    if (t.to_online === false) cells[2].append(" ", offlineChip());
+  } else {
+    cells[2].textContent = "—";
+  }
+
+  const lease = taskLease(t);
+  const leaseSpan = document.createElement("span");
+  if (lease.cls) leaseSpan.className = lease.cls;
+  leaseSpan.textContent = lease.text;
+  cells[3].append(leaseSpan);
+
+  const pending = Number(t.pending_submissions ?? 0);
+  if (pending > 0) {
+    if (isAll) {
+      const warn = document.createElement("span");
+      warn.className = "warnv";
+      warn.textContent = String(pending);
+      cells[4].append(warn);
+    } else {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ghost mini";
+      btn.dataset.gotoDelivery = "1";
+      btn.title = "去交付箱取走";
+      btn.textContent = String(pending);
+      cells[4].append(btn);
+    }
+  } else {
+    cells[4].textContent = "—";
+  }
+
+  const pendingReview = Number(t.pending_review ?? 0);
+  if (pendingReview > 0) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "ghost mini";
+    btn.dataset.gotoDelivery = "1";
+    btn.title = "交付箱里还有待裁决交付";
+    btn.textContent = String(pendingReview);
+    cells[5].append(btn);
+  } else {
+    cells[5].textContent = "—";
+  }
+  cells[6].textContent = t.updated_at ? `${ago((Date.now() - t.updated_at) / 1000)}前` : "—";
+
+  if (isAll) {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "切到项目";
+    cells[7].append(hint);
+  } else if (st === "done") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "已结";
+    cells[7].append(hint);
+  } else {
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "ghost mini";
+    close.dataset.taskClose = id;
+    close.textContent = "完成";
+    const reclaim = document.createElement("button");
+    reclaim.type = "button";
+    reclaim.className = "ghost mini";
+    reclaim.dataset.taskReclaim = id;
+    reclaim.textContent = "取回";
+    const select = document.createElement("select");
+    select.className = "mini taskRow";
+    select.dataset.taskAssignee = id;
+    fillAgentOptions(select, assigned, true);
+    const reassign = document.createElement("button");
+    reassign.type = "button";
+    reassign.className = "ghost mini";
+    reassign.dataset.taskReassign = id;
+    reassign.textContent = "转派";
+    cells[7].append(close, document.createTextNode(" "), reclaim, document.createTextNode(" "),
+                    select, document.createTextNode(" "), reassign);
+  }
+  cells[7].style.whiteSpace = "nowrap";
+  return tr;
+}
+
 async function loadAgents() {
   const project = current;
   const isAll = project === "*";
@@ -1039,31 +1292,7 @@ async function loadAgents() {
   const outdated = rows.filter(a => a.sdk_outdated).length;
   $("agentStat").textContent = `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}` +
     (outdated ? ` · ${outdated} 个旧版 SDK` : "");
-  $("agents").innerHTML = rows.length ? rows.map(a => {
-    const w = a.work || {}, l = a.load || {}, dk = (l.disk || [{}])[0];
-    const cls = a.alive === "alive" ? "alive" : a.alive === "late" ? "late" : "offline";
-    const idle = (w.state || "idle") === "idle" ? " class=\"idle\"" : "";
-    // 失联的 agent 只保留最后上报的 work，不能当作"现在正在忙"
-    const doing = a.alive === "alive" ? (w.phase || w.state || "—") : "—";
-    const mem = (l.mem_used_mb != null) ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
-    const projectName = (allProjects.find((p) => p.project === a.project)?.display_name) || a.project;
-    return `<tr${idle} class="clickable" data-agent="${a.agent_id}" data-project="${a.project}" data-alive="${a.alive}" data-work="${a.alive === "alive" ? (w.state || "idle") : ""}">
-      <td><span class="dot ${cls}"></span>${a.agent_id}${a.sdk_outdated
-        ? ` <span class="badge released" title="当前 SDK ${esc(a.sdk_version || "未上报")}，最新 ${esc(a.sdk_latest || "未知")}">旧版</span>` : ""}</td>
-      <td class="muted">${projectName}</td>
-      <td>${a.alive === "alive" ? "忙" : a.alive === "late" ? "迟到" : "失联"}</td>
-      <td>${doing}</td>
-      <td class="num">${pct(l.cpu_pct, 85)}</td>
-      <td class="num">${mem}</td>
-      <td class="num">${dk && dk.used_pct != null ? pct(dk.used_pct, 90) + (dk.free_gb != null ? ` <span class="muted">${dk.free_gb}G</span>` : "") : "—"}</td>
-      <td class="mono">${(a.env || {}).git_head || "—"}</td>
-      <td class="muted">${ago(a.age_s)}前</td>
-      <td style="white-space:nowrap">
-        <button class="ghost mini" data-detail="${a.agent_id}" data-project="${a.project}">详情</button>
-        <button class="ghost mini" data-revoke="${a.agent_id}" data-project="${a.project}" title="吊销该 agent 凭据">×</button>
-      </td>
-    </tr>`;
-  }).join("") : `<tr><td colspan="10" class="empty">还没有 agent 接入</td></tr>`;
+  $("agents").replaceChildren(...(rows.length ? rows.map(agentRow) : [emptyTableRow(10, "还没有 agent 接入")]));
   window._agents = rows;
   bindBulk();
   reapplyFilters();
@@ -1080,18 +1309,22 @@ function taskAgentOptions(selected, allowOffline = false) {
     // 行内下拉允许把“当前离线 owner”显示成选中态，但不能让它再次被提交给后端。
     const off = a.alive !== "alive" && (!allowOffline || isCurrent);
     const picked = isCurrent && !(a.alive !== "alive" && !allowOffline);
-    opts.push(`<option value="${a.agent_id}"${picked ? " selected" : ""}${off ? " disabled" : ""}>${a.agent_id}${mark}</option>`);
+    opts.push(`<option value="${esc(decEsc(a.agent_id))}"${picked ? " selected" : ""}${off ? " disabled" : ""}>${esc(decEsc(a.agent_id))}${mark}</option>`);
   }
   return opts.join("");
 }
 
 function taskLease(t) {
-  if (t.state !== "claimed") return t.lease_left_ms > 0 && t.owner ? `${Math.ceil(t.lease_left_ms / 1000)}s` : "—";
-  if (!t.owner) return "—";
-  if (t.lease_left_ms <= 0) return `<span class="badv">已过期</span>`;
+  if (t.state !== "claimed") return {
+    text: t.lease_left_ms > 0 && t.owner ? `${Math.ceil(t.lease_left_ms / 1000)}s` : "—",
+    cls: "",
+  };
+  if (!t.owner) return { text: "—", cls: "" };
+  if (t.lease_left_ms <= 0) return { text: "已过期", cls: "badv" };
   const s = Math.ceil(t.lease_left_ms / 1000);
-  return t.owner_online === false ? `<span class="badv">节点离线</span>` :
-    `<span class="${s <= 60 ? "warnv" : ""}">${s}s</span>`;
+  return t.owner_online === false
+    ? { text: "节点离线", cls: "badv" }
+    : { text: `${s}s`, cls: s <= 60 ? "warnv" : "" };
 }
 
 function taskStateLabel(s) {
@@ -1139,39 +1372,8 @@ async function loadTasks() {
   const keepTo = $("taskTo").value;
   $("taskTo").innerHTML = taskAgentOptions(keepTo);
   if (keepTo) $("taskTo").value = keepTo;
-  $("tasks").innerHTML = rows.length ? rows.map((t) => {
-    const id = t.task_id || t.id || "";
-    const st = t.state || "open";
-    const offline = `<span class="warnv" title="节点最近心跳超过 5 分钟或从未上线">离线</span>`;
-    const owner = t.owner
-      ? `<span class="mono">${t.owner}</span>${t.owner_online === false ? ` ${offline}` : ""}`
-      : (t.to ? `<span class="muted">→ <span class="mono">${t.to}</span></span>${t.to_online === false ? ` ${offline}` : ""}` : "—");
-    const pending = Number(t.pending_submissions ?? 0);
-    const pendingReview = Number(t.pending_review ?? 0);
-    const assigned = t.to || t.owner || "";
-    const stale = taskIsStale(t);
-    const projectTag = isAll ? `<span class="muted" style="font-size:10px">${t.project || "—"}</span><br>` : "";
-    const acts = isAll ? `<span class="muted">切到项目</span>` : (st === "done" ? `<span class="muted">已结</span>` : `
-      <button class="ghost mini" data-task-close="${id}">完成</button>
-      <button class="ghost mini" data-task-reclaim="${id}">取回</button>
-      <select class="mini taskRow" data-task-assignee="${id}">${taskAgentOptions(assigned, true)}</select>
-      <button class="ghost mini" data-task-reassign="${id}">转派</button>`);
-    const pendingCell = pending > 0
-      ? (isAll ? `<span class="warnv">${pending}</span>` : `<button class="ghost mini" data-goto-delivery="1" title="去交付箱取走">${pending}</button>`) : "—";
-    const reviewCell = pendingReview > 0
-      ? `<button class="ghost mini" data-goto-delivery="1" title="交付箱里还有待裁决交付">${pendingReview}</button>`
-      : `<span class="muted">—</span>`;
-    return `<tr data-task-id="${id}" data-state="${st}" data-stale="${stale ? 1 : 0}" data-review="${pendingReview}" data-project="${t.project || current}">
-      <td>${projectTag}<span class="mono">${id}</span><div class="muted" style="white-space:normal;max-width:240px">${t.title || ""}</div></td>
-      <td><span class="badge ${st}">${taskStateLabel(st)}</span></td>
-      <td>${owner}</td>
-      <td>${taskLease(t)}</td>
-      <td class="num">${pendingCell}</td>
-      <td class="num">${reviewCell}</td>
-      <td class="muted">${t.updated_at ? ago((Date.now() - t.updated_at) / 1000) + "前" : "—"}</td>
-      <td style="white-space:nowrap">${acts}</td>
-    </tr>`;
-  }).join("") : `<tr><td colspan="8" class="empty">${isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件"}</td></tr>`;
+  const emptyTaskText = isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件";
+  $("tasks").replaceChildren(...(rows.length ? rows.map((t) => taskRow(t, isAll)) : [emptyTableRow(8, emptyTaskText)]));
   reapplyFilters();
   renderDashboard();
   syncBulkAvailability();
@@ -1601,8 +1803,8 @@ async function loadEnr() {
 
 function renderSndWho(rows) {
   $("sndWho").innerHTML = rows.length ? rows.map((a) => `
-    <label class="whoItem"><input type="checkbox" value="${a.agent_id}">
-      <span class="dot ${a.alive === "alive" ? "alive" : "offline"}"></span>${a.agent_id}
+    <label class="whoItem"><input type="checkbox" value="${esc(decEsc(a.agent_id))}">
+      <span class="dot ${a.alive === "alive" ? "alive" : "offline"}"></span>${esc(decEsc(a.agent_id))}
       <span class="muted">${a.alive === "alive" ? "在线" : "失联"}</span></label>`).join("")
     : '<span class="muted">当前项目还没有 agent</span>';
 }

@@ -25,6 +25,13 @@ function fetchT(url: string, init: any = {}) {
   return fetch(url, { ...init, signal: AbortSignal.timeout(init.timeoutMs ?? 30_000) });
 }
 
+/** 去掉末尾的 `/`，不用 `/+$` 正则，避免端点字符串触发 ReDoS 扫描。 */
+function trimTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47) end--;
+  return s.slice(0, end);
+}
+
 export class Client {
   private opts: Required<ClientOptions>;
   private work: Work = { state: "idle" };
@@ -50,7 +57,7 @@ export class Client {
     const agentId = opts.agentId ?? `agent-${Math.random().toString(16).slice(2, 8)}`;
     const prof = detectProfile(agentId);
     mkdirSync(stateDir, { recursive: true });
-    const cfg = { endpoint: opts.endpoint.replace(/\/+$/, ""), project: opts.project, agent_id: agentId,
+    const cfg = { endpoint: trimTrailingSlashes(opts.endpoint), project: opts.project, agent_id: agentId,
                   token: opts.token, heartbeat_s: prof.heartbeatS, state_dir: stateDir };
     const file = join(stateDir, "config.json");
     writeFileSync(file, JSON.stringify(cfg, null, 2), { mode: 0o600 });
