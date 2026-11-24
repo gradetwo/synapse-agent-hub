@@ -215,6 +215,88 @@ if (location.search.includes("reset=1")) {
   .scopeGrid label .cap{display:inline;margin:0;font-size:10.5px;text-transform:none;letter-spacing:0}
   .scopeGrid input{width:auto;height:14px;min-height:0;margin:0;flex:0 0 auto}
   .scopeHint{font-size:11px;color:#7d8798}
+  /* 注册审批：权限折叠成 chip，动作只留 ✓/✕，Agent ID 可就地改 */
+  .enrIdInput{width:148px;min-width:122px;padding:5px 8px;font:12.5px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;box-sizing:border-box}
+  .enrIdHint{display:block;font-size:10px;color:#7d8798;margin-top:2px}
+  .scopeDetails{display:inline-block;max-width:330px;vertical-align:top}
+  .scopeDetails summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;color:#cbd5e1}
+  .scopeDetails summary::-webkit-details-marker{display:none}
+  .scopeDetails summary .lead{color:#7d8798}
+  .scopeDetails[open] summary{color:#e6edf5}
+  .scopeChips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;max-width:330px}
+  .scopeChip{font-size:11px;line-height:1.5;padding:2px 6px;border:1px solid #263343;border-radius:999px;background:#151d27;color:#9fb0c3;white-space:nowrap}
+  .scopeChip.raw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .enrActions{display:flex;gap:6px}
+  .actIcon{width:32px;height:32px;min-width:32px!important;padding:0;font-size:17px;line-height:1;border-radius:8px;
+    display:inline-flex;align-items:center;justify-content:center}
+  .actIcon.ok{color:#56d364;border-color:#2f6a43;background:#13251a}
+  .actIcon.ok:hover{background:#1a3522}
+  .actIcon.no{color:#ff7b72;border-color:#6b2f32;background:#261517}
+  .actIcon.no:hover{background:#351c1e}
+  .enrTableWrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:720px){
+    /* 手机端审批不再横向滚表格：每条申请变成一张小块，✓/✕ 永远在右侧可见 */
+    .enrTable{display:block;width:100%}
+    .enrTable thead{display:none}
+    .enrTableWrap{overflow:visible}
+    #enr{display:grid;gap:8px}
+    #enr tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;
+      padding:10px;border:1px solid #202936;border-radius:10px;background:#11161d}
+    #enr td{padding:0;border:0;display:block}
+    #enr td:nth-child(1){grid-column:1;grid-row:1}
+    #enr td:nth-child(5){grid-column:2;grid-row:1;align-self:center}
+    #enr td:nth-child(2){grid-column:1/-1;grid-row:2}
+    #enr td:nth-child(3){grid-column:1/-1;grid-row:3}
+    #enr td:nth-child(4){grid-column:1/-1;grid-row:4;font-size:11px}
+    #enr tr td.empty{grid-column:1/-1}
+    .enrIdInput{width:100%;min-width:0}
+    .scopeDetails{max-width:100%;width:100%}
+    .scopeChips{max-width:100%}
+    .enrActions{justify-content:flex-end}
+  }
+  /* Agent 详情：工作概览与可视化 */
+  .sheetHead #dName{min-width:0;overflow-wrap:anywhere}
+  .sheetHead #dMeta{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .agentStats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin:2px 0 10px}
+  .agentStat{background:#151b23;border:1px solid #222c38;border-radius:9px;padding:8px 9px;min-width:0}
+  .agentStat .k{font-size:10.5px;color:#8b98a9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agentStat .v{font-size:19px;font-weight:700;color:#e6edf5;line-height:1.2;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agentStat .s{font-size:10.5px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agentStat.ok .v{color:#7ee787}.agentStat.warn .v{color:#ffa657}.agentStat.accent .v{color:#79c0ff}
+  .agentViz{display:grid;grid-template-columns:1.02fr 1fr;gap:10px}
+  .vizBox{background:#11161d;border:1px solid #202936;border-radius:9px;padding:9px 10px;min-width:0}
+  .vizBox .cap{margin-bottom:5px}
+  .donut{height:112px;background:transparent;border:0;border-radius:0}
+  .vizLegend{display:flex;flex-wrap:wrap;gap:5px 9px;font-size:11px;color:#9aa7b7;margin-top:4px}
+  .vizLegend span{display:inline-flex;align-items:center;gap:4px}
+  .vizDot{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .workBars{display:grid;gap:8px;padding:3px 0}
+  .workBar .t{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;color:#9aa7b7}
+  .workBar .t b{color:#e6edf5;font-size:12px}
+  .barTrack{height:7px;border-radius:999px;background:#1c2530;overflow:hidden;margin-top:4px}
+  .barFill{height:100%;border-radius:999px;background:#4c8dff}
+  .workList{max-height:300px;overflow:auto;-webkit-overflow-scrolling:touch}
+  .workList .workRow{display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid #18212b;font-size:12.5px}
+  .workList .workRow:last-child{border-bottom:0}
+  .workList .tid{font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#8fa6c0;white-space:nowrap}
+  .workList .wtitle{color:#d7e0ea;flex:1;min-width:120px;overflow-wrap:anywhere}
+  .workList .when{font-size:11px;color:#7d8798;margin-left:auto;white-space:nowrap}
+  .permDetails{border:1px solid #202936;border-radius:9px;background:#0f151c;padding:8px 10px;margin-top:10px}
+  .permDetails summary{cursor:pointer;font-size:12.5px;color:#9fb0c3;list-style:none;display:flex;align-items:center;gap:8px}
+  .permDetails summary::-webkit-details-marker{display:none}
+  .permDetails[open] summary{color:#e6edf5;margin-bottom:6px}
+  .permDetails summary .lead{color:#7d8798;font-size:11px}
+  #dPermSummary{font-size:11px;color:#7d8798}
+  @media(max-width:720px){
+    .scopeGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+    .scopeGrid label{min-width:0;flex-wrap:wrap}
+    .agentStats{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .agentStat .v{font-size:17px}
+    .agentViz{grid-template-columns:1fr}
+    .donut{height:96px}
+    .workList .when{margin-left:0}
+  }
+
   .cap{font-size:11px;color:#7d8798;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
   .list{font-size:12.5px}
   .list .row{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid #151b23}
@@ -414,10 +496,13 @@ if (location.search.includes("reset=1")) {
   </div>
   <div class="card">
     <h2>注册审批 <span class="muted" id="enrStat"></span></h2>
-    <table>
-      <thead><tr><th>Agent</th><th>项目</th><th>申请权限</th><th>时间</th><th></th></tr></thead>
-      <tbody id="enr"><tr><td colspan="5" class="empty">无待审申请</td></tr></tbody>
-    </table>
+    <div class="scopeHint" style="margin:-2px 0 8px">批准前可直接修改 Agent ID；批准后新 ID 会通过注册轮询下发给节点。</div>
+    <div class="enrTableWrap">
+      <table class="enrTable">
+        <thead><tr><th>Agent ID <span class="scopeHint">可改</span></th><th>项目</th><th>申请权限</th><th>时间</th><th>操作</th></tr></thead>
+        <tbody id="enr"><tr><td colspan="5" class="empty">无待审申请</td></tr></tbody>
+      </table>
+    </div>
   </div>
   <div class="card">
     <h2>签发 token <span class="muted">新 agent / 管理身份</span></h2>
@@ -639,6 +724,25 @@ if (location.search.includes("reset=1")) {
     <div class="sheetHead"><b id="dName">agent</b><span class="muted" id="dMeta"></span>
       <button class="ghost iconBtn" id="dClose" aria-label="关闭" title="关闭">×</button></div>
     <div class="sheetBody">
+    <div class="agentStats" id="dStats"></div>
+    <div class="agentViz">
+      <div class="vizBox">
+        <div class="cap">任务构成 <span class="scopeHint" id="dTaskTotal"></span></div>
+        <canvas id="dTaskDonut" class="donut" aria-label="任务状态构成"></canvas>
+        <div class="vizLegend" id="dTaskLegend"></div>
+      </div>
+      <div class="vizBox">
+        <div class="cap">完成与质量</div>
+        <div class="workBars" id="dWorkBars"></div>
+      </div>
+    </div>
+    <div class="cap" style="margin-top:12px">最近任务 <span class="scopeHint">owner / 定向 / 释放记录，按更新时间</span></div>
+    <div id="dTasks" class="workList list"></div>
+    <details class="permDetails" id="dIssueBox">
+      <summary><span>最近 Issue</span><span id="dIssueSummary" class="scopeHint"></span><span class="lead">展开</span></summary>
+      <div id="dIssues" class="workList list"></div>
+    </details>
+    <div class="cap" style="margin-top:12px">资源趋势 <span class="scopeHint">最近 120 个采样</span></div>
     <div class="charts">
       <div><div class="cap">CPU %</div><canvas id="cCpu"></canvas></div>
       <div><div class="cap">内存 MB</div><canvas id="cMem"></canvas></div>
@@ -649,40 +753,42 @@ if (location.search.includes("reset=1")) {
       <button class="ghost" data-dq="status" data-da="__AGENT__">汇报状态</button>
       <button class="ghost" data-dq="pause" data-da="__AGENT__">暂停任务</button>
     </div>
-    <div class="cap" style="margin-top:12px">权限</div>
-    <div class="permBar">
-      <span id="dRole" class="permRole">—</span>
-      <label class="permTtl">有效期
-        <select id="dTtl">
-          <option value="7">7 天</option>
-          <option value="30" selected>30 天</option>
-          <option value="0">不限期</option>
-        </select>
-      </label>
-      <div class="permActions">
-        <button id="dReissue">生成新 token</button>
-        <button class="primary" id="dGrant">授予管理</button>
-        <button id="dDemote">收回管理</button>
-        <button id="dRevoke">吊销 token</button>
+    <details class="permDetails" id="dPermDetails">
+      <summary><span>权限与 token 管理</span><span id="dPermSummary" class="muted">—</span><span class="lead">展开</span></summary>
+      <div class="permBar">
+        <span id="dRole" class="permRole">—</span>
+        <label class="permTtl">有效期
+          <select id="dTtl">
+            <option value="7">7 天</option>
+            <option value="30" selected>30 天</option>
+            <option value="0">不限期</option>
+          </select>
+        </label>
+        <div class="permActions">
+          <button id="dReissue">生成新 token</button>
+          <button class="primary" id="dGrant">授予管理</button>
+          <button id="dDemote">收回管理</button>
+          <button id="dRevoke">吊销 token</button>
+        </div>
       </div>
-    </div>
-    <div class="cap" style="margin-top:10px">细粒度权限 <span class="scopeHint">只改权限，不重签 token</span></div>
-    <div id="dScopes" class="scopeGrid"></div>
-    <div class="permBar" style="margin-top:8px">
-      <span class="scopeHint">勾选后点保存；对同一 agent 的所有活跃 token 生效。</span>
-      <div class="permActions"><button class="primary" id="dSaveScopes">保存权限</button></div>
-    </div>
-    <div class="cap" style="margin-top:10px">项目参与</div>
-    <div class="permBar">
-      <label class="permTtl">目标项目
-        <select id="dMoveTo"></select>
-      </label>
-      <div class="permActions">
-        <button id="dJoinProject">加入项目</button>
-        <button id="dMoveProject">迁移项目</button>
+      <div class="cap" style="margin-top:10px">细粒度权限 <span class="scopeHint">只改权限，不重签 token</span></div>
+      <div id="dScopes" class="scopeGrid"></div>
+      <div class="permBar" style="margin-top:8px">
+        <span class="scopeHint">勾选后点保存；对同一 agent 的所有活跃 token 生效。</span>
+        <div class="permActions"><button class="primary" id="dSaveScopes">保存权限</button></div>
       </div>
-    </div>
-    <div id="dToken" class="list"></div>
+      <div class="cap" style="margin-top:10px">项目参与</div>
+      <div class="permBar">
+        <label class="permTtl">目标项目
+          <select id="dMoveTo"></select>
+        </label>
+        <div class="permActions">
+          <button id="dJoinProject">加入项目</button>
+          <button id="dMoveProject">迁移项目</button>
+        </div>
+      </div>
+      <div id="dToken" class="list"></div>
+    </details>
     <div class="cap" style="margin-top:12px">最近消息</div><div id="dMsgs" class="list"></div>
     <div class="cap" style="margin-top:12px">提交历史</div><div id="dSubs" class="list"></div>
     </div>
@@ -1417,22 +1523,59 @@ async function loadEnr() {
   BADGES.access = rows.length;
   updateBadges();
   if (!rows.length) { $("enr").innerHTML = `<tr><td colspan="5" class="empty">无待审申请</td></tr>`; return; }
+  const scopeCell = (e) => {
+    const scopes = scopeList(e.scopes);
+    if (!scopes.length) return '<span class="muted">无额外权限</span>';
+    const labels = scopes.map((s) => SCOPE_LABELS[s] || s);
+    const head = labels.slice(0, 3).join(" / ");
+    const more = labels.length > 3 ? ` +${labels.length - 3}` : "";
+    return `<details class="scopeDetails"><summary><span class="lead">▸</span><span class="lead">${scopes.length} 项</span>
+      <span>${esc(head)}${esc(more)}</span></summary>
+      <div class="scopeChips">${scopes.map((s) => `<span class="scopeChip${SCOPE_LABELS[s] ? "" : " raw"}" title="${esc(s)}">${esc(SCOPE_LABELS[s] || s)}</span>`).join("")}</div>
+    </details>`;
+  };
   $("enr").innerHTML = rows.map((e) => `
-    <tr><td>${e.agent_id}</td><td class="muted">${e.project}</td>
-      <td class="muted">${e.scopes}</td>
-      <td class="muted">${new Date(e.created_at).toLocaleString()}</td>
-      <td><button class="mini primary" data-approve="${e.id}" data-project="${e.project}">批准</button>
-          <button class="mini" data-reject="${e.id}">拒绝</button></td></tr>`).join("");
+    <tr><td>
+      <input class="enrIdInput" data-enr-id="${e.id}" value="${esc(e.agent_id)}"
+        data-original="${esc(e.agent_id)}" maxlength="40" spellcheck="false" aria-label="批准后的 Agent ID">
+      <span class="enrIdHint">批准前可改</span>
+    </td><td><span class="badge">${esc(e.project)}</span></td>
+      <td>${scopeCell(e)}</td>
+      <td class="muted">${new Date(e.created_at).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+      <td><div class="enrActions">
+        <button class="actIcon ok" data-approve="${e.id}" data-project="${e.project}" title="批准" aria-label="批准">✓</button>
+        <button class="actIcon no" data-reject="${e.id}" title="拒绝" aria-label="拒绝">✕</button>
+      </div></td></tr>`).join("");
   $("enr").querySelectorAll("[data-approve]").forEach((b) => b.onclick = async () => {
     const project = b.dataset.project;
-    await api(`/admin/enrollments/${b.dataset.approve}/approve`, "POST", {});
-    // 批准的是别的项目时，当前名册还停在旧项目，会误以为 agent 没上线。
-    if (project) activateProject(project);
-    await refresh();
+    const input = b.closest("tr").querySelector(".enrIdInput");
+    const agentId = (input?.value || "").trim();
+    if (!/^[A-Za-z0-9._-]{2,40}$/.test(agentId)) {
+      showToast("Agent ID 不合法：需 2-40 位字母/数字/点/下划线/短横线", 8000);
+      input?.focus();
+      return;
+    }
+    b.disabled = true;
+    try {
+      const r = await api(`/admin/enrollments/${b.dataset.approve}/approve`, "POST", { agent_id: agentId });
+      // 批准的是别的项目时，当前名册还停在旧项目，会误以为 agent 没上线。
+      if (project) activateProject(project);
+      showToast(r?.renamed ? `已批准，Agent ID 改为 ${r.agent_id}，将随注册轮询下发` : `已批准 ${r?.agent_id || agentId}`, 7000);
+      await refresh();
+    } catch (e) {
+      showToast(`批准失败：${e.message}`, 9000);
+      b.disabled = false;
+    }
   });
   $("enr").querySelectorAll("[data-reject]").forEach((b) => b.onclick = async () => {
-    await api(`/admin/enrollments/${b.dataset.reject}/reject`, "POST", {});
-    await refresh();
+    b.disabled = true;
+    try {
+      await api(`/admin/enrollments/${b.dataset.reject}/reject`, "POST", {});
+      await refresh();
+    } catch (e) {
+      showToast(`拒绝失败：${e.message}`, 8000);
+      b.disabled = false;
+    }
   });
 }
 
@@ -1740,6 +1883,118 @@ function drawLine(cv, vals, color) {
   }
 }
 
+const TASK_COLORS = { open: "#8b98a9", claimed: "#6aa9ff", released: "#ffd58a", blocked: "#ff9b9b", done: "#86d99e" };
+function drawDonut(cv, parts) {
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 240, h = cv.clientHeight || 112;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
+  const total = parts.reduce((n, p) => n + Math.max(0, p.value), 0);
+  const cx = w / 2, cy = h / 2, r = Math.max(20, Math.min(w / 2 - 18, h / 2 - 8));
+  if (!total) {
+    g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.strokeStyle = "#27313d"; g.lineWidth = 9; g.stroke();
+    g.fillStyle = "#7d8798"; g.font = "11px system-ui,sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText("暂无任务", cx, cy);
+    return;
+  }
+  let a = -Math.PI / 2;
+  for (const p of parts) {
+    const v = Math.max(0, p.value);
+    if (!v) continue;
+    const sweep = (v / total) * Math.PI * 2;
+    g.beginPath(); g.arc(cx, cy, r, a + 0.015, a + sweep - 0.015);
+    g.strokeStyle = p.color; g.lineWidth = 9; g.stroke();
+    a += sweep;
+  }
+  g.fillStyle = "#e6edf5"; g.font = "700 17px system-ui,sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(String(total), cx, cy - 1);
+  g.fillStyle = "#7d8798"; g.font = "10px system-ui,sans-serif";
+  g.fillText("任务", cx, cy + 15);
+}
+
+function fmtLast(ms) {
+  if (!ms) return "—";
+  const age = Math.max(0, Date.now() - Number(ms));
+  return age < 86400_000 ? ago(age / 1000) + "前" : new Date(Number(ms)).toLocaleDateString();
+}
+
+function renderAgentWork(d, live) {
+  const st = d.stats || {};
+  const n = (x) => Number(x ?? 0);
+  const total = n(st.tasks_total), done = n(st.tasks_done), blocked = n(st.tasks_blocked);
+  const claimed = n(st.tasks_claimed), released = n(st.tasks_released);
+  const subTotal = n(st.submissions_total), approved = n(st.submissions_approved);
+  const rejected = n(st.submissions_rejected), pending = n(st.submissions_pending);
+  const issueTotal = n(st.issues_total), issueOpen = n(st.issues_open);
+  const issueClosed = n(st.issues_closed) + n(st.issues_merged);
+  const rate = total ? Math.round(done / total * 100) : 0;
+  const alive = live?.alive;
+  const statusText = alive === "alive" ? "在线" : alive === "late" ? "迟到" : alive === "offline" ? "离线" : "未上报";
+  const lastMs = Number(st.last_active_ms || live?.last_hb_ms || 0);
+  const workText = alive === "alive" ? (live?.work?.phase || live?.work?.state || "空闲")
+    : (lastMs ? `最后活动 ${fmtLast(lastMs)}` : "无活动记录");
+  const card = (k, v, s, cls = "") =>
+    `<div class="agentStat ${cls}"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div><div class="s">${esc(s)}</div></div>`;
+  $("dStats").innerHTML = [
+    card("状态", statusText, workText, alive === "alive" ? "ok" : alive === "late" ? "warn" : ""),
+    card("执行中", claimed, `历史任务 ${total}`, "accent"),
+    card("已完成", done, `完成率 ${rate}%`, "ok"),
+    card("阻塞", blocked, released ? `另有 ${released} 条待取` : "无", blocked ? "warn" : ""),
+    card("交付通过", `${approved}/${subTotal}`, `待裁决 ${pending} · 拒收 ${rejected}`),
+    card("Issue", `${issueClosed}/${issueTotal}`, `open ${issueOpen}`),
+  ].join("");
+
+  const parts = [
+    { key: "claimed", label: "执行中", value: claimed, color: TASK_COLORS.claimed },
+    { key: "open", label: "待领取", value: n(st.tasks_open), color: TASK_COLORS.open },
+    { key: "released", label: "待取", value: released, color: TASK_COLORS.released },
+    { key: "blocked", label: "阻塞", value: blocked, color: TASK_COLORS.blocked },
+    { key: "done", label: "已完成", value: done, color: TASK_COLORS.done },
+  ];
+  $("dTaskTotal").textContent = `共 ${total} 条`;
+  $("dTaskLegend").innerHTML = parts.map((p) =>
+    `<span><i class="vizDot" style="background:${p.color}"></i>${p.label} <b>${p.value}</b></span>`).join("");
+  drawDonut($("dTaskDonut"), parts);
+
+  const bar = (label, value, denom, color) => {
+    const at = denom ? Math.max(0, Math.min(100, Math.round(value / denom * 100))) : 0;
+    return `<div class="workBar"><div class="t"><span>${esc(label)}</span><b>${value}/${denom}</b></div>
+      <div class="barTrack"><div class="barFill" style="width:${at}%;background:${color}"></div></div></div>`;
+  };
+  $("dWorkBars").innerHTML = [
+    bar("任务完成率", done, total, TASK_COLORS.done),
+    bar("交付通过率", approved, subTotal, "#6aa9ff"),
+    bar("Issue 关闭率", issueClosed, issueTotal, "#a78bfa"),
+    bar("阻塞任务", blocked, total, TASK_COLORS.blocked),
+  ].join("");
+
+  const tasks = d.tasks || [];
+  $("dTasks").innerHTML = tasks.length ? tasks.map((t) => {
+    const id = t.task_id || t.id || "";
+    const to = Array.isArray(t.to) ? t.to : t.to ? [t.to] : [];
+    const role = t.owner === detailAgent ? "owner"
+      : to.includes(detailAgent) ? "定向"
+      : t.released_by === detailAgent ? "释放"
+      : (t.reassigned_from === detailAgent || t.reclaimed_from === detailAgent) ? "曾负责" : "";
+    const ts = Number(t.updated_at || t.created_at || 0);
+    return `<div class="workRow"><span class="badge ${esc(t.state || "open")}">${esc(taskStateLabel(t.state))}</span>
+      <span class="tid">${esc(id)}</span><span class="wtitle">${esc(t.title || "—")}</span>
+      ${role ? `<span class="muted">${role}</span>` : ""}
+      ${Number(t.pending_submissions || 0) ? `<span class="warnv">待取 ${Number(t.pending_submissions)}</span>` : ""}
+      <span class="when" title="${ts ? new Date(ts).toLocaleString() : ""}">${ts ? ago((Date.now() - ts) / 1000) + "前" : "—"}</span></div>`;
+  }).join("") : `<div class="muted">暂无任务记录</div>`;
+
+  const issues = d.issues || [];
+  $("dIssueSummary").textContent = `${issueTotal} 条 · open ${issueOpen}`;
+  $("dIssues").innerHTML = issues.length ? issues.map((i) => {
+    const ts = Number(i.created_at || 0);
+    return `<div class="workRow"><span class="badge ${i.status === "open" ? "issue-open" : "issue-closed"}">${esc(i.status)}</span>
+      <span class="tid">${esc(i.issue_id)}</span><span class="wtitle">${esc(i.title || "—")}</span>
+      <span class="when" title="${ts ? new Date(ts).toLocaleString() : ""}">${ts ? ago((Date.now() - ts) / 1000) + "前" : "—"}</span></div>`;
+  }).join("") : `<div class="muted">暂无上报 Issue</div>`;
+}
+
 let detailAgent = null;
 let detailRole = "agent";
 let detailReady = false;
@@ -1804,7 +2059,14 @@ function openAgent(id, project) {
   $("dMeta").textContent = "加载中…";
   document.querySelectorAll("#detail [data-dq]").forEach((b) => { b.dataset.da = id; });
   $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
-  if (!sameAgentRefresh) $("dToken").innerHTML = "";
+  $("dStats").innerHTML = $("dTasks").innerHTML = $("dIssues").innerHTML = "";
+  $("dWorkBars").innerHTML = ""; $("dTaskLegend").innerHTML = "";
+  $("dTaskTotal").textContent = ""; $("dIssueSummary").textContent = "";
+  $("dPermSummary").textContent = "加载中…";
+  if (!sameAgentRefresh) {
+    $("dToken").innerHTML = "";
+    const pd = $("dPermDetails"); if (pd) pd.open = false;
+  }
   $("dRole").textContent = "加载中…";
   if (!sameAgentRefresh) $("dScopes").innerHTML = "";
   setDetailReady(false);
@@ -1818,6 +2080,8 @@ function openAgent(id, project) {
       ? ` · SDK ${live.sdk_version}${live.sdk_outdated ? "（旧版）" : ""}` : "";
     $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样${sdkNote}`;
     detailRole = role;
+    $("dPermSummary").textContent = `${role} · ${scopes.length} 项权限`;
+    renderAgentWork(d, live);
     $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 收件 / 接任务 / 上报";
     $("dRole").classList.toggle("admin", role === "admin");
     renderScopeEditor(scopes);
@@ -2353,11 +2617,17 @@ function bindBulk() {
   // 注册审批：一次批完，不用逐个点
   const enr = cardByTitle("注册审批");
   if (enr) addCardBtn(enr, "全部批准", async () => {
-    const ids = [...document.querySelectorAll("[data-approve]")].map((b) => b.dataset.approve);
-    if (!ids.length) return;
-    if (!confirm(`批准 ${ids.length} 个待审申请？`)) return;
-    for (const id of ids) await api(`/admin/enrollments/${id}/approve`, "POST", {});
+    const rows = [...document.querySelectorAll("[data-approve]")].map((b) => ({
+      id: b.dataset.approve,
+      agent_id: (b.closest("tr")?.querySelector(".enrIdInput")?.value || "").trim(),
+    }));
+    if (!rows.length) return;
+    const bad = rows.find((r) => !/^[A-Za-z0-9._-]{2,40}$/.test(r.agent_id));
+    if (bad) return showToast(`Agent ID 不合法：${bad.agent_id || "（空）"}`, 8000);
+    if (!confirm(`批准 ${rows.length} 个待审申请？Agent ID 将按表格中已改的值下发。`)) return;
+    for (const r of rows) await api(`/admin/enrollments/${r.id}/approve`, "POST", { agent_id: r.agent_id });
     await refresh();
+    showToast(`已批准 ${rows.length} 个申请`, 5000);
   });
   // 名册：一键清掉失联的残留号
   const ros = cardByTitle("名册");

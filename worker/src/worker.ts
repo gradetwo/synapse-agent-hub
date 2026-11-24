@@ -1012,10 +1012,24 @@ async function admin(req: Request, env: Env, url: URL) {
       let scopes = e.scopes;
       const b: any = await req.json().catch(() => ({}));
       if (Array.isArray(b.scopes) && b.scopes.length) scopes = b.scopes.join(",");
+      // 管理台批准时可直接改 Agent ID：新 ID 会写回 enrollment，并随
+      // GET /p/enroll/{id} 的轮询响应下发给节点。未传就沿用申请时的 ID。
+      const targetAgentId = String(b.agent_id ?? e.agent_id).trim();
+      if (!/^[A-Za-z0-9._-]{2,40}$/.test(targetAgentId))
+        return err(422, "bad_agent_id: Agent ID 需为 2-40 位字母/数字/点/下划线/短横线");
+      // 改名撞上项目里另一个 active agent 时拒绝，避免把别人的 token 轮换掉；
+      // 改成自己原来的 ID 仍按“同 agent 换钥”处理。
+      if (targetAgentId !== e.agent_id) {
+        const conflict = await env.DB.prepare(
+          `SELECT 1 FROM agents WHERE project = ? AND agent_id = ? AND revoked_at IS NULL
+             AND (expires_at IS NULL OR expires_at > ?) LIMIT 1`
+        ).bind(e.project, targetAgentId, now).first<any>();
+        if (conflict) return err(409, `agent_id_conflict:${targetAgentId}`);
+      }
       // 先查配额；不要把旧 token 先吊销，否则后续 INSERT 失败会把现有 agent 弄成不可用。
       {
         const q = await projectQuota(env, e.project);
-        const n = await activeAgentCountExcluding(env, e.project, e.agent_id);
+        const n = await activeAgentCountExcluding(env, e.project, targetAgentId);
         if (n >= q.maxAgents) return err(409, `agent_quota_exceeded:${n}/${q.maxAgents}`);
       }
       // 同一个 agent 重新注册且复用了旧 token 时，agents 表里可能还留着同 token 的
@@ -1027,15 +1041,17 @@ async function admin(req: Request, env: Env, url: URL) {
          ON CONFLICT(project, agent_id, token_sha) DO UPDATE SET
            role = excluded.role, scopes = excluded.scopes,
            revoked_at = NULL, expires_at = NULL, created_at = excluded.created_at`
-      ).bind(e.project, e.agent_id, "agent", scopes, e.token_sha, now).run();
+      ).bind(e.project, targetAgentId, "agent", scopes, e.token_sha, now).run();
       await env.DB.prepare(
         `UPDATE agents SET revoked_at = ?
           WHERE project = ? AND agent_id = ? AND revoked_at IS NULL AND token_sha <> ?`
-      ).bind(now, e.project, e.agent_id, e.token_sha).run();
+      ).bind(now, e.project, targetAgentId, e.token_sha).run();
       await env.DB.prepare(
-        "UPDATE enrollments SET status='approved', scopes=?, decided_at=?, decided_by=? WHERE id=?"
-      ).bind(scopes, now, who, id).run();
-      return json({ ok: true, status: "approved", agent_id: e.agent_id, project: e.project, scopes });
+        "UPDATE enrollments SET status='approved', agent_id=?, scopes=?, decided_at=?, decided_by=? WHERE id=?"
+      ).bind(targetAgentId, scopes, now, who, id).run();
+      return json({ ok: true, status: "approved", agent_id: targetAgentId,
+                    previous_agent_id: e.agent_id, renamed: targetAgentId !== e.agent_id,
+                    project: e.project, scopes });
     }
     await env.DB.prepare(
       "UPDATE enrollments SET status='rejected', decided_at=?, decided_by=? WHERE id=?"
@@ -1375,7 +1391,7 @@ async function admin(req: Request, env: Env, url: URL) {
       return json({ ok: true, revoked: done });
     }
 
-    // 单个 agent 详情：资源曲线 + 消息 + 提交
+    // 单个 agent 详情：资源曲线 + 消息 + 提交 + 任务履历/工作统计
     if (action.startsWith("agent/") && req.method === "GET") {
       const id = decodeURIComponent(action.slice(6));
       const hb = await env.DB.prepare(
@@ -1383,8 +1399,9 @@ async function admin(req: Request, env: Env, url: URL) {
          WHERE project=? AND agent_id=? ORDER BY bucket DESC LIMIT 120`
       ).bind(project, id).all();
       const subs = await env.DB.prepare(
-        `SELECT submission_id,state,kind,title,base_sha,created_at FROM submissions
-         WHERE project=? AND agent_id=? ORDER BY created_at DESC LIMIT 20`
+        `SELECT submission_id,state,kind,title,base_sha,task_id,review_state,created_at,updated_at
+           FROM submissions WHERE project=? AND agent_id=?
+          ORDER BY created_at DESC LIMIT 50`
       ).bind(project, id).all();
       const ag = await env.DB.prepare(
         `SELECT agent_id,role,scopes,created_at,expires_at,revoked_at FROM agents
@@ -1394,7 +1411,75 @@ async function admin(req: Request, env: Env, url: URL) {
         `https://do/inbox?since=0&limit=200&agent=*&desc=1`))).json().catch(() => ({ messages: [] }));
       const msgs = (inbox.messages ?? []).filter((m: any) =>
         m.sender === id || (Array.isArray(m.to) ? m.to.includes(id) : m.to === id)).slice(-30);
-      return json({ agent: ag, hb: hb.results ?? [], submissions: subs.results ?? [], messages: msgs });
+
+      // 任务履历：owner（做过）、to（定向给它但还没 claim）、released_by（做完释放）、
+      // reassigned_from/reclaimed_from（转派/取回前的负责人）并集；按更新时间倒序保留 60 条。
+      let allTasks: any[] = [];
+      try {
+        const tr = await stub.fetch(new Request("https://do/tasks/list"));
+        const td: any = await tr.json();
+        allTasks = Array.isArray(td.tasks) ? td.tasks : [];
+      } catch { /* 名册/任务列表读不到时，详情仍应显示曲线与提交 */ }
+      const touches = (t: any) => {
+        const to = Array.isArray(t.to) ? t.to : t.to ? [t.to] : [];
+        return t.owner === id || to.includes(id) || t.released_by === id
+          || t.reassigned_from === id || t.reclaimed_from === id;
+      };
+      const tasks = allTasks.filter(touches).sort((a: any, b: any) =>
+        Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
+      const taskState: Record<string, number> = { open: 0, claimed: 0, released: 0, blocked: 0, done: 0 };
+      for (const t of tasks) taskState[t.state] = (taskState[t.state] ?? 0) + 1;
+
+      // 提交与 Issue 的聚合在 D1 侧一次算完，避免把近百条历史拉到前端再数。
+      const subStats: any = await env.DB.prepare(
+        `SELECT COUNT(*) total,
+                SUM(CASE WHEN review_state='approved' THEN 1 ELSE 0 END) approved,
+                SUM(CASE WHEN review_state='rejected' THEN 1 ELSE 0 END) rejected,
+                SUM(CASE WHEN review_state='pending' THEN 1 ELSE 0 END) pending
+           FROM submissions WHERE project=? AND agent_id=?`
+      ).bind(project, id).first().catch(() => null);
+      const issueStats: any = await env.DB.prepare(
+        `SELECT COUNT(*) total,
+                SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) open,
+                SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) closed,
+                SUM(CASE WHEN status='merged' THEN 1 ELSE 0 END) merged
+           FROM issues WHERE project=? AND reporter=?`
+      ).bind(project, id).first().catch(() => null);
+      const issues = await env.DB.prepare(
+        `SELECT issue_id,title,status,priority,created_at,closed_at FROM issues
+          WHERE project=? AND reporter=? ORDER BY created_at DESC LIMIT 12`
+      ).bind(project, id).all().catch(() => ({ results: [] }));
+      const idle: any = await env.DB.prepare(
+        `SELECT last_active_ms,idle_since_ms,reminded_at,flagged_at FROM agent_idle
+          WHERE project=? AND agent_id=?`
+      ).bind(project, id).first().catch(() => null);
+      const num = (x: any) => Number(x ?? 0);
+      return json({
+        agent: ag,
+        hb: hb.results ?? [],
+        submissions: subs.results ?? [],
+        messages: msgs,
+        tasks: tasks.slice(0, 60),
+        issues: issues.results ?? [],
+        stats: {
+          tasks_total: tasks.length,
+          tasks_open: taskState.open,
+          tasks_claimed: taskState.claimed,
+          tasks_released: taskState.released,
+          tasks_blocked: taskState.blocked,
+          tasks_done: taskState.done,
+          submissions_total: num(subStats?.total),
+          submissions_approved: num(subStats?.approved),
+          submissions_rejected: num(subStats?.rejected),
+          submissions_pending: num(subStats?.pending),
+          issues_total: num(issueStats?.total),
+          issues_open: num(issueStats?.open),
+          issues_closed: num(issueStats?.closed),
+          issues_merged: num(issueStats?.merged),
+          last_active_ms: idle?.last_active_ms ?? null,
+          idle_since_ms: idle?.idle_since_ms ?? null,
+        },
+      });
     }
 
     // 定向指令：发给一个或多个 agent（不是广播）。
