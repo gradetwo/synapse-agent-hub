@@ -392,8 +392,12 @@ fn is_task_notice(m: &Value) -> bool {
     matches!(m["kind"].as_str(), Some("task_notice")) ||
         matches!(m["topic"].as_str(), Some("task_notice")) ||
         // claimed/released/done/reclaimed 是任务板生命周期事件，无正文；
-        // 只有 kind=task 的消息才是管理员下发的任务正文。
-        (m["topic"].as_str() == Some("task") && m["kind"].as_str() != Some("task"))
+        // kind=task 是管理员下发的任务正文，kind=reassigned 是带完整正文的
+        // 管理员转派事件（payload 里同样有 task_id/title/body），两者都必须进窗口。
+        // 其余 task 生命周期事件才过滤。
+        (m["topic"].as_str() == Some("task")
+            && m["kind"].as_str() != Some("task")
+            && m["kind"].as_str() != Some("reassigned"))
 }
 
 /// 外部投递（窗口/tmux）只接“点名给本 agent 的消息”和“管理端广播”，不接项目事件流。
@@ -3024,6 +3028,16 @@ mod tests {
             "kind": "task", "payload": {"title": "review"}
         });
         assert!(!is_surface_noise(&cfg, &agent_dm));
+
+        // 管理员转派事件也带完整正文（payload.task_id/title/body），不能按
+        // “无正文的 task 生命周期事件”过滤掉；这是 T-FIX-212 没进窗口的根因。
+        let admin_reassigned = json!({
+            "seq": 101, "sender": "admin", "to": "a1", "topic": "task",
+            "kind": "reassigned",
+            "payload": {"task_id": "T-2", "title": "转派", "body": "do it"}
+        });
+        assert!(!is_task_notice(&admin_reassigned));
+        assert!(!is_surface_noise(&cfg, &admin_reassigned));
     }
 
     #[test]

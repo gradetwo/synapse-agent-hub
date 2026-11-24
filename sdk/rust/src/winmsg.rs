@@ -897,7 +897,11 @@ pub fn send_text_paste(hwnd: usize, text: &str, press_enter: bool) -> Result<(),
         r?;
         sys::Sleep(80);
         if sys::GetForegroundWindow() != h {
-            return Err("写入剪贴板后目标窗口失去前台，已中止粘贴".into());
+            eprintln!("[winmsg] 写入剪贴板后目标窗口失去前台，重新激活后继续");
+            activate_window(hwnd)?;
+            if sys::GetForegroundWindow() != h {
+                return Err("写入剪贴板后目标窗口失去前台，重新激活仍失败，已中止粘贴".into());
+            }
         }
         paste_and_maybe_enter(press_enter);
     }
@@ -970,12 +974,11 @@ pub fn find_input_rect(_hwnd: usize) -> Option<(i32, i32, i32, i32)> {
     None
 }
 
-/// 增强发送：激活 → 点击窗口底部输入框区域取得键盘焦点 → 剪贴板粘贴 → 可选回车。
-/// 对豆包等 Electron 聊天窗口最稳：先点击确保焦点落在输入框，再粘贴。
+/// 单击 composer 一次：激活 → 校验前台 → 定位输入框 → 点击 → 再校验前台。
+/// 点击会让 Windows 重新分配前台焦点，某些机器上会瞬时被其它窗口抢走；
+/// 这里只负责一次尝试，重试策略由 `send_text_click_paste` 负责。
 #[cfg(windows)]
-pub fn send_text_click_paste(
-    hwnd: usize, text: &str, press_enter: bool, click_x_ratio: f64, click_y_ratio: f64,
-) -> Result<(), String> {
+fn click_composer_once(hwnd: usize, click_x_ratio: f64, click_y_ratio: f64) -> Result<(), String> {
     activate_window(hwnd)?;
     unsafe {
         let h = hwnd as sys::HWND;
@@ -1035,7 +1038,44 @@ pub fn send_text_click_paste(
         if sys::GetForegroundWindow() != h {
             return Err("点击后目标窗口失去前台，已中止粘贴".into());
         }
+    }
+    Ok(())
+}
 
+/// 增强发送：激活 → 点击窗口底部输入框区域取得键盘焦点 → 剪贴板粘贴 → 可选回车。
+/// 对豆包等 Electron 聊天窗口最稳：先点击确保焦点落在输入框，再粘贴。
+///
+/// 点击后前台偶尔会被其它窗口瞬时抢走（真机实测 `win-send` 一次就失败，
+/// 重新激活后同一命令成功）。这里对“激活+点击+前台校验”最多重试 3 次；
+/// 只有 3 次都失败才返回错误，避免因为一次前台抖动丢掉整条补投。
+#[cfg(windows)]
+pub fn send_text_click_paste(
+    hwnd: usize, text: &str, press_enter: bool, click_x_ratio: f64, click_y_ratio: f64,
+) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        match click_composer_once(hwnd, click_x_ratio, click_y_ratio) {
+            Ok(()) => {
+                last_err.clear();
+                break;
+            }
+            Err(e) => {
+                last_err = e;
+                eprintln!("[winmsg] composer 点击第 {attempt} 次失败：{last_err}");
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    }
+    if !last_err.is_empty() {
+        return Err(format!("{last_err}（点击重试 3 次仍失败）"));
+    }
+    unsafe {
+        let h = hwnd as sys::HWND;
+        if sys::GetForegroundWindow() != h {
+            return Err("点击成功后目标窗口仍不是前台，已中止粘贴".into());
+        }
         // 写剪贴板
         if sys::OpenClipboard(std::ptr::null_mut()) == 0 {
             return Err(format!("OpenClipboard 失败: {}", sys::GetLastError()));
@@ -1162,7 +1202,11 @@ pub fn send_text_click_paste_checked(
     // 回车前最后确认目标窗口仍是前台，避免把 Enter 送到别的窗口。
     unsafe {
         if sys::GetForegroundWindow() != hwnd as sys::HWND {
-            return Err("回车前目标窗口不是前台，已中止发送".into());
+            eprintln!("[winmsg] 回车前目标窗口失去前台，重新激活后继续");
+            activate_window(hwnd)?;
+            if sys::GetForegroundWindow() != hwnd as sys::HWND {
+                return Err("回车前目标窗口不是前台，重新激活仍失败，已中止发送".into());
+            }
         }
         enter_key();
     }
