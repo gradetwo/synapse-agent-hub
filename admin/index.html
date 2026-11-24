@@ -929,7 +929,9 @@ async function loadAgents() {
   if (current !== project) return;   // 切项目/切视图后，旧请求只允许静默丢弃
   const rows = (d.agents || []).map((a) => ({ ...a, project: a.project || project }));
   const alive = rows.filter(a => a.alive === "alive").length;
-  $("agentStat").textContent = `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}`;
+  const outdated = rows.filter(a => a.sdk_outdated).length;
+  $("agentStat").textContent = `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}` +
+    (outdated ? ` · ${outdated} 个旧版 SDK` : "");
   $("agents").innerHTML = rows.length ? rows.map(a => {
     const w = a.work || {}, l = a.load || {}, dk = (l.disk || [{}])[0];
     const cls = a.alive === "alive" ? "alive" : a.alive === "late" ? "late" : "offline";
@@ -939,7 +941,8 @@ async function loadAgents() {
     const mem = (l.mem_used_mb != null) ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
     const projectName = (allProjects.find((p) => p.project === a.project)?.display_name) || a.project;
     return `<tr${idle} class="clickable" data-agent="${a.agent_id}" data-project="${a.project}" data-alive="${a.alive}" data-work="${a.alive === "alive" ? (w.state || "idle") : ""}">
-      <td><span class="dot ${cls}"></span>${a.agent_id}</td>
+      <td><span class="dot ${cls}"></span>${a.agent_id}${a.sdk_outdated
+        ? ` <span class="badge released" title="当前 SDK ${esc(a.sdk_version || "未上报")}，最新 ${esc(a.sdk_latest || "未知")}">旧版</span>` : ""}</td>
       <td class="muted">${projectName}</td>
       <td>${a.alive === "alive" ? "忙" : a.alive === "late" ? "迟到" : "失联"}</td>
       <td>${doing}</td>
@@ -1810,7 +1813,10 @@ function openAgent(id, project) {
     const hb = (d.hb || []).slice().reverse();
     const role = d.agent?.role || "agent";
     const scopes = scopeList(d.agent?.scopes);
-    $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样`;
+    const live = (window._agents || []).find((a) => a.agent_id === id && (current === "*" || (a.project || current) === current));
+    const sdkNote = live?.sdk_version
+      ? ` · SDK ${live.sdk_version}${live.sdk_outdated ? "（旧版）" : ""}` : "";
+    $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样${sdkNote}`;
     detailRole = role;
     $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 收件 / 接任务 / 上报";
     $("dRole").classList.toggle("admin", role === "admin");

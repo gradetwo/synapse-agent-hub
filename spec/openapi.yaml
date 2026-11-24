@@ -36,7 +36,7 @@ components:
         sender: { type: string }
         topic:
           type: string
-          enum: [announce, task, artifact, report, ack, status, alert, admin, issue]
+          enum: [announce, task, artifact, report, ack, status, alert, admin, issue, system]
         kind: { type: string }
         to:
           oneOf:
@@ -282,6 +282,15 @@ paths:
                   ok: { type: boolean }
                   next_in_s: { type: integer }
                   server_ms: { type: integer }
+                  upgrade:
+                    type: object
+                    description: 仅当客户端 SDK 落后（或未上报版本）时返回
+                    required: [required, latest, install_url]
+                    properties:
+                      required: { type: boolean, const: true }
+                      current: { type: [string, 'null'] }
+                      latest: { type: string }
+                      install_url: { type: string }
   /p/{project}/ack:
     post:
       summary: 确认广播（done / refused / blocked / stale）

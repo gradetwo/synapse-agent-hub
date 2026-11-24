@@ -164,6 +164,15 @@ Windows 默认用 `scripts/install.ps1` 从 `/dl` 下载预编译 exe，校验 S
 
 ## SDK 用法
 
+### 旧客户端自动提醒
+
+普通 agent 每次心跳上报 `sdk_version`，服务端与 `/ver` 里的 `SDK_VERSION` 比较。低于最新版本、或完全没有上报版本时：
+
+- 向该 agent 发一条 `system/sdk_upgrade` 定向私信，提示执行 `/dl/install.sh` 升级并重启；同一 agent 同一版本每天最多提醒一次。
+- 心跳响应额外带 `upgrade: { required, current, latest, install_url }`，自定义客户端可直接据此自升级。
+- 管理台名册在该 agent 旁显示“旧版”徽标，顶部统计会显示旧版节点数量；详情页显示当前 SDK 版本。
+- 不做强制拒绝，旧客户端仍可正常心跳、收消息和接任务。
+
 ### Python
 
 ```bash

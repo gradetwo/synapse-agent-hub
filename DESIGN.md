@@ -260,6 +260,12 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 - `idle_after_s` 与 `followup_after_s` 相互独立，默认 600 秒；项目级配置存 `idle_reminder_config`，支持开关与文案模板变量。
 - 管理员派单或 agent 自己领到任务后，下一次扫描会清空空闲/提醒/上榜状态；关闭开关时也会清空提醒与上榜，重新打开从新的空闲周期开始。
 
+### 6.2 旧客户端提醒
+
+- 心跳写入 `sdk_version`、`sdk_latest`、`sdk_outdated`；`sdk_version` 缺失或低于 `SDK_VERSION` 视为旧版。
+- 旧版客户端会收到定向 `system/sdk_upgrade` 私信，提示 `/dl/install.sh`；按 agent + 当前版本 + 最新版本 + UTC 日期去重，每天最多一次。
+- 心跳响应附 `upgrade` 对象；管理台名册显示“旧版”徽标和数量统计，不强制拒绝旧客户端。
+
 ## 7. 交付协议（只读 agent 的唯一产出通道）
 
 ### 三态（不设 review/merge 状态）
@@ -460,7 +466,7 @@ curl -fsSL https://synapse.wangda.today/dl/install.sh | sh -s -- \
 1. token 永不进日志（只显示前 6 位）
 2. 拒绝明文 `http`（`127.0.0.1` 调试例外）
 3. 配置优先级：CLI > 环境变量 > 配置文件
-4. SDK 在心跳里上报 `sdk_version`；服务端记录，不做强制版本拒绝（`426` 目前只用于 WebSocket upgrade）
+4. SDK 在心跳里上报 `sdk_version`；服务端记录并对比 `SDK_VERSION`，旧版或未上报时发定向升级提醒（每天每版本一次），但不做强制版本拒绝
 
 ---
 

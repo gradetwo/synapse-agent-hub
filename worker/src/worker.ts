@@ -12,7 +12,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "agent-pool-read-idle-watch-20261124";
+const BUILD_TAG = "agent-pool-read-idle-sdk-upgrade-20261124";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.6";
 
@@ -374,6 +374,7 @@ export default {
       // sender 必须由服务端注入：否则 agent 可以自称 admin 或别的 agent（身份伪造）
       init.body = JSON.stringify({ ...body, project, agent_id: auth.agentId,
                                    sender: auth.agentId, role: auth.role,
+                                   ...(action.startsWith("heartbeat") ? { latest_sdk_version: SDK_VERSION } : {}),
                                    ...(pubMaxPerMin ? { max_per_min: pubMaxPerMin } : {}) });
     }
     // DO 的响应统一在边界处补安全头（DO 内部不感知 HTTP 语义）

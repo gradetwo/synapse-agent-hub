@@ -8,6 +8,28 @@ export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
+/** 取 SDK 版本的核心数字段；无法解析时返回 null（按旧客户端处理）。 */
+function sdkVersionCore(v: unknown): number[] | null {
+  const raw = String(v ?? "").trim().replace(/^v/i, "").split(/[+-]/)[0];
+  if (!/^\d+(?:\.\d+)*$/.test(raw)) return null;
+  const parts = raw.split(".").map((x) => Number(x));
+  while (parts.length < 3) parts.push(0);
+  return parts;
+}
+
+/** 客户端版本是否落后于服务端 SDK_VERSION。 */
+function isSdkOutdated(client: unknown, latest: unknown): boolean {
+  const c = sdkVersionCore(client);
+  const l = sdkVersionCore(latest);
+  if (!l) return false;
+  if (!c) return true;
+  for (let i = 0; i < Math.max(c.length, l.length); i++) {
+    const a = c[i] ?? 0, b = l[i] ?? 0;
+    if (a !== b) return a < b;
+  }
+  return false;
+}
+
 const msgKey = (n: number) => `msg:${String(n).padStart(10, "0")}`;
 
 class DoError extends Error {
@@ -325,19 +347,50 @@ export class ProjectRoom implements DurableObject {
     const key = `agent:${b.agent_id}`;
     const prev: any = (await this.st.get(key)) ?? {};
     const now = Date.now();
+    const clientVersion = String(b.sdk_version ?? "").trim().slice(0, 40);
+    const latestVersion = String(b.latest_sdk_version ?? "").trim().slice(0, 40);
+    // 管理员身份不催升级；普通 agent 未上报版本也按旧客户端处理。
+    const outdated = b.role !== "admin" && !!latestVersion && isSdkOutdated(clientVersion, latestVersion);
     const rec = {
       agent_id: b.agent_id,
       role: b.role ?? "agent",
       work: b.work ?? { state: "idle" },
       load: b.load ?? {},
       env: b.env ?? {},
-      sdk_version: b.sdk_version ?? null,
+      sdk_version: clientVersion || null,
+      sdk_latest: latestVersion || null,
+      sdk_outdated: outdated,
       last_hb_ms: now,
       first_seen_ms: prev.first_seen_ms ?? now,
       hb_count: (prev.hb_count ?? 0) + 1,
       last_bucket: prev.last_bucket ?? 0,
     };
     await this.st.put(key, rec);
+
+    // 旧客户端提醒：同一天同一版本只发一次，避免每个心跳刷屏。
+    if (outdated) {
+      const shown = clientVersion || "未上报版本";
+      const day = new Date(now).toISOString().slice(0, 10);
+      try {
+        await this.append({
+          project: b.project ?? this.projectName(),
+          sender: "system", topic: "system", kind: "sdk_upgrade", to: b.agent_id,
+          payload: {
+            title: "客户端版本过旧：请升级 SDK",
+            body: `检测到当前 agent SDK 为 ${shown}，服务端最新为 ${latestVersion}。` +
+                  "请执行 /dl/install.sh 升级并重启；升级后心跳会自动上报新版本。",
+            agent_id: b.agent_id,
+            current_version: clientVersion || null,
+            latest_version: latestVersion,
+            install_url: "/dl/install.sh",
+          },
+          max_per_min: 1000,
+          dedupe_key: `sdk-upgrade:${b.agent_id}:${clientVersion || "unknown"}:${latestVersion}:${day}`,
+        } as any);
+      } catch (e) {
+        console.warn("sdk upgrade reminder failed", b.project, b.agent_id, e);
+      }
+    }
 
     // 任务租约挂心跳：持有者活着就续，TTL = LEASE_TTL_S（默认 12h）
     const tasks = await this.st.list<Task>({ prefix: "task:" });
@@ -361,7 +414,17 @@ export class ProjectRoom implements DurableObject {
         b.load?.disk?.[0]?.used_pct ?? null, b.work?.state ?? null
       ).run().catch(() => {});   // 心跳不能因 D1 配额/抖动失败；DO 仍会续租
     }
-    return json({ ok: true, next_in_s: 60, server_ms: now });
+    return json({
+      ok: true, next_in_s: 60, server_ms: now,
+      ...(outdated ? {
+        upgrade: {
+          required: true,
+          current: clientVersion || null,
+          latest: latestVersion,
+          install_url: "/dl/install.sh",
+        },
+      } : {}),
+    });
   }
 
   // F1：任务创建入口（否则租约台账永远是死代码）
