@@ -332,6 +332,22 @@ print(r["issue_id"])
 | GET | `/p/{project}/issues?limit=50` | 只列 `open` 且 `task_id IS NULL` 的 Issue（需 `issues.read`） |
 | POST | `/p/{project}/issues/{id}/claim` | 任意项目 agent 认领未指派 Issue；同样受活跃任务上限约束 |
 
+### 空闲提醒 / 待唤醒
+
+普通 agent 在线、名下没有活跃任务，并连续 `idle_after_s`（默认 600 秒）没有主动调用任务池 / Issue / 其他数据面接口时，系统会向它发一条定向私信，提示去公共池领任务或主动上报 Issue。消息发出后 `followup_after_s`（默认 600 秒）内仍没有产生任务、也没有主动调用接口，该节点会进入管理台 **待唤醒** tab 的列表。
+
+两个时间彼此独立，均可在该 tab 调整；同一页还可以编辑提醒文案（支持 `{project}`、`{agent_id}`、`{idle_minutes}`、`{followup_minutes}`、`{task_endpoint}`、`{issue_endpoint}`），并总开关自动提醒。`立即检查` 可手动触发一次扫描。
+
+管理 API：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/p/{project}/idle` | 读取配置与当前待唤醒列表 |
+| PUT | `/admin/p/{project}/idle` | 保存 `enabled` / `idle_after_s` / `followup_after_s` / `message` |
+| POST | `/admin/p/{project}/idle/check` | 立即执行租约回收与空闲扫描，返回 reminded / flagged 计数 |
+
+上线前需执行 `worker/migrations/20261124-idle-reminder.sql`（与 `20261124-agent-read-scopes.sql` 一起传 `--migration`）。
+
 Python SDK：`Client.report_issue(..., self_assign=True)` / `Client.take_issue()` / `Admin.issues()`；TypeScript SDK：`Client.reportIssue(..., true)` / `Client.takeIssue()` / `Admin.issues()`。上报默认按项目 **20 条/分钟** 节流，超出返回 `429 issue_rate_limited`。
 
 `/x/admin/agents/move` 请求：

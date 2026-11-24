@@ -640,6 +640,39 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Project'
       responses: { '200': { description: snapshot } }
+  /admin/p/{project}/idle:
+    get:
+      summary: 空闲提醒配置与“待唤醒”列表
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses:
+        '200': { description: '返回 config（enabled/idle_after_s/followup_after_s/message）与超过 followup 仍无动作的 agents[]' }
+    put:
+      summary: 保存空闲提醒配置
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean, default: true }
+                idle_after_s: { type: integer, minimum: 1, maximum: 86400, default: 600 }
+                followup_after_s: { type: integer, minimum: 1, maximum: 86400, default: 600 }
+                message: { type: string, maxLength: 2000, description: '支持 {project}/{agent_id}/{idle_minutes}/{followup_minutes}/{task_endpoint}/{issue_endpoint}' }
+      responses:
+        '200': { description: 配置已保存 }
+        '503': { description: idle_migration_required }
+  /admin/p/{project}/idle/check:
+    post:
+      summary: 立即执行一次租约回收与空闲扫描
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses:
+        '200': { description: 返回 reclaimed / reminded / flagged 计数 }
+        '503': { description: idle_check_failed }
   /admin/p/{project}/tasks:
     get:
       summary: 任务台账

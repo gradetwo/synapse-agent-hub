@@ -189,6 +189,8 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | GET | `/admin/agents` | 全部可见项目的聚合名册（每行带 `project`，控制台“全部项目”视图用） |
 | GET | `/admin/p/{p}/agents` | 单项目名册（含 alive/late/offline + age_s） |
 | GET | `/admin/p/{p}/snapshot` | seq + agents + tasks |
+| GET/PUT | `/admin/p/{p}/idle` | 空闲提醒配置 + 待唤醒列表 / 保存配置 |
+| POST | `/admin/p/{p}/idle/check` | 立即执行一次租约回收与空闲扫描 |
 | POST | `/admin/p/{p}/broadcast` | 广播（幂等 `broadcast_id`） |
 | GET/POST | `/admin/p/{p}/submissions` | 交付箱列表 / 新建（测试用） |
 | POST | `/admin/p/{p}/submissions/{id}/collect` | 标记取走 |
@@ -250,6 +252,13 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 ```
 
 ---
+
+### 6.1 空闲提醒（普通 agent）
+
+- `agent_idle` 按 `(project, agent_id)` 记录 `idle_since_ms`、`reminded_at`、`flagged_at`、最近任务/Issue list 和最近主动调用。心跳、自动 ack、收件轮询不算主动调用。
+- cron 每分钟扫描在线（心跳 ≤120s）且名下活跃任务为 0 的普通 agent：连续 `idle_after_s` 无主动调用即发定向 `system/idle_reminder` 私信；再经过 `followup_after_s` 仍无任务、无主动调用，则进入管理台“待唤醒”列表。
+- `idle_after_s` 与 `followup_after_s` 相互独立，默认 600 秒；项目级配置存 `idle_reminder_config`，支持开关与文案模板变量。
+- 管理员派单或 agent 自己领到任务后，下一次扫描会清空空闲/提醒/上榜状态；关闭开关时也会清空提醒与上榜，重新打开从新的空闲周期开始。
 
 ## 7. 交付协议（只读 agent 的唯一产出通道）
 

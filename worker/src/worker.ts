@@ -1,6 +1,6 @@
 // Worker：唯一入口。data plane = /p/{project}/…（agent token）
 //                      control plane = /admin/…（admin token 或 Access 已通过）
-import { Env } from "./types";
+import { Env, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOWUP_DEFAULT_S } from "./types";
 import CONSOLE_HTML from "../../admin/index.html";
 import { ACTIVE_TASK_LIMIT } from "./project-room";
 export { ProjectRoom } from "./project-room";
@@ -12,7 +12,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "agent-pool-read-task-limit-20261124";
+const BUILD_TAG = "agent-pool-read-idle-watch-20261124";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.5";
 
@@ -313,6 +313,15 @@ export default {
       return err(403, `insufficient_scope: 需要 ${requiredScope}，当前 [${(auth.scopes || []).join(",")}]`);
     if (auth.projectStatus === "paused" && req.method !== "GET") return err(423, "project_paused");
 
+    // 普通 agent 的主动调用记录：心跳/自动 ack/收件不算，其余接口都算“有动作”，
+    // 避免把一直在 wait 的节点误判为空闲。写 D1 异步执行，不拖慢原请求。
+    const idlePassive = action.startsWith("heartbeat") || action.startsWith("ack") ||
+      action === "inbox" || action === "ws-ticket";
+    if (auth.role !== "admin" && auth.agentId && !idlePassive) {
+      const kind = taskPoolRead ? "task_list" : issuePoolRead ? "issue_list" : "activity";
+      ctx.waitUntil(markIdleActivity(env, project, auth.agentId, kind));
+    }
+
     // 公共池只读发现：普通 agent 先看再 claim；接口只返回未指派 open 任务。
     if (taskPoolRead) return listPublicTasks(env, project, url);
     // open 且未指派 Issue 只读发现；不发正文之外的审计字段。
@@ -384,7 +393,10 @@ export default {
       for (const r of rows.results) {
         try {
           const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + r.project));
-          await stub.fetch(new Request("https://do/cron/tick"));
+          await stub.fetch(new Request("https://do/cron/tick", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ project: r.project }),
+          }));
           // F2 收尾：归档按项目 retention_days 清理，避免无限增长
           const days = Math.max(1, Number(r.retention_days ?? 30));
           const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
@@ -584,6 +596,7 @@ function need(action: string) {
   if (action === "tasks/list" || action === "tasks/get" || action === "tasks/active-load") return "admin";
   // 台账/单任务元数据/内部 active-load 不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
+  if (action === "agent/activity" || action === "agents/idle-list") return "admin";
   if (action === "issues" || action.startsWith("issues/")) return "issues.report";
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
@@ -631,6 +644,62 @@ async function taskLoadWarning(stub: any, agentId: string): Promise<any | null> 
     task_ids: Array.isArray(d.task_ids) ? d.task_ids : [],
     message: `${agentId} 当前名下未完成任务 ${active} 个，超过建议上限 ${ACTIVE_TASK_LIMIT}；仍已派发，请提醒其先完成或释放部分任务。`,
   };
+}
+
+/** 记录普通 agent 的主动调用；写 D1 的 agent_idle，供 cron 和管理台使用。 */
+async function markIdleActivity(env: Env, project: string, agentId: string, kind: string) {
+  const now = Date.now();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO agent_idle
+         (project, agent_id, idle_since_ms, reminded_at, flagged_at,
+          last_task_list_ms, last_issue_list_ms, last_active_ms)
+       VALUES (?,?,?,0,0,?,?,?)
+       ON CONFLICT(project, agent_id) DO UPDATE SET
+         last_task_list_ms = CASE WHEN excluded.last_task_list_ms > 0
+           THEN excluded.last_task_list_ms ELSE agent_idle.last_task_list_ms END,
+         last_issue_list_ms = CASE WHEN excluded.last_issue_list_ms > 0
+           THEN excluded.last_issue_list_ms ELSE agent_idle.last_issue_list_ms END,
+         last_active_ms = excluded.last_active_ms,
+         idle_since_ms = excluded.idle_since_ms,
+         reminded_at = 0,
+         flagged_at = 0`
+    ).bind(
+      project, agentId, now,
+      kind === "task_list" ? now : 0,
+      kind === "issue_list" ? now : 0,
+      now,
+    ).run();
+  } catch (e) {
+    console.warn("agent activity write failed", project, agentId, e);
+  }
+}
+
+async function idleConfig(env: Env, project: string) {
+  const fallback = {
+    enabled: true,
+    idle_after_s: IDLE_AFTER_DEFAULT_S,
+    followup_after_s: IDLE_FOLLOWUP_DEFAULT_S,
+    message: IDLE_DEFAULT_MESSAGE,
+    ready: true,
+  };
+  try {
+    const row = await env.DB.prepare(
+      `SELECT enabled, idle_after_s, followup_after_s, message
+         FROM idle_reminder_config WHERE project = ?`
+    ).bind(project).first<any>();
+    if (!row) return fallback;
+    return {
+      enabled: Number(row.enabled) !== 0,
+      idle_after_s: Math.max(1, Math.min(86400, Number(row.idle_after_s) || IDLE_AFTER_DEFAULT_S)),
+      followup_after_s: Math.max(1, Math.min(86400, Number(row.followup_after_s) || IDLE_FOLLOWUP_DEFAULT_S)),
+      message: String(row.message || IDLE_DEFAULT_MESSAGE),
+      ready: true,
+    };
+  } catch (e) {
+    console.warn("idle config read failed", project, e);
+    return { ...fallback, enabled: false, ready: false };
+  }
 }
 
 async function activeAgentCount(env: Env, project: string) {
@@ -1054,6 +1123,48 @@ async function admin(req: Request, env: Env, url: URL) {
       return err(403, "project_not_visible");
     const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
 
+    if (action === "idle" && req.method === "GET") {
+      const config = await idleConfig(env, project);
+      if (!config.ready) return json({ config, agents: [], migration_required: true });
+      const r = await stub.fetch(new Request("https://do/agents/idle-list", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project }),
+      })).catch(() => null);
+      const d: any = r && r.ok ? await r.json().catch(() => ({ agents: [] })) : { agents: [] };
+      return json({ config, agents: config.enabled ? (d.agents ?? []) : [] });
+    }
+    if (action === "idle" && (req.method === "POST" || req.method === "PUT")) {
+      const b: any = await req.json().catch(() => ({}));
+      const enabled = b.enabled === false || b.enabled === 0 || b.enabled === "0" ? 0 : 1;
+      const idleAfter = Math.max(1, Math.min(86400, Number(b.idle_after_s) || IDLE_AFTER_DEFAULT_S));
+      const followup = Math.max(1, Math.min(86400, Number(b.followup_after_s) || IDLE_FOLLOWUP_DEFAULT_S));
+      const message = String(b.message ?? "").trim().slice(0, 2000) || IDLE_DEFAULT_MESSAGE;
+      try {
+        await env.DB.prepare(
+          `INSERT INTO idle_reminder_config
+             (project, enabled, idle_after_s, followup_after_s, message, updated_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(project) DO UPDATE SET
+             enabled = excluded.enabled,
+             idle_after_s = excluded.idle_after_s,
+             followup_after_s = excluded.followup_after_s,
+             message = excluded.message,
+             updated_at = excluded.updated_at`
+        ).bind(project, enabled, idleAfter, followup, message, Date.now()).run();
+      } catch (e) {
+        console.warn("idle config save failed", project, e);
+        return err(503, "idle_migration_required");
+      }
+      return json({ ok: true, config: await idleConfig(env, project) });
+    }
+    if (action === "idle/check" && req.method === "POST") {
+      const r = await stub.fetch(new Request("https://do/cron/tick", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project }),
+      })).catch(() => null);
+      if (!r || !r.ok) return err(503, "idle_check_failed");
+      return json(await r.json().catch(() => ({ ok: true })));
+    }
     if (action === "agents") return stub.fetch(new Request("https://do/agent/list"));
     if (action === "tasks" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));

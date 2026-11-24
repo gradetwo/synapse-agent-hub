@@ -458,6 +458,41 @@ if (location.search.includes("reset=1")) {
   </div>
 
   <div class="card">
+    <h2>空闲监测 <span class="muted" id="idleStat"></span></h2>
+    <div class="muted" style="font-size:11px;margin:-2px 0 6px">
+      普通 agent 在线且名下无任务、连续一段时间没有主动调用任务池/Issue 等接口时，系统会私信提醒；
+      提醒后仍未产生任务、未调用接口的节点会进入下方“待唤醒”列表。两个时间与提醒文案都可按项目调整。
+    </div>
+    <div class="form" id="idleForm">
+      <div class="row3">
+        <label>自动提醒
+          <select id="idleEnabled">
+            <option value="1">开启</option>
+            <option value="0">关闭</option>
+          </select>
+        </label>
+        <label>空闲多久提醒（分钟）<input id="idleAfter" type="number" min="1" max="1440" step="1" value="10"></label>
+        <label>提醒后多久上榜（分钟）<input id="idleFollowup" type="number" min="1" max="1440" step="1" value="10"></label>
+      </div>
+      <label>提醒内容（支持 {project} / {agent_id} / {idle_minutes} / {followup_minutes} / {task_endpoint} / {issue_endpoint}）
+        <textarea id="idleMessage" rows="3"></textarea>
+      </label>
+      <div class="row">
+        <button class="primary" id="btnIdleSave">保存配置</button>
+        <button id="btnIdleCheck">立即检查</button>
+        <span class="muted" id="idleHint" style="align-self:center"></span>
+      </div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>节点</th><th>在线</th><th class="num">名下任务</th><th>空闲起点</th><th>提醒时间</th>
+        <th>上榜时间</th><th>最近任务 list</th><th>最近 Issue list</th><th>最近主动调用</th>
+      </tr></thead>
+      <tbody id="idleAgents"><tr><td colspan="9" class="empty">选择具体项目查看</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
     <h2>任务 <span class="muted" id="taskStat"></span></h2>
     <div class="form taskForm">
       <div class="row">
@@ -685,6 +720,9 @@ const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
 let TASK_ROWS = [];                // 最近一次任务台账快照（任务 tab 用）
 let ISSUE_ROWS = [];               // 最近一次 Issue 台账快照
+let IDLE_ROWS = [];                // 最近一次“待唤醒”快照
+let IDLE_CONFIG = null;            // 当前项目空闲提醒配置
+let IDLE_CFG_DIRTY = false;        // 用户正在编辑时不被自动刷新覆盖
 let ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
 let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
 let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
@@ -873,6 +911,9 @@ function activateProject(project) {
   if (sel) sel.value = project;
   try { localStorage.setItem("hub.project", project); } catch {}
   updateScopeLabel();
+  IDLE_CFG_DIRTY = false;
+  IDLE_CONFIG = null;
+  IDLE_ROWS = [];
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
@@ -1065,6 +1106,48 @@ async function loadIssues() {
   updateBadges();
   renderIssueRows();
   renderDashboard();
+}
+
+async function loadIdle() {
+  const project = current;
+  if (!project || project === "*") {
+    IDLE_ROWS = [];
+    IDLE_CONFIG = null;
+    $("idleStat").textContent = "选择具体项目";
+    $("idleHint").textContent = "";
+    $("idleAgents").innerHTML = `<tr><td colspan="9" class="empty">选择具体项目查看</td></tr>`;
+    return;
+  }
+  const d = await api(`/admin/p/${project}/idle`);
+  if (current !== project) return;
+  IDLE_CONFIG = d.config || {};
+  IDLE_ROWS = d.agents || [];
+  if (!IDLE_CFG_DIRTY) {
+    $("idleEnabled").value = IDLE_CONFIG.enabled ? "1" : "0";
+    $("idleAfter").value = String(Math.max(1, Math.round(Number(IDLE_CONFIG.idle_after_s || 600) / 60)));
+    $("idleFollowup").value = String(Math.max(1, Math.round(Number(IDLE_CONFIG.followup_after_s || 600) / 60)));
+    $("idleMessage").value = IDLE_CONFIG.message || "";
+  }
+  $("idleHint").textContent = d.migration_required || IDLE_CONFIG.ready === false
+    ? "⚠️ 空闲提醒表尚未迁移：请先执行 worker/migrations/20261124-idle-reminder.sql"
+    : "";
+  $("idleStat").textContent = !IDLE_CONFIG.enabled
+    ? "自动提醒已关闭"
+    : `${IDLE_ROWS.length} 台待唤醒 · 空闲 ${Math.round(Number(IDLE_CONFIG.idle_after_s || 600) / 60)} 分钟提醒`;
+  const fmt = (ms) => Number(ms) > 0 ? new Date(Number(ms)).toLocaleString() : "—";
+  $("idleAgents").innerHTML = IDLE_ROWS.length ? IDLE_ROWS.map((a) => `
+    <tr>
+      <td><span class="mono">${esc(a.agent_id)}</span></td>
+      <td><span class="badge alive">在线</span></td>
+      <td class="num">${Number(a.active_tasks ?? 0)}</td>
+      <td class="muted">${fmt(a.idle_since_ms)}</td>
+      <td class="muted">${fmt(a.reminded_at)}</td>
+      <td class="muted">${fmt(a.flagged_at)}</td>
+      <td class="muted">${fmt(a.last_task_list_ms)}</td>
+      <td class="muted">${fmt(a.last_issue_list_ms)}</td>
+      <td class="muted">${fmt(a.last_active_ms)}</td>
+    </tr>`).join("")
+    : `<tr><td colspan="9" class="empty">${IDLE_CONFIG.enabled ? "暂无上榜节点" : "自动提醒关闭中"}</td></tr>`;
 }
 
 function renderIssueRows() {
@@ -2151,6 +2234,7 @@ const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "名册"] },
   { id: "task",     label: "任务", cards: ["任务"] },
   { id: "issue",    label: "Issue", cards: ["Issue"] },
+  { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
   { id: "msg",      label: "消息", cards: ["消息流", "定向指令", "广播"] },
   { id: "deli",     label: "交付", cards: ["交付箱"] },
   { id: "access",   label: "接入", cards: ["签发 token", "注册审批", "登录封禁"] },
@@ -2419,7 +2503,7 @@ async function loadAnalytics(fresh = false) {
 function setProjectPanels(enabled) {
   document.body.classList.toggle("view-all", !enabled);
   syncBulkAvailability();
-  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast", "btnTaskCreate"]) {
+  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast", "btnTaskCreate", "btnIdleSave", "btnIdleCheck"]) {
     const el = $(id);
     if (el) el.disabled = !enabled;
   }
@@ -2467,6 +2551,7 @@ async function refresh(forceFresh = false) {
   // 各面板独立容错：任一非核心接口失败不应让整页 lock()。
   // 用 allSettled 并打印失败项，界面其余部分照常渲染。
   const parts = [loadAgents(), loadSec(), loadStats(forceFresh), loadEnr(), loadAnalytics(forceFresh)];
+  if (current !== "*") parts.push(loadIdle());
   const results = await Promise.allSettled(parts);
   if (current !== scope || epoch !== refreshEpoch) return;
   results.forEach((r, i) => {
@@ -2647,6 +2732,53 @@ $("gateCancel").onclick = () => {
   token = ""; localStorage.removeItem(KEY);
   lock("已取消：没有凭证时不会显示任何项目数据。点“连接”可重新输入。");
 };
+for (const id of ["idleEnabled", "idleAfter", "idleFollowup", "idleMessage"]) {
+  const el = $(id);
+  if (el) el.addEventListener("input", () => { IDLE_CFG_DIRTY = true; });
+}
+
+$("btnIdleSave").onclick = async () => {
+  if (!current || current === "*") return;
+  const enabled = $("idleEnabled").value === "1";
+  const idleMin = Number($("idleAfter").value);
+  const followMin = Number($("idleFollowup").value);
+  if (!Number.isFinite(idleMin) || idleMin < 1 || !Number.isFinite(followMin) || followMin < 1) {
+    showToast("两个时间都必须至少 1 分钟", 5000);
+    return;
+  }
+  const body = {
+    enabled,
+    idle_after_s: Math.round(idleMin * 60),
+    followup_after_s: Math.round(followMin * 60),
+    message: $("idleMessage").value,
+  };
+  $("btnIdleSave").disabled = true;
+  try {
+    await api(`/admin/p/${current}/idle`, "PUT", body);
+    IDLE_CFG_DIRTY = false;
+    showToast(`空闲提醒配置已保存（${enabled ? "开启" : "关闭"}）`, 5000);
+    await loadIdle();
+  } catch (e) {
+    showToast(`保存失败：${e.message || e}`, 8000);
+  } finally {
+    $("btnIdleSave").disabled = false;
+  }
+};
+
+$("btnIdleCheck").onclick = async () => {
+  if (!current || current === "*") return;
+  $("btnIdleCheck").disabled = true;
+  try {
+    const r = await api(`/admin/p/${current}/idle/check`, "POST", {});
+    showToast(`检查完成：新提醒 ${r.reminded ?? 0} 个，新上榜 ${r.flagged ?? 0} 个`, 6000);
+    await loadIdle();
+  } catch (e) {
+    showToast(`检查失败：${e.message || e}`, 8000);
+  } finally {
+    $("btnIdleCheck").disabled = false;
+  }
+};
+
 $("btnTaskCreate").onclick = async () => {
   if (current === "*") return alert("先选择具体项目再派单");
   const title = $("taskTitle").value.trim();

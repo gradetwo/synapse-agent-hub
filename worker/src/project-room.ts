@@ -1,6 +1,6 @@
 // ProjectRoom：每项目一个 Durable Object。
 // 单线程 ⇒ seq 单调递增、任务认领免锁 CAS、心跳覆盖写。
-import { Env, Msg, Task } from "./types";
+import { Env, Msg, Task, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOWUP_DEFAULT_S, IDLE_ONLINE_MS } from "./types";
 
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
 const DEFAULT_TASK_LEASE_MS = 12 * 60 * 60_000; // 任务 claim 默认租约 12h；心跳会续，LEASE_TTL_S 可调
@@ -70,6 +70,8 @@ export class ProjectRoom implements DurableObject {
       case "tasks/admin-reassign": return this.adminReassign(body);
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
+      case "agent/activity": return this.markActivity(body);
+      case "agents/idle-list": return this.idleList(body);
       case "agent/remove": return this.removeAgent(body);
       case "ws":           return this.ws(req);
       case "wsstat": {
@@ -78,7 +80,7 @@ export class ProjectRoom implements DurableObject {
         return json({ sockets: live.length, agents: new Set(live.map((x) => x.agent)).size, live });
       }
       case "snapshot":     return this.snapshot();
-      case "cron/tick":    return this.tick();
+      case "cron/tick":    return this.tick(body);
       default:             return json({ error: "unknown_action", action }, 404);
     }
   }
@@ -887,6 +889,235 @@ export class ProjectRoom implements DurableObject {
     return json({ agents: list });
   }
 
+  // ── 空闲提醒：活动记录、配置和 cron 扫描 ──────────────────
+  /** 记录一次主动调用；由 Worker 在数据面入口异步写入，避免拖慢原请求。 */
+  private async markActivity(b: any) {
+    const agentId = String(b?.agent_id ?? "").trim();
+    if (!agentId) return json({ error: "agent_id_required" }, 422);
+    const project = String(b?.project ?? "").trim();
+    if (!project) return json({ error: "project_required" }, 422);
+    const kind = String(b?.kind ?? "activity");
+    const now = Date.now();
+    try {
+      await this.env.DB.prepare(
+        `INSERT INTO agent_idle
+           (project, agent_id, idle_since_ms, reminded_at, flagged_at,
+            last_task_list_ms, last_issue_list_ms, last_active_ms)
+         VALUES (?,?,?,0,0,?,?,?)
+         ON CONFLICT(project, agent_id) DO UPDATE SET
+           last_task_list_ms = CASE WHEN excluded.last_task_list_ms > 0
+             THEN excluded.last_task_list_ms ELSE agent_idle.last_task_list_ms END,
+           last_issue_list_ms = CASE WHEN excluded.last_issue_list_ms > 0
+             THEN excluded.last_issue_list_ms ELSE agent_idle.last_issue_list_ms END,
+           last_active_ms = excluded.last_active_ms,
+           idle_since_ms = excluded.idle_since_ms,
+           reminded_at = 0,
+           flagged_at = 0`
+      ).bind(
+        project, agentId, now,
+        kind === "task_list" ? now : 0,
+        kind === "issue_list" ? now : 0,
+        now,
+      ).run();
+    } catch (e) {
+      console.warn("agent activity write failed", project, agentId, e);
+    }
+    return json({ ok: true });
+  }
+
+  private async idleConfig(project: string) {
+    const fallback = {
+      enabled: true,
+      idle_after_s: IDLE_AFTER_DEFAULT_S,
+      followup_after_s: IDLE_FOLLOWUP_DEFAULT_S,
+      message: IDLE_DEFAULT_MESSAGE,
+    };
+    if (!project) return { ...fallback, enabled: false };
+    try {
+      const row = await this.env.DB.prepare(
+        `SELECT enabled, idle_after_s, followup_after_s, message
+           FROM idle_reminder_config WHERE project = ?`
+      ).bind(project).first<any>();
+      if (!row) return fallback;
+      return {
+        enabled: Number(row.enabled) !== 0,
+        idle_after_s: Math.max(1, Math.min(86400, Number(row.idle_after_s) || IDLE_AFTER_DEFAULT_S)),
+        followup_after_s: Math.max(1, Math.min(86400, Number(row.followup_after_s) || IDLE_FOLLOWUP_DEFAULT_S)),
+        message: String(row.message || IDLE_DEFAULT_MESSAGE),
+      };
+    } catch (e) {
+      // 迁移未跑/表缺失时不要误发提醒；管理台会提示先执行迁移。
+      console.warn("idle config read failed", project, e);
+      return { ...fallback, enabled: false };
+    }
+  }
+
+  private renderIdleMessage(template: string, project: string, agentId: string,
+                            idleAfterS: number, followupS: number) {
+    const vars: Record<string, string> = {
+      project, agent_id: agentId,
+      idle_minutes: String(Math.round(idleAfterS / 60)),
+      followup_minutes: String(Math.round(followupS / 60)),
+      task_endpoint: `/p/${project}/tasks`,
+      issue_endpoint: `/p/${project}/issues`,
+    };
+    return String(template).replace(/\{(project|agent_id|idle_minutes|followup_minutes|task_endpoint|issue_endpoint)\}/g,
+      (_, k) => vars[k] ?? `{${k}}`);
+  }
+
+  private async saveIdleRow(project: string, agentId: string, row: any) {
+    await this.env.DB.prepare(
+      `INSERT OR REPLACE INTO agent_idle
+         (project, agent_id, idle_since_ms, reminded_at, flagged_at,
+          last_task_list_ms, last_issue_list_ms, last_active_ms)
+       VALUES (?,?,?,?,?,?,?,?)`
+    ).bind(project, agentId,
+      Number(row.idle_since_ms ?? 0), Number(row.reminded_at ?? 0), Number(row.flagged_at ?? 0),
+      Number(row.last_task_list_ms ?? 0), Number(row.last_issue_list_ms ?? 0),
+      Number(row.last_active_ms ?? 0),
+    ).run().catch((e) => console.warn("idle row save failed", project, agentId, e));
+  }
+
+  private async idleTick(project: string) {
+    const cfg = await this.idleConfig(project);
+    const now = Date.now();
+    if (!cfg.enabled) {
+      // 关闭自动提醒时清空提醒/上榜，重新打开后从新的空闲周期开始。
+      await this.env.DB.prepare(
+        `UPDATE agent_idle SET idle_since_ms = ?, reminded_at = 0, flagged_at = 0
+           WHERE project = ?`
+      ).bind(now, project).run().catch((e) => console.warn("idle reset failed", project, e));
+      return { reminded: 0, flagged: 0 };
+    }
+    let rows: any[] = [];
+    try {
+      const r = await this.env.DB.prepare(
+        `SELECT project, agent_id, idle_since_ms, reminded_at, flagged_at,
+                last_task_list_ms, last_issue_list_ms, last_active_ms
+           FROM agent_idle WHERE project = ?`
+      ).bind(project).all<any>();
+      rows = r.results ?? [];
+    } catch (e) {
+      console.warn("idle rows read failed", project, e);
+      return { reminded: 0, flagged: 0 };
+    }
+    const byId = new Map(rows.map((r) => [String(r.agent_id), r]));
+    const agents = await this.st.list<any>({ prefix: "agent:" });
+    let reminded = 0, flagged = 0;
+    for (const rec of agents.values()) {
+      const agentId = String(rec?.agent_id ?? "").trim();
+      if (!agentId || rec.role === "admin") continue;
+      const hbAge = now - Number(rec.last_hb_ms ?? 0);
+      if (hbAge > IDLE_ONLINE_MS) continue;
+      const load = await this.activeTaskLoad(agentId);
+      let row: any = byId.get(agentId) ?? {
+        idle_since_ms: 0, reminded_at: 0, flagged_at: 0,
+        last_task_list_ms: 0, last_issue_list_ms: 0, last_active_ms: 0,
+      };
+      let dirty = false;
+      if (load.active_tasks > 0) {
+        if (row.idle_since_ms || row.reminded_at || row.flagged_at) {
+          row.idle_since_ms = row.reminded_at = row.flagged_at = 0;
+          dirty = true;
+        }
+        if (dirty) await this.saveIdleRow(project, agentId, row);
+        continue;
+      }
+      if (!row.idle_since_ms) {
+        row.idle_since_ms = now;
+        dirty = true;
+      }
+      // 防止“ Worker 写活动、DO 读旧行”的竞态：以活动时间作为新的空闲起点。
+      if (Number(row.last_active_ms ?? 0) > Number(row.idle_since_ms ?? 0)) {
+        row.idle_since_ms = Number(row.last_active_ms);
+        dirty = true;
+      }
+      if (cfg.enabled && Number(row.reminded_at) === 0 &&
+          now - Number(row.idle_since_ms) >= cfg.idle_after_s * 1000) {
+        const message = this.renderIdleMessage(cfg.message, project, agentId,
+                                              cfg.idle_after_s, cfg.followup_after_s);
+        try {
+          await this.append({
+            project, sender: "system", topic: "system", kind: "idle_reminder",
+            to: agentId,
+            payload: {
+              title: "空闲提醒：去公共池找任务或上报 Issue",
+              body: message,
+              agent_id: agentId,
+              task_endpoint: `/p/${project}/tasks`,
+              issue_endpoint: `/p/${project}/issues`,
+            },
+            max_per_min: 1000,
+            dedupe_key: `idle-reminder:${agentId}:${row.idle_since_ms}`,
+          } as any);
+          row.reminded_at = now;
+          row.flagged_at = 0;
+          dirty = true;
+          reminded++;
+        } catch (e) {
+          console.warn("idle reminder append failed", project, agentId, e);
+        }
+      }
+      if (Number(row.reminded_at) > 0 && Number(row.flagged_at) === 0 &&
+          now - Number(row.reminded_at) >= cfg.followup_after_s * 1000) {
+        if (Number(row.last_active_ms ?? 0) > Number(row.reminded_at)) {
+          row.reminded_at = 0;
+          row.flagged_at = 0;
+          row.idle_since_ms = Math.max(now, Number(row.last_active_ms));
+        } else {
+          row.flagged_at = now;
+          flagged++;
+        }
+        dirty = true;
+      }
+      if (dirty) await this.saveIdleRow(project, agentId, row);
+    }
+    return { reminded, flagged };
+  }
+
+  /** 管理台“待唤醒”列表：只返回已超过 followup 仍无动作的在线 agent。 */
+  private async idleList(b: any) {
+    const project = String(b?.project ?? "").trim();
+    if (!project) return json({ agents: [] });
+    const cfg = await this.idleConfig(project);
+    if (!cfg.enabled) return json({ agents: [] });
+    let rows: any[] = [];
+    try {
+      const r = await this.env.DB.prepare(
+        `SELECT * FROM agent_idle WHERE project = ? AND flagged_at > 0
+           ORDER BY flagged_at ASC`
+      ).bind(project).all<any>();
+      rows = r.results ?? [];
+    } catch (e) {
+      console.warn("idle list read failed", project, e);
+      return json({ agents: [] });
+    }
+    const now = Date.now();
+    const records = await this.st.list<any>({ prefix: "agent:" });
+    const agents: any[] = [];
+    for (const row of rows) {
+      const rec = records.get(`agent:${row.agent_id}`);
+      if (!rec || rec.role === "admin") continue;
+      if (now - Number(rec.last_hb_ms ?? 0) > IDLE_ONLINE_MS) continue;
+      if (Number(row.last_active_ms ?? 0) > Number(row.flagged_at ?? 0)) continue;
+      const load = await this.activeTaskLoad(String(row.agent_id));
+      if (load.active_tasks > 0) continue;
+      agents.push({
+        agent_id: row.agent_id,
+        online: true,
+        last_hb_ms: rec.last_hb_ms ?? 0,
+        active_tasks: load.active_tasks,
+        idle_since_ms: row.idle_since_ms ?? 0,
+        reminded_at: row.reminded_at ?? 0,
+        flagged_at: row.flagged_at ?? 0,
+        last_task_list_ms: row.last_task_list_ms ?? 0,
+        last_issue_list_ms: row.last_issue_list_ms ?? 0,
+        last_active_ms: row.last_active_ms ?? 0,
+      });
+    }
+    return json({ agents });
+  }
+
   private async snapshot() {
     const seq = (await this.st.get<number>("seq")) ?? 0;
     const now = Date.now();
@@ -901,7 +1132,7 @@ export class ProjectRoom implements DurableObject {
   }
 
   // ── cron：回收过期租约 ────────────────────────────────────
-  private async tick() {
+  private async tick(b: any = {}) {
     const now = Date.now();
     let reclaimed = 0;
     const r = await this.st.list<Task>({ prefix: "task:" });
@@ -919,7 +1150,9 @@ export class ProjectRoom implements DurableObject {
         reclaimed++;
       }
     }
-    return json({ ok: true, reclaimed });
+    const project = String(b?.project ?? "").trim();
+    const idle = project ? await this.idleTick(project) : { reminded: 0, flagged: 0 };
+    return json({ ok: true, reclaimed, ...idle });
   }
 }
 

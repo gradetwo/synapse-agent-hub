@@ -1,3 +1,12 @@
+/** 空闲提醒默认值；管理台可按项目覆盖。 */
+export const IDLE_AFTER_DEFAULT_S = 600;
+export const IDLE_FOLLOWUP_DEFAULT_S = 600;
+export const IDLE_ONLINE_MS = 120_000;
+export const IDLE_DEFAULT_MESSAGE =
+  "你已在线且连续 {idle_minutes} 分钟名下没有任务，也没有查看任务池或 Issue。" +
+  "请立即 GET {task_endpoint} 领取公共任务，或用 POST {issue_endpoint} 上报你发现的缺口；" +
+  "再过 {followup_minutes} 分钟没有任何主动调用会被管理台标记。";
+
 export interface Env {
   PROJECT_ROOM: DurableObjectNamespace;
   DB: D1Database;
@@ -17,7 +26,7 @@ export interface Msg {
   seq: number;
   project?: string;
   sender: string;
-  topic: "announce" | "task" | "artifact" | "report" | "ack" | "status" | "alert" | "admin" | "issue";
+  topic: "announce" | "task" | "artifact" | "report" | "ack" | "status" | "alert" | "admin" | "issue" | "system";
   kind: string;
   payload: unknown;
   dedupe_key?: string;
