@@ -820,7 +820,7 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | agents | subs | send | broadcast | get\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
+        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | subs | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
   synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -1099,6 +1099,13 @@ fn main() {
                             }
                             #[cfg(not(windows))]
                             {
+                                // 先补权限位再 rename：临时文件默认 0644，直接覆盖会让
+                                // 新二进制丢可执行位（ISS-MWSNUQQP-58ECCC）。
+                                if let Err(e) = apply_upgrade_mode(&tmp, &current) {
+                                    eprintln!("设置新二进制权限失败：{e}；已放弃替换（旧版本未动）");
+                                    let _ = fs::remove_file(&tmp);
+                                    std::process::exit(5);
+                                }
                                 match fs::rename(&tmp, &current) {
                                     Ok(_) => println!("{}", json!({"ok": true, "from": mine, "to": latest,
                                                                   "platform": platform, "bytes": b.len()})),
@@ -1128,7 +1135,9 @@ fn main() {
         "subs" => {
             let state = args_map.get("state").cloned().unwrap_or_default();
             let q = if state.is_empty() { String::from("") } else { format!("?state={state}") };
-            match admin_get(&cfg, &agent, &base, &format!("/x/admin/p/{}/submissions{}", cfg.project, q)) {
+            // 交付只读走数据面：/x/admin 只认 admin token，普通 agent 永远 403
+            // （ISS-MWSZPB49-B96120）；服务端已对项目 agent 开放 GET /p/<proj>/submissions。
+            match admin_get(&cfg, &agent, &base, &format!("/p/{}/submissions{}", cfg.project, q)) {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
                 Err(e) => { eprintln!("subs 失败：{e}"); std::process::exit(1); }
             }
@@ -1203,7 +1212,8 @@ fn main() {
         "get" => {
             let sid = args_map.get("sid").cloned().or_else(|| std::env::args().nth(2)).unwrap_or_default();
             let out = args_map.get("out").cloned().unwrap_or_else(|| format!("{}.zip", sid));
-            match admin_bytes(&cfg, &agent, &base, &format!("/x/admin/p/{}/submissions/{}/bundle", cfg.project, sid)) {
+            // bundle 下载同样走数据面只读路径，普通 agent token 可用（ISS-MWSZPB49-B96120）。
+            match admin_bytes(&cfg, &agent, &base, &format!("/p/{}/submissions/{}/bundle", cfg.project, sid)) {
                 Ok(b) => {
                     if let Err(e) = fs::write(&out, &b) { eprintln!("写文件失败：{e}"); std::process::exit(1); }
                     println!("{}", json!({"ok": true, "file": out, "bytes": b.len()}));
@@ -2135,19 +2145,51 @@ fn parse_proxy_url(raw: &str) -> Result<ProxyCfg, String> {
     })
 }
 
-/// 直连可达性探测：只看 TCP/TLS/HTTP 是否通。任何 HTTP 状态码（含 4xx/5xx）
-/// 都说明“直连能到达 Hub”，不应该因为业务错误就误切代理。
-fn direct_reachable(endpoint: &str) -> bool {
+/// 单次直连探测的超时：3 秒在抖动网络下频繁误判（wb-win-189 实测一分钟内
+/// 直连→代理→直连翻转，ISS-MWSP9ART-9C0134），放宽到 8 秒。
+const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// 首次失败后重试一次；两次都失败才判直连不可用，避免单次抖动就整场走代理。
+const DIRECT_PROBE_ATTEMPTS: u32 = 2;
+
+/// 一次直连探测：只看 TCP/TLS/HTTP 是否通。任何 HTTP 状态码（含 4xx/5xx）
+/// 都说明“直连能到达 Hub”，不应该因为业务错误就误切代理。通了返回本次耗时。
+fn probe_direct_once(endpoint: &str) -> Option<Duration> {
     let url = format!("{}/ver", endpoint.trim_end_matches('/'));
+    let started = std::time::Instant::now();
     let probe = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(3))
+        .timeout(DIRECT_PROBE_TIMEOUT)
         .user_agent(concat!("synapse-agent/", env!("CARGO_PKG_VERSION"), " (rust)"))
         .build();
     match probe.get(&url).call() {
-        Ok(_) => true,
-        Err(ureq::Error::Status(_, _)) => true,
-        Err(_) => false,
+        Ok(_) => Some(started.elapsed()),
+        Err(ureq::Error::Status(_, _)) => Some(started.elapsed()),
+        Err(_) => None,
     }
+}
+
+/// 升级替换前把旧二进制的权限位复制到临时文件：fs::write 新建的文件是 0644，
+/// rename 覆盖后新二进制没有可执行位，进程下次启动直接 Permission denied
+/// （ISS-MWSNUQQP-58ECCC）。读不到旧权限时兜底 0755，并强制带上执行位。
+#[cfg(not(windows))]
+fn apply_upgrade_mode(tmp: &str, current: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(current).map(|m| m.permissions().mode()).unwrap_or(0o755);
+    fs::set_permissions(tmp, fs::Permissions::from_mode(mode | 0o111))
+}
+
+/// 直连可达性探测：最多试 DIRECT_PROBE_ATTEMPTS 次；通了返回成功那次的耗时，
+/// 供启动日志记录，免得再出现“探针误判、原因不明”。
+fn probe_direct(endpoint: &str) -> Option<Duration> {
+    for _ in 0..DIRECT_PROBE_ATTEMPTS {
+        if let Some(elapsed) = probe_direct_once(endpoint) {
+            return Some(elapsed);
+        }
+    }
+    None
+}
+
+fn direct_reachable(endpoint: &str) -> bool {
+    probe_direct(endpoint).is_some()
 }
 
 /// 启动时解析一次：显式 --proxy 优先；未显式指定时先试直连，失败才用环境代理。
@@ -2180,12 +2222,13 @@ fn init_proxy(endpoint: &str) {
                 if explicit {
                     eprintln!("[proxy] 已启用代理 {}（--proxy 参数）", p.display);
                     Some(p)
-                } else if direct_reachable(endpoint) {
+                } else if let Some(elapsed) = probe_direct(endpoint) {
                     // 默认直连优先：环境里虽然有代理变量，但 Hub 直连可达时不要绕代理。
-                    eprintln!("[proxy] 直连可用，跳过代理 {}（环境变量自动检测）", p.display);
+                    eprintln!("[proxy] 直连可用（探测耗时 {}ms），跳过代理 {}（环境变量自动检测）", elapsed.as_millis(), p.display);
                     None
                 } else {
-                    eprintln!("[proxy] 直连不可用，改用代理 {}（环境变量自动检测）", p.display);
+                    eprintln!("[proxy] 直连不可用（探测 {} 次均失败，单次超时 {}s），改用代理 {}（环境变量自动检测）",
+                              DIRECT_PROBE_ATTEMPTS, DIRECT_PROBE_TIMEOUT.as_secs(), p.display);
                     Some(p)
                 }
             }
@@ -2742,6 +2785,48 @@ mod tests {
             tmux_forward: false,
             tmux_verify: true,
         }
+    }
+
+    #[test]
+    fn upgrade_mode_preserves_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("upgrade-mode");
+        let current = dir.join("synapse-agent");
+        let tmp = dir.join("synapse-agent.new");
+        fs::write(&current, b"old").unwrap();
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::write(&tmp, b"new").unwrap(); // fs::write 新建文件是 0644，没有可执行位
+        let before = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(before & 0o111, 0, "fixture tmp file must start without exec bits");
+        apply_upgrade_mode(tmp.to_str().unwrap(), &current).unwrap();
+        let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o751, "tmp must inherit the old binary's mode before rename");
+    }
+
+    #[test]
+    fn direct_probe_reaches_local_listener() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+            }
+        });
+        let endpoint = format!("http://127.0.0.1:{port}");
+        assert!(probe_direct(&endpoint).is_some(), "live local listener must probe reachable");
+        let _ = server.join();
+    }
+
+    #[test]
+    fn direct_probe_dead_port_is_unreachable() {
+        // 绑一个端口再立刻释放：几乎必然无人监听，连接会被拒绝。
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+            .local_addr().unwrap().port();
+        assert!(probe_direct(&format!("http://127.0.0.1:{port}")).is_none(),
+                "refused port must probe unreachable after retries");
     }
 
     #[test]
