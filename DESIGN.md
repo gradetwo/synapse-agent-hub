@@ -166,7 +166,9 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 | POST | `/p/{p}/ack` | ack | `status: done \| refused \| blocked \| stale` |
 | POST | `/p/{p}/report` | report | 任务 + 资源详单 |
 | GET | `/p/{p}/tasks` | tasks.read | 公共池：只列 `open` 且无 `to` 的任务 |
-| POST | `/p/{p}/tasks/claim` | tasks.claim | 认领公共任务；租约默认 12h（`LEASE_TTL_S`）；名下未完成 ≥5 时 409 `agent_task_limit_exceeded` |
+| GET | `/p/{p}/tasks?mine=1` | tasks.read | 自查名下任务（open 定向/claimed/blocked/released），带 `counts_toward_limit` |
+| GET | `/p/{p}/tasks/{task_id}` | tasks.read | 自查单条任务；非本人名下 404 |
+| POST | `/p/{p}/tasks/claim` | tasks.claim | 认领公共任务；租约默认 12h（`LEASE_TTL_S`）；`claimed` ≥5 时 409 `agent_task_limit_exceeded` |
 | GET | `/p/{p}/issues` | issues.read | 只列 `open` 且 `task_id IS NULL` 的 Issue |
 | POST | `/p/{p}/issues/{id}/claim` | issues.report | 任意项目 agent 把未指派 open Issue 转成自己的任务；同样受 ≥5 限制 |
 | POST | `/p/{p}/tasks/release` | publish | `done \| blocked`；目标 done 且该任务仍有待取交付时只进 `released`（见 §7 联动） |
@@ -256,7 +258,7 @@ projects(project PK, display_name, status, max_agents, max_storage_mb,
 ### 6.1 空闲提醒（普通 agent）
 
 - `agent_idle` 按 `(project, agent_id)` 记录 `idle_since_ms`、`reminded_at`、`flagged_at`、最近任务/Issue list 和最近主动调用。心跳、自动 ack、收件轮询不算主动调用。
-- cron 每分钟扫描在线（心跳 ≤120s）且名下活跃任务为 0 的普通 agent：连续 `idle_after_s` 无主动调用即发定向 `system/idle_reminder` 私信；再经过 `followup_after_s` 仍无任务、无主动调用，则进入管理台“待唤醒”列表。
+- cron 每分钟扫描在线（心跳 ≤120s）且名下已 claim 任务为 0 的普通 agent：连续 `idle_after_s` 无主动调用即发定向 `system/idle_reminder` 私信；再经过 `followup_after_s` 仍无任务、无主动调用，则进入管理台“待唤醒”列表。
 - `idle_after_s` 与 `followup_after_s` 相互独立，默认 600 秒；项目级配置存 `idle_reminder_config`，支持开关与文案模板变量。
 - 管理员派单或 agent 自己领到任务后，下一次扫描会清空空闲/提醒/上榜状态；关闭开关时也会清空提醒与上榜，重新打开从新的空闲周期开始。
 

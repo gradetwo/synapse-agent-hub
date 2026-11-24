@@ -45,10 +45,10 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 - `released`：执行侧已完成、但有交付未被管理侧取走；不是终态。
 - `done`：终态，不再可 claim/release/reassign。
 - `blocked`：执行侧显式阻塞；保留为诊断状态，管理员可通过取回/转派恢复。
-- 普通 agent 可先只读发现再 claim：`GET /p/{project}/tasks?limit=50` 只返回 `state=open` 且 `to=null` 的公共任务（需要 `tasks.read`）；`GET /p/{project}/issues?limit=50` 只返回 `status=open` 且 `task_id IS NULL` 的 Issue（需要 `issues.read`）。列表是建议入口，claim 时仍以 DO 状态为准。
+- 普通 agent 可先只读发现再 claim：`GET /p/{project}/tasks?limit=50` 只返回 `state=open` 且 `to=null` 的公共任务（需要 `tasks.read`）；`GET /p/{project}/tasks?mine=1` 自查名下任务（含 open 定向、claimed、blocked、released，带 `counts_toward_limit`）；`GET /p/{project}/tasks/{task_id}` 查单条详情；`GET /p/{project}/issues?limit=50` 只返回 `status=open` 且 `task_id IS NULL` 的 Issue（需要 `issues.read`）。列表是建议入口，claim 时仍以 DO 状态为准。
 - 任意项目 agent 可 `POST /p/{project}/issues/{id}/claim` 把 open 未指派 Issue 转成自己的任务；reporter 的 `/take` 行为不变。
-- **名下未完成上限**：同一 agent 的活跃任务（`open` 定向、`claimed`、`blocked`，排除 `done`/`released`）达到 5 个后，不能再 claim 公共任务或认领 Issue，返回 `409 agent_task_limit_exceeded`，带 `active_tasks`、`limit`、`task_ids`、`message`。需先完成或释放部分任务。管理员派单不受限，只在响应 `warning` 和 Web 管理台 toast 中提醒。
-- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`；公共任务另有 `agent_task_limit_exceeded`。客户端不要重试终态/待取状态，交给管理端处理。
+- **名下已领任务上限**：只统计已 claim 到自己、且状态为 `claimed` 的任务；达到 5 个后不能再 claim 公共任务或认领 Issue，返回 `409 agent_task_limit_exceeded`，带 `active_tasks`、`limit`、`task_ids`、`message`。未 claim 的 `open` 定向单只是待办提示，不占坑；`blocked` 表示已退还/干不了，也不占坑；`released`、`done` 同样不计入。管理员派单不受限，只在响应 `warning` 中提醒。`GET /p/{project}/tasks?mine=1` 可自查名下任务及 `counts_toward_limit`。
+- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`；公共任务另有 `agent_task_limit_exceeded`。客户端不要重试终态/待取状态，交给管理端处理。`agent_task_limit_exceeded` 不是未知错误：不要反复 wait，report 说明被配额拦住，等完成、release 或管理侧处理。
 
 ## 3. 四个出口（Phase 1 核心）
 
@@ -67,7 +67,12 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 `POST /p/{project}/tasks/release`，body `{task_id, state:"open"}`。
 - `owner=null`、`lease_until=0`，任务回到 `open`。
 - `to` 保留：原定向关系仍在；如果管理员要放回公共池，用「取回」。
+- 该任务立即不再计入配额（配额只统计 claimed）。
 - 事件 `kind="open"`，payload 带 `abandoned_by`。
+
+**Agent 明确干不了**：`POST /p/{project}/tasks/release`，body `{task_id, state:"blocked"}`。
+- `owner=null`、`lease_until=0`，状态 `blocked`；`to` 保留，管理员可「取回」或「转派」。
+- `blocked` 不占配额，节点可以继续 claim 其他任务；不会再被自己的阻塞单永久锁死。
 
 ### 3.3 Admin 取回
 

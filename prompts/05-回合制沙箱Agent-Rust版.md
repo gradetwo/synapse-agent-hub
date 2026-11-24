@@ -75,6 +75,7 @@ YANSHI_WAIT=30 HOME=$STATE "$BIN" wait &
    409 locked = 已被别人有效领走（响应带 state、owner 与 lease_until），不要重复干，report 说明后跳过；
    409 already_done = 任务已完成，不要重试；409 blocked = 已被置为 blocked，不要 claim，报管理端取回/转派；
    409 released_pending_collection = 已交付但还有交付未取走，不要 claim，等管理端取件/关单；
+   409 agent_task_limit_exceeded = 名下 claimed 任务达到 5 个；不是未知错误，report 说明等释放/管理侧处理，不要反复 wait；
    403 not_your_task = 没指派给你，不要领，report 管理端；
    404 not_found = 单号写错或任务已撤，report 管理端核对。
    领单失败必须响亮 report（写明 task_id 与原始错误），不许静默跳过、不许没领单就开工。
@@ -89,7 +90,7 @@ YANSHI_WAIT=30 HOME=$STATE "$BIN" wait &
    有交付还没被取走时返回 released（已交付待取），最后一件取走后自动 done；
    这是正常状态，不是失败，不要重复 release。
    干不了先 report 写明原因，再 --state blocked；中途放弃用 --state open 并 report 说明。
-5. 普通 agent 可查询公共池与 open Issue（需 `tasks.read` / `issues.read`），但名下活跃任务达到 5 个后不能再自领；对账以本地记录 + 服务端列表为准。
+5. 普通 agent 可查询公共池与 open Issue（需 `tasks.read` / `issues.read`），并可用 `tasks?mine=1` 查自己名下任务、`tasks/<task_id>` 查单条详情；配额只统计`claimed` 任务，达到 5 个后不能再自领。未 claim 的 open 定向、blocked、released、done 不占坑；对账以本地记录 + 服务端列表为准。
 
 【处理纪律】
 1. 严格按 seq 顺序，不跳过积压；wait 内部已自动 ack 收到的那条。

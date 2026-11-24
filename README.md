@@ -305,7 +305,7 @@ synapse-agent issue --title "worker 心跳偶发 503" \
 synapse-agent issue-take --issue ISS-...
 ```
 
-`issue-take` 只有原 reporter 本人可以调用；其他项目 agent 可用 `POST /p/{project}/issues/{id}/claim` 自助认领。两者都要求 Issue 同时满足 `open` 且尚未派发（`task_id` 为空），且名下活跃任务达到 5 个后会被 `agent_task_limit_exceeded` 拦住。转换成功后任务以认领者为 `to`，任务完成时 Issue 自动关闭。
+`issue-take` 只有原 reporter 本人可以调用；其他项目 agent 可用 `POST /p/{project}/issues/{id}/claim` 自助认领。两者都要求 Issue 同时满足 `open` 且尚未派发（`task_id` 为空），且名下 `claimed` 任务达到 5 个后会被 `agent_task_limit_exceeded` 拦住（未 claim 的 open 定向、blocked 不占坑）。转换成功后任务以认领者为 `to`，任务完成时 Issue 自动关闭。
 
 上报时勾选 `--self` 但建任务失败不会丢 Issue：接口仍返回 `201`，`self_task.ok=false`，Issue 保持 `open`，可稍后用 `issue-take` 重试。
 
@@ -337,13 +337,15 @@ print(r["issue_id"])
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/p/{project}/tasks?limit=50` | 只列 `open` 且无 `to` 的公共任务（需 `tasks.read`） |
-| POST | `/p/{project}/tasks/claim` | 认领公共任务；名下活跃 ≥5 时返回 `409 agent_task_limit_exceeded` |
+| GET | `/p/{project}/tasks?mine=1` | 自查名下任务：open 定向、claimed、blocked、released；带 `counts_toward_limit` |
+| GET | `/p/{project}/tasks/{task_id}` | 自查单条任务详情；非本人名下返回 404 |
+| POST | `/p/{project}/tasks/claim` | 认领公共任务；名下 `claimed` ≥5 时返回 `409 agent_task_limit_exceeded` |
 | GET | `/p/{project}/issues?limit=50` | 只列 `open` 且 `task_id IS NULL` 的 Issue（需 `issues.read`） |
-| POST | `/p/{project}/issues/{id}/claim` | 任意项目 agent 认领未指派 Issue；同样受活跃任务上限约束 |
+| POST | `/p/{project}/issues/{id}/claim` | 任意项目 agent 认领未指派 Issue；同样受已 claim 任务上限约束 |
 
 ### 空闲提醒 / 待唤醒
 
-普通 agent 在线、名下没有活跃任务，并连续 `idle_after_s`（默认 600 秒）没有主动调用任务池 / Issue / 其他数据面接口时，系统会向它发一条定向私信，提示去公共池领任务或主动上报 Issue。消息发出后 `followup_after_s`（默认 600 秒）内仍没有产生任务、也没有主动调用接口，该节点会进入管理台 **待唤醒** tab 的列表。
+普通 agent 在线、名下没有 `claimed` 任务，并连续 `idle_after_s`（默认 600 秒）没有主动调用任务池 / Issue / 其他数据面接口时，系统会向它发一条定向私信，提示去公共池领任务或主动上报 Issue。消息发出后 `followup_after_s`（默认 600 秒）内仍没有产生任务、也没有主动调用接口，该节点会进入管理台 **待唤醒** tab 的列表。
 
 两个时间彼此独立，均可在该 tab 调整；同一页还可以编辑提醒文案（支持 `{project}`、`{agent_id}`、`{idle_minutes}`、`{followup_minutes}`、`{task_endpoint}`、`{issue_endpoint}`），并总开关自动提醒。`立即检查` 可手动触发一次扫描。
 

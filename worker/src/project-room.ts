@@ -4,7 +4,7 @@ import { Env, Msg, Task, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOW
 
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
 const DEFAULT_TASK_LEASE_MS = 12 * 60 * 60_000; // 任务 claim 默认租约 12h；心跳会续，LEASE_TTL_S 可调
-export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任务/Issue 时，名下未完成任务上限
+export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任务/Issue 时，名下已 claim 未完成任务上限
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
@@ -454,7 +454,7 @@ export class ProjectRoom implements DurableObject {
         if (load.active_tasks >= ACTIVE_TASK_LIMIT)
           return json({ error: "agent_task_limit_exceeded", active_tasks: load.active_tasks,
                         limit: ACTIVE_TASK_LIMIT, task_ids: load.task_ids,
-                        message: `你当前名下未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再认领 Issue。` }, 409);
+                        message: `你当前名下已 claim 未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再认领 Issue。` }, 409);
       }
     }
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
@@ -525,14 +525,14 @@ export class ProjectRoom implements DurableObject {
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
     if (t.state === "claimed" && t.owner === b.agent_id && Number(t.lease_until ?? 0) > now)
       return json({ ok: true, lease_until: t.lease_until, already: true });
-    // 自领公共任务前检查名下未完成任务；定向任务不受此限（管理员派单只提醒不拦截）。
+    // 自领公共任务前检查名下已 claim 未完成任务；定向任务不受此限（管理员派单只提醒不拦截）。
     // 过期后重领自己原来的任务时，把该任务本身从计数里排除。
     if (!t.to && (t.state === "open" || (t.state === "claimed" && Number(t.lease_until ?? 0) < now))) {
       const load = await this.activeTaskLoad(b.agent_id, String(t.task_id ?? t.id ?? ""));
       if (load.active_tasks >= ACTIVE_TASK_LIMIT)
         return json({ error: "agent_task_limit_exceeded", active_tasks: load.active_tasks,
                       limit: ACTIVE_TASK_LIMIT, task_ids: load.task_ids,
-                      message: `你当前名下未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再领取公共任务。` }, 409);
+                      message: `你当前名下已 claim 未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再领取公共任务。` }, 409);
     }
     // 非 open 状态按真实原因报错，不能一律说 locked：done/blocked/released 的
     // owner 与 lease_until 都是空值，旧实现会拼出“被锁定但 owner=null、租约 0”的
@@ -721,17 +721,17 @@ export class ProjectRoom implements DurableObject {
     });
   }
 
-  /** 名下未完成任务：只统计 open/claimed/blocked 且 owner 或 to 指向该 agent 的任务；
-   * released（已交付待管理侧取件）和 done 不再占用名额。 */
+  /** 配额只统计“已 claim 到自己”的 claimed 任务。
+   * 未 claim 的 open 定向单只是待办提示，不占坑；blocked 是“干不了/已退还”，
+   * 同样不占坑，否则节点会被自己的阻塞单永久锁死（ISS-MWUA0IR3-B2C294）。
+   * released（已交付待管理侧取件）和 done 也不再占用名额。 */
   private async activeTaskLoad(agentId: string, excludeTaskId = ""): Promise<{ active_tasks: number; task_ids: string[] }> {
     const rows = await this.st.list<any>({ prefix: "task:" });
     const ids: string[] = [];
     for (const t of rows.values()) {
-      if (!t || t.state === "done" || t.state === "released") continue;
+      if (!t || t.state !== "claimed" || t.owner !== agentId) continue;
       if (excludeTaskId && String(t.task_id ?? t.id ?? "") === excludeTaskId) continue;
-      const owns = t.owner === agentId;
-      const to = Array.isArray(t.to) ? t.to.includes(agentId) : t.to === agentId;
-      if (owns || (!t.owner && to)) ids.push(String(t.task_id ?? t.id ?? ""));
+      ids.push(String(t.task_id ?? t.id ?? ""));
     }
     return { active_tasks: ids.length, task_ids: ids.filter(Boolean).slice(0, 20) };
   }

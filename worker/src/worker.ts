@@ -305,8 +305,13 @@ export default {
     const subRead = req.method === "GET" &&
       (action === "submissions" || /^submissions\/[^/]+\/bundle$/.test(action));
     const taskPoolRead = req.method === "GET" && action === "tasks";
+    // 单条任务自查：GET /p/{project}/tasks/{task_id}。排除内部动作，避免把
+    // tasks/active-load 等管理端点误当成任务详情而绕过 admin 鉴权。
+    const taskInternal = /^(claim|release|create|list|get|active-load|admin-close|admin-reclaim|admin-reassign|submission-settled)$/;
+    const taskDetailRead = req.method === "GET" && /^tasks\/[A-Za-z0-9._:-]{1,64}$/.test(action) &&
+      !taskInternal.test(action.slice(6));
     const issuePoolRead = req.method === "GET" && action === "issues";
-    const requiredScope = taskPoolRead ? "tasks.read"
+    const requiredScope = taskPoolRead || taskDetailRead ? "tasks.read"
       : issuePoolRead ? "issues.read"
       : subRead ? "submissions.read" : need(action);
     if (!inScope(auth.scopes!, requiredScope))
@@ -322,6 +327,12 @@ export default {
       ctx.waitUntil(markIdleActivity(env, project, auth.agentId, kind));
     }
 
+    // 任务自查：?mine=1 返回自己名下任务（含未 claim 的定向 open、blocked 等）。
+    if (taskPoolRead && url.searchParams.get("mine") === "1")
+      return listMyTasks(env, project, url, auth.agentId!);
+    // 单条任务详情：仅 owner / to / released_by 命中自己的任务；admin 可看全部。
+    if (taskDetailRead)
+      return getTaskForAgent(env, project, action.slice(6), auth.agentId!, auth.role === "admin");
     // 公共池只读发现：普通 agent 先看再 claim；接口只返回未指派 open 任务。
     if (taskPoolRead) return listPublicTasks(env, project, url);
     // open 且未指派 Issue 只读发现；不发正文之外的审计字段。
@@ -643,7 +654,7 @@ async function taskLoadWarning(stub: any, agentId: string): Promise<any | null> 
     active_tasks: active,
     limit: ACTIVE_TASK_LIMIT,
     task_ids: Array.isArray(d.task_ids) ? d.task_ids : [],
-    message: `${agentId} 当前名下未完成任务 ${active} 个，超过建议上限 ${ACTIVE_TASK_LIMIT}；仍已派发，请提醒其先完成或释放部分任务。`,
+    message: `${agentId} 当前名下已 claim 未完成任务 ${active} 个，超过建议上限 ${ACTIVE_TASK_LIMIT}；仍已派发，请提醒其先完成或释放部分任务。`,
   };
 }
 
@@ -1802,6 +1813,58 @@ async function listPublicTasks(env: Env, project: string, url: URL) {
       ...(t.issue_id ? { issue_id: t.issue_id } : {}),
     }));
   return json({ tasks, count: tasks.length, limit });
+}
+
+/** 任务是否属于某个 agent：owner、定向 to，或由它 release 成 blocked/released。 */
+function taskBelongsToAgent(t: any, agentId: string): boolean {
+  if (!t || !agentId) return false;
+  if (t.owner === agentId) return true;
+  const to = Array.isArray(t.to) ? t.to.includes(agentId) : t.to === agentId;
+  return !!to || (t.released_by === agentId && (t.state === "blocked" || t.state === "released"));
+}
+
+/** 普通 agent 可见的任务字段；不返回内部审计字段。 */
+function agentTaskView(t: any, agentId: string) {
+  return {
+    task_id: t.task_id ?? t.id ?? "",
+    title: t.title ?? "",
+    body: t.body ?? "",
+    state: t.state ?? "",
+    owner: t.owner ?? null,
+    to: t.to ?? null,
+    issue_id: t.issue_id ?? null,
+    created_at: t.created_at ?? 0,
+    updated_at: t.updated_at ?? 0,
+    lease_until: t.lease_until ?? 0,
+    pending_submissions: Number(t.pending_submissions ?? 0),
+    pending_review: Number(t.pending_review ?? 0),
+    blocked_at: t.blocked_at ?? 0,
+    released_by: t.released_by ?? null,
+    // 配额口径：只有已 claim 到自己名下的 claimed 任务占坑。
+    counts_toward_limit: t.state === "claimed" && t.owner === agentId,
+  };
+}
+
+/** 普通 agent 自查：?mine=1 列出自己名下任务（含 open 定向、blocked、released）。 */
+async function listMyTasks(env: Env, project: string, url: URL, agentId: string) {
+  const raw = Number(url.searchParams.get("limit") ?? 50);
+  const limit = Number.isFinite(raw) ? Math.max(1, Math.min(100, raw)) : 50;
+  const mine = (await projectTasks(env, project))
+    .filter((t: any) => taskBelongsToAgent(t, agentId))
+    .sort((a: any, b: any) => Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
+  const active = mine.filter((t: any) => t.state === "claimed" && t.owner === agentId).length;
+  const tasks = mine.slice(0, limit).map((t: any) => agentTaskView(t, agentId));
+  return json({ tasks, count: tasks.length, mine: true,
+    quota: { limit: ACTIVE_TASK_LIMIT, active_tasks: active } });
+}
+
+/** 普通 agent 自查单条任务；不是自己名下的一律 404，避免枚举/泄露。 */
+async function getTaskForAgent(env: Env, project: string, taskId: string, agentId: string, isAdmin: boolean) {
+  const task = (await projectTasks(env, project)).find((t: any) => String(t.task_id ?? t.id ?? "") === taskId);
+  if (!task || (!isAdmin && !taskBelongsToAgent(task, agentId))) {
+    return err(404, "task_not_found");
+  }
+  return json(agentTaskView(task, agentId));
 }
 
 /** 普通 agent 的 Issue 池：只列 open 且尚未生成任务的 Issue。 */

@@ -332,14 +332,25 @@ paths:
         '200': { description: ok }
   /p/{project}/tasks:
     get:
-      summary: 普通 agent 查询公共任务池
-      description: 只返回 state=open 且无 to 的任务（未指派、可被任意项目成员认领），按创建时间升序；需要 tasks.read。
+      summary: 普通 agent 查询公共任务池或自己的任务
+      description: 默认只返回 state=open 且无 to 的公共任务（按创建时间升序）；mine=1 时返回自己名下任务（open 定向/claimed/blocked/released），带 counts_toward_limit。需要 tasks.read。
       parameters:
         - $ref: '#/components/parameters/Project'
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: mine, in: query, schema: { type: boolean, default: false } }
       responses:
-        '200': { description: '返回 tasks[]（task_id/title/body/created_at/updated_at/issue_id），count、limit' }
+        '200': { description: '返回 tasks[]（task_id/title/body/state/owner/to/counts_toward_limit 等），count、limit；mine=1 时附 quota{limit,active_tasks}' }
         '403': { description: 缺少 tasks.read }
+  /p/{project}/tasks/{task_id}:
+    get:
+      summary: 普通 agent 自查单条任务
+      description: 仅 owner、定向 to，或该 blocked/released 任务的 release 发起者可见；不是本人名下返回 404。需要 tasks.read。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: task_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,64}$' } }
+      responses:
+        '200': { description: '任务详情，含 state、owner、to、counts_toward_limit、lease_until 等' }
+        '404': { description: task_not_found（含不属于当前 agent） }
   /p/{project}/tasks/claim:
     post:
       summary: 认领任务（租约默认 12h，心跳续租）
@@ -356,7 +367,7 @@ paths:
                 task_id: { type: string }
       responses:
         '200': { description: 成功，返回 lease_until；已在名下且租约有效时 already=true }
-        '409': { description: locked / already_done / blocked / released_pending_collection / agent_task_limit_exceeded（公共任务且名下未完成≥5，带 active_tasks、limit、task_ids、message） }
+        '409': { description: locked / already_done / blocked / released_pending_collection / agent_task_limit_exceeded（公共任务且名下 claimed≥5，带 active_tasks、limit、task_ids、message） }
   /p/{project}/tasks/release:
     post:
       summary: 交还 / 完成
@@ -371,7 +382,7 @@ paths:
               required: [task_id]
               properties:
                 task_id: { type: string }
-                state: { type: string, enum: [done, blocked] }
+                state: { type: string, enum: [done, open, blocked] }
       responses:
         '200': { description: ok }
   /p/{project}/artifact/{sha256}:
@@ -467,7 +478,7 @@ paths:
       responses:
         '200': { description: 已创建任务，返回 task_id / assigned_to / task_link }
         '403': { description: not_issue_reporter }
-        '409': { description: issue_not_open / issue_already_dispatched / agent_task_limit_exceeded（名下未完成≥5，带 active_tasks、limit、task_ids、message） }
+        '409': { description: issue_not_open / issue_already_dispatched / agent_task_limit_exceeded（名下 claimed 任务 ≥5，带 active_tasks、limit、task_ids、message） }
   /p/{project}/issues/{issueId}/claim:
     post:
       summary: 任意项目 agent 认领 open 未指派 Issue
@@ -705,7 +716,7 @@ paths:
                 body: { type: string }
                 to: { type: string, nullable: true }
       responses:
-        '200': { description: '任务创建成功；目标 agent 活跃任务>5 时附 warning（agent_task_load_high），仍创建' }
+        '200': { description: '任务创建成功；目标 agent 已 claim 任务>5 时附 warning（agent_task_load_high），仍创建' }
         '409': { description: task_exists }
   /admin/p/{project}/tasks/reclaim:
     post:
@@ -746,7 +757,7 @@ paths:
                 reason: { type: string, maxLength: 240 }
                 force: { type: boolean, default: false, description: 覆盖有效租约时必须显式置 true }
       responses:
-        '200': { description: '已转派，返回 task；目标活跃任务>5 时附 warning，仍转派' }
+        '200': { description: '已转派，返回 task；目标已 claim 任务>5 时附 warning，仍转派' }
         '409': { description: task_done / task_active_lease }
   /admin/p/{project}/issues:
     get:
@@ -820,7 +831,7 @@ paths:
                 title: { type: string }
                 body: { type: string }
       responses:
-        '200': { description: '已派发，返回 task_id / task_link；目标活跃任务>5 时附 warning，仍派发' }
+        '200': { description: '已派发，返回 task_id / task_link；目标已 claim 任务>5 时附 warning，仍派发' }
         '409': { description: issue_not_open / issue_already_dispatched }
   /admin/p/{project}/broadcast:
     post:

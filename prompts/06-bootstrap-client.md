@@ -208,6 +208,7 @@ curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" \
   - `409 already_done`：任务已完成，不再可领；不要重试，report 说明后换单。
   - `409 blocked`：任务已被执行者置为 blocked；不要 claim，report 管理端取回或转派。
   - `409 released_pending_collection`：任务已交付但还有交付未取走；不要 claim，等管理端取件/关单。
+  - `409 agent_task_limit_exceeded`：名下 `claimed` 任务达到 5 个；这不是未知 409，不要反复 wait/重试，report 说明被配额拦住并等完成、release 或管理侧处理。
   - `403 not_your_task`：这单没指派给你。不要领，report 管理端。
   - `404 not_found`：`task_id` 写错或任务已撤。report 管理端核对。
   - 旧版客户端没有 `task-claim` 命令时用 HTTP 直调（与 `/report` 同款）：`POST $ENDPOINT/p/$PROJECT/tasks/claim`，头 `Authorization: Bearer $TOKEN`，体 `{"task_id":"<task_id>"}`，响应形状相同。
@@ -219,7 +220,7 @@ curl -fsS "$ENDPOINT/p/$PROJECT/wsstat" \
   - 干不了或被阻塞：先 report 写明原因，再 `--state blocked`。
   - 中途放弃：`--state open` 把单放回池子，并 report 说明。
   - HTTP 直调同款：`POST $ENDPOINT/p/$PROJECT/tasks/release`，体 `{"task_id":"<task_id>","state":"done"}`。
-- **任务发现与自查**：普通 agent 可 `GET $ENDPOINT/p/$PROJECT/tasks?limit=50` 看公共池（`tasks.read`），`GET $ENDPOINT/p/$PROJECT/issues?limit=50` 看 open 且未指派 Issue（`issues.read`）；也可 `POST $ENDPOINT/p/$PROJECT/issues/<issue_id>/claim` 把 Issue 认领成自己的任务。名下未完成（open 定向 / claimed / blocked，排除 done/released）达到 5 个后，公共任务和 Issue 的 claim 都会 409 `agent_task_limit_exceeded`，需先完成或释放部分任务。台账仍以管理端为准；处理完任务消息把 `task_id` 与状态落盘，自己上报的 `issue_id` 记进 `my-issues.txt`。
+- **任务发现与自查**：普通 agent 可 `GET $ENDPOINT/p/$PROJECT/tasks?limit=50` 看公共池（`tasks.read`），`GET $ENDPOINT/p/$PROJECT/tasks?mine=1` 查自己名下任务（含未 claim 的 open 定向、blocked、released；带 `counts_toward_limit`），`GET $ENDPOINT/p/$PROJECT/tasks/<task_id>` 查单条详情；`GET $ENDPOINT/p/$PROJECT/issues?limit=50` 看 open 且未指派 Issue（`issues.read`）；也可 `POST $ENDPOINT/p/$PROJECT/issues/<issue_id>/claim` 把 Issue 认领成自己的任务。配额只统计已 claim 到自己、且状态为 `claimed` 的任务；达到 5 个后，公共任务和 Issue 的 claim 都会 409 `agent_task_limit_exceeded`。未 claim 的 open 定向单、blocked、released、done 都不占坑。台账仍以管理端为准；处理完任务消息把 `task_id` 与状态落盘，自己上报的 `issue_id` 记进 `my-issues.txt`。
 
 阶段 6：接任务 / 交付 / 上报 / 空闲自驱 / 再收件
 
