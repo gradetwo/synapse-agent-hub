@@ -1129,8 +1129,16 @@ fn main() {
                                     std::process::exit(5);
                                 }
                                 match fs::rename(&tmp, &current) {
-                                    Ok(_) => println!("{}", json!({"ok": true, "from": mine, "to": latest,
-                                                                  "platform": platform, "bytes": b.len()})),
+                                    Ok(_) => {
+                                        // 二次兜底：某些文件系统/umask 可能在 rename 后落成 0644，
+                                        // 这里再按当前文件自身权限补执行位，避免下次启动 Permission denied。
+                                        if let Err(e) = ensure_executable(&current) {
+                                            eprintln!("替换后补可执行位失败：{e}；新二进制已写入但可能无法启动");
+                                            std::process::exit(5);
+                                        }
+                                        println!("{}", json!({"ok": true, "from": mine, "to": latest,
+                                                                  "platform": platform, "bytes": b.len()}))
+                                    }
                                     Err(e) => { eprintln!("替换失败：{e}（可能需要写权限，或系统限制）"); std::process::exit(5); }
                                 }
                             }
@@ -2200,6 +2208,14 @@ fn apply_upgrade_mode(tmp: &str, current: &std::path::Path) -> std::io::Result<(
     fs::set_permissions(tmp, fs::Permissions::from_mode(mode | 0o111))
 }
 
+/// 按文件自身权限补执行位；用于 rename 后的二次兜底。
+#[cfg(not(windows))]
+fn ensure_executable(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o755);
+    fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o111))
+}
+
 /// 直连可达性探测：最多试 DIRECT_PROBE_ATTEMPTS 次；通了返回成功那次的耗时，
 /// 供启动日志记录，免得再出现“探针误判、原因不明”。
 fn probe_direct(endpoint: &str) -> Option<Duration> {
@@ -2857,6 +2873,33 @@ mod tests {
         apply_upgrade_mode(tmp.to_str().unwrap(), &current).unwrap();
         let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o751, "tmp must inherit the old binary's mode before rename");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_mode_restores_exec_bit_when_current_is_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("upgrade-mode-0644");
+        let current = dir.join("synapse-agent");
+        let tmp = dir.join("synapse-agent.new");
+        fs::write(&current, b"old").unwrap();
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&tmp, b"new").unwrap();
+        apply_upgrade_mode(tmp.to_str().unwrap(), &current).unwrap();
+        let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "upgrade must add exec bits when the old binary is 0644");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_executable_repairs_0644_after_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("ensure-executable");
+        let bin = dir.join("synapse-agent");
+        fs::write(&bin, b"new").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_executable(&bin).unwrap();
+        assert_eq!(fs::metadata(&bin).unwrap().permissions().mode() & 0o777, 0o755);
     }
 
     #[cfg(unix)]

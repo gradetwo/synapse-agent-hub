@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS projects (
   project         TEXT PRIMARY KEY,
   display_name    TEXT NOT NULL,
   status          TEXT NOT NULL DEFAULT 'active',   -- active|paused|archived
-  max_agents      INTEGER NOT NULL DEFAULT 20,
+  max_agents      INTEGER NOT NULL DEFAULT 200,
   max_storage_mb  INTEGER NOT NULL DEFAULT 2048,
   max_msgs_per_min INTEGER NOT NULL DEFAULT 60,
   retention_days  INTEGER NOT NULL DEFAULT 30,

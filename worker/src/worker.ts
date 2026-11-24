@@ -10,7 +10,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "review-fixes-20261124";
+const BUILD_TAG = "agent-quota-200-upgrade-exec-20261124";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.5";
 
@@ -590,7 +590,7 @@ async function projectQuota(env: Env, project: string) {
     "SELECT max_agents, max_storage_mb, max_msgs_per_min FROM projects WHERE project = ?"
   ).bind(project).first<any>().catch(() => null);
   return {
-    maxAgents: Number(r?.max_agents ?? 20),
+    maxAgents: Number(r?.max_agents ?? 200),
     maxStorageMb: Number(r?.max_storage_mb ?? 2048),
     maxMsgsPerMin: Number(r?.max_msgs_per_min ?? 60),
   };
@@ -991,7 +991,7 @@ async function admin(req: Request, env: Env, url: URL) {
   if (p === "/admin/projects" && req.method === "POST") {
     const b: any = await req.json().catch(() => ({}));
     if (!/^[a-z0-9-]{2,40}$/.test(String(b.project ?? ""))) return err(422, "bad_project_name");
-    const maxAgents = Math.max(1, Math.min(1000, Number(b.max_agents ?? 20)));
+    const maxAgents = Math.max(1, Math.min(1000, Number(b.max_agents ?? 200)));
     const maxStorage = Math.max(1, Math.min(10240, Number(b.max_storage_mb ?? 2048)));
     const maxMsgs = Math.max(1, Math.min(1000, Number(b.max_msgs_per_min ?? 60)));
     const retention = Math.max(1, Math.min(3650, Number(b.retention_days ?? 30)));
