@@ -571,9 +571,9 @@ if (location.search.includes("reset=1")) {
     <table>
       <thead><tr>
         <th>节点</th><th>在线</th><th class="num">名下任务</th><th>空闲起点</th><th>提醒时间</th>
-        <th>上榜时间</th><th>最近任务 list</th><th>最近 Issue list</th><th>最近主动调用</th>
+        <th>上榜时间</th><th>最近任务 list</th><th>最近 Issue list</th><th>最近主动调用</th><th>操作</th>
       </tr></thead>
-      <tbody id="idleAgents"><tr><td colspan="9" class="empty">选择具体项目查看</td></tr></tbody>
+      <tbody id="idleAgents"><tr><td colspan="10" class="empty">选择具体项目查看</td></tr></tbody>
     </table>
   </div>
 
@@ -752,6 +752,7 @@ if (location.search.includes("reset=1")) {
       <button class="ghost" data-dq="sync" data-da="__AGENT__">同步代码</button>
       <button class="ghost" data-dq="status" data-da="__AGENT__">汇报状态</button>
       <button class="ghost" data-dq="pause" data-da="__AGENT__">暂停任务</button>
+      <button class="ghost" id="dIdleRemind" hidden>重发提醒</button>
     </div>
     <details class="permDetails" id="dPermDetails">
       <summary><span>权限与 token 管理</span><span id="dPermSummary" class="muted">—</span><span class="lead">展开</span></summary>
@@ -1224,7 +1225,7 @@ async function loadIdle() {
     IDLE_CONFIG = null;
     $("idleStat").textContent = "选择具体项目";
     $("idleHint").textContent = "";
-    $("idleAgents").innerHTML = `<tr><td colspan="9" class="empty">选择具体项目查看</td></tr>`;
+    $("idleAgents").innerHTML = `<tr><td colspan="10" class="empty">选择具体项目查看</td></tr>`;
     return;
   }
   const d = await api(`/admin/p/${project}/idle`);
@@ -1245,7 +1246,7 @@ async function loadIdle() {
     : `${IDLE_ROWS.length} 台待唤醒 · 空闲 ${Math.round(Number(IDLE_CONFIG.idle_after_s || 600) / 60)} 分钟提醒`;
   const fmt = (ms) => Number(ms) > 0 ? new Date(Number(ms)).toLocaleString() : "—";
   $("idleAgents").innerHTML = IDLE_ROWS.length ? IDLE_ROWS.map((a) => `
-    <tr>
+    <tr class="clickable" style="cursor:pointer" data-agent="${esc(a.agent_id)}" data-project="${esc(project)}" title="点击查看 Agent 详情">
       <td><span class="mono">${esc(a.agent_id)}</span></td>
       <td><span class="badge alive">在线</span></td>
       <td class="num">${Number(a.active_tasks ?? 0)}</td>
@@ -1255,8 +1256,27 @@ async function loadIdle() {
       <td class="muted">${fmt(a.last_task_list_ms)}</td>
       <td class="muted">${fmt(a.last_issue_list_ms)}</td>
       <td class="muted">${fmt(a.last_active_ms)}</td>
+      <td><button class="ghost mini" data-idle-remind="${esc(a.agent_id)}" data-project="${esc(project)}">重发提醒</button></td>
     </tr>`).join("")
-    : `<tr><td colspan="9" class="empty">${IDLE_CONFIG.enabled ? "暂无上榜节点" : "自动提醒关闭中"}</td></tr>`;
+    : `<tr><td colspan="10" class="empty">${IDLE_CONFIG.enabled ? "暂无上榜节点" : "自动提醒关闭中"}</td></tr>`;
+}
+
+async function resendIdleReminder(agentId, project, fromDetail = false) {
+  const p = project || current;
+  if (!p || p === "*") return alert("先选择具体项目再重发提醒");
+  if (!agentId) return;
+  if (!confirm(`给 ${agentId} 重发一次空闲提醒？\n重发后会从“待唤醒”列表移除，并重新开始 followup 计时。`)) return;
+  try {
+    await api(`/admin/p/${p}/idle/remind`, "POST", { agent_id: agentId });
+    showToast(`已重发提醒给 ${agentId}`, 5000);
+    const btn = $("dIdleRemind");
+    if (btn) btn.hidden = true;
+    await loadIdle();
+    if (fromDetail && detailAgent === agentId && $("detail") && !$("detail").hidden)
+      await openAgent(agentId, p);
+  } catch (e) {
+    alert(`重发失败：${e.message || e}`);
+  }
 }
 
 function renderIssueRows() {
@@ -1998,7 +2018,7 @@ function renderAgentWork(d, live) {
 let detailAgent = null;
 let detailRole = "agent";
 let detailReady = false;
-const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes"];
+const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes", "dIdleRemind"];
 const TASK_SCOPES = ["tasks.claim", "tasks.release"];
 const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TASK_SCOPES,
                       "tasks.read","issues.read","artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
@@ -2069,6 +2089,8 @@ function openAgent(id, project) {
   }
   $("dRole").textContent = "加载中…";
   if (!sameAgentRefresh) $("dScopes").innerHTML = "";
+  const idleRemindBtn = $("dIdleRemind");
+  if (idleRemindBtn) idleRemindBtn.hidden = true;
   setDetailReady(false);
   api(`/admin/p/${current}/agent/${encodeURIComponent(id)}`).then((d) => {
     setDetailReady(true);
@@ -2084,6 +2106,12 @@ function openAgent(id, project) {
     renderAgentWork(d, live);
     $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 收件 / 接任务 / 上报";
     $("dRole").classList.toggle("admin", role === "admin");
+    const idle = d.idle || {};
+    const remindBtn = $("dIdleRemind");
+    if (remindBtn) {
+      remindBtn.hidden = !(Number(idle.flagged_at ?? 0) > 0);
+      remindBtn.onclick = () => resendIdleReminder(id, current, true);
+    }
     renderScopeEditor(scopes);
     fillDetailProjects();
     drawLine($("cCpu"), hb.map((x) => x.cpu_pct ?? 0), "#6aa9ff");
@@ -3095,7 +3123,7 @@ document.addEventListener("click", async (e) => {
     const issueState = dash.getAttribute("data-dash-issue");
     if (issueState) return showCardFilter("Issue", "issue", issueState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const iv = btn.getAttribute("data-issue-view");
@@ -3175,6 +3203,8 @@ document.addEventListener("click", async (e) => {
     }
     const rv = btn.getAttribute("data-revoke");
     if (rv) return revoke(rv, btn.getAttribute("data-project"));
+    const idr = btn.getAttribute("data-idle-remind");
+    if (idr) return resendIdleReminder(idr, btn.getAttribute("data-project"));
     const dt = btn.getAttribute("data-detail");
     if (dt) return openAgent(dt, btn.getAttribute("data-project"));
     const dl = btn.getAttribute("data-dl");

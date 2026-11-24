@@ -94,6 +94,7 @@ export class ProjectRoom implements DurableObject {
       case "agent/list":   return this.agents();
       case "agent/activity": return this.markActivity(body);
       case "agents/idle-list": return this.idleList(body);
+      case "agents/idle-remind": return this.idleRemind(body);
       case "agent/remove": return this.removeAgent(body);
       case "ws":           return this.ws(req);
       case "wsstat": {
@@ -1179,6 +1180,79 @@ export class ProjectRoom implements DurableObject {
       });
     }
     return json({ agents });
+  }
+
+  /** 管理台手动重发：发一条空闲提醒，并把 followup 周期重置。 */
+  private async idleRemind(b: any) {
+    const project = String(b?.project ?? "").trim();
+    const agentId = String(b?.agent_id ?? "").trim();
+    if (!project) return json({ error: "project_required" }, 422);
+    if (!agentId) return json({ error: "agent_id_required" }, 422);
+    const now = Date.now();
+    const rec = await this.st.get<any>(`agent:${agentId}`);
+    if (!rec) return json({ error: "agent_not_found", agent_id: agentId }, 404);
+    if (rec.role === "admin") return json({ error: "admin_not_idle_target" }, 409);
+    if (rec.project && String(rec.project) !== project)
+      return json({ error: "agent_project_mismatch" }, 409);
+    const hbAge = now - Number(rec.last_hb_ms ?? 0);
+    if (hbAge > IDLE_ONLINE_MS)
+      return json({ error: "agent_offline", agent_id: agentId, hb_age_s: Math.round(hbAge / 1000) }, 409);
+    const load = await this.activeTaskLoad(agentId);
+    if (load.active_tasks > 0)
+      return json({ error: "agent_has_tasks", agent_id: agentId, active_tasks: load.active_tasks }, 409);
+    const cfg = await this.idleConfig(project);
+    if (!cfg.enabled) return json({ error: "idle_disabled" }, 409);
+
+    let row: any = null;
+    try {
+      row = await this.env.DB.prepare(
+        `SELECT idle_since_ms, reminded_at, flagged_at,
+                last_task_list_ms, last_issue_list_ms, last_active_ms
+           FROM agent_idle WHERE project = ? AND agent_id = ?`
+      ).bind(project, agentId).first<any>();
+    } catch (e) {
+      console.warn("idle remind read failed", project, agentId, e);
+      return json({ error: "idle_migration_required" }, 503);
+    }
+    // 手动重发后重新开始 followup 计时；否则下一次 cron 会立刻再次上榜。
+    const idleSince = Number(row?.idle_since_ms ?? 0) || now;
+    const message = this.renderIdleMessage(cfg.message, project, agentId,
+                                           cfg.idle_after_s, cfg.followup_after_s);
+    try {
+      await this.append({
+        project, sender: "system", topic: "system", kind: "idle_reminder",
+        to: agentId,
+        payload: {
+          title: "空闲提醒：去公共池找任务或上报 Issue",
+          body: message,
+          agent_id: agentId,
+          task_endpoint: `/p/${project}/tasks`,
+          issue_endpoint: `/p/${project}/issues`,
+          manual: true,
+        },
+        max_per_min: 1000,
+        dedupe_key: `idle-reminder:manual:${agentId}:${now}`,
+      } as any);
+    } catch (e: any) {
+      console.warn("idle reminder manual append failed", project, agentId, e);
+      return json({ error: "idle_remind_failed", detail: String(e?.message ?? e) }, 503);
+    }
+    try {
+      await this.env.DB.prepare(
+        `INSERT OR REPLACE INTO agent_idle
+           (project, agent_id, idle_since_ms, reminded_at, flagged_at,
+            last_task_list_ms, last_issue_list_ms, last_active_ms)
+         VALUES (?,?,?,?,?,?,?,?)`
+      ).bind(
+        project, agentId, idleSince, now, 0,
+        Number(row?.last_task_list_ms ?? 0), Number(row?.last_issue_list_ms ?? 0),
+        Number(row?.last_active_ms ?? 0),
+      ).run();
+    } catch (e) {
+      console.warn("idle reminder state save failed", project, agentId, e);
+      return json({ error: "idle_state_save_failed", sent: true, agent_id: agentId }, 503);
+    }
+    return json({ ok: true, agent_id: agentId, reminded_at: now, idle_since_ms: idleSince });
   }
 
   private async snapshot() {

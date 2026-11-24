@@ -693,6 +693,26 @@ paths:
       responses:
         '200': { description: 返回 reclaimed / reminded / flagged 计数 }
         '503': { description: idle_check_failed }
+  /admin/p/{project}/idle/remind:
+    post:
+      summary: 手动给一个待唤醒 Agent 重发空闲提醒
+      description: 重发后清除 flagged_at，并从“待唤醒”列表移除；followup 周期重新开始。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agent_id]
+              properties:
+                agent_id: { type: string }
+      responses:
+        '200': { description: 已重发，返回 agent_id / reminded_at / idle_since_ms }
+        '409': { description: agent_offline / agent_has_tasks / idle_disabled / agent_project_mismatch }
+        '422': { description: agent_id_required }
+        '503': { description: idle_migration_required / idle_remind_failed / idle_state_save_failed }
   /admin/p/{project}/tasks:
     get:
       summary: 任务台账

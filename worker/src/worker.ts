@@ -1193,6 +1193,22 @@ async function admin(req: Request, env: Env, url: URL) {
       if (!r || !r.ok) return err(503, "idle_check_failed");
       return json(await r.json().catch(() => ({ ok: true })));
     }
+    if (action === "idle/remind" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      const agentId = String(b?.agent_id ?? "").trim();
+      if (!agentId) return err(422, "agent_id_required");
+      const cfg = await idleConfig(env, project);
+      if (!cfg.ready) return err(503, "idle_migration_required");
+      if (!cfg.enabled) return err(409, "idle_disabled");
+      // DO 负责在线/任务占用检查、发送消息并重置 followup 周期。
+      const r = await stub.fetch(new Request("https://do/agents/idle-remind", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project, agent_id: agentId }),
+      })).catch(() => null);
+      const d: any = r ? await r.json().catch(() => ({ error: "idle_remind_failed" }))
+                       : { error: "idle_remind_failed" };
+      return json(d, r?.status || 503);
+    }
     if (action === "agents") return stub.fetch(new Request("https://do/agent/list"));
     if (action === "tasks" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
@@ -1461,6 +1477,12 @@ async function admin(req: Request, env: Env, url: URL) {
         messages: msgs,
         tasks: tasks.slice(0, 60),
         issues: issues.results ?? [],
+        idle: idle ? {
+          last_active_ms: num(idle.last_active_ms),
+          idle_since_ms: num(idle.idle_since_ms),
+          reminded_at: num(idle.reminded_at),
+          flagged_at: num(idle.flagged_at),
+        } : null,
         stats: {
           tasks_total: tasks.length,
           tasks_open: taskState.open,
