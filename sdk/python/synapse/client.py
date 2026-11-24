@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import requests
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 def _state_dir() -> Path:
     new = os.environ.get("SYNAPSE_STATE_DIR") or os.environ.get("YANSHI_STATE_DIR")
     if new: return Path(new)
