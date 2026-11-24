@@ -8,7 +8,8 @@
 //!   {"id":"...","dir":"in|out","sender":"...","topic":"...","text":"...","ts":...,"meta":{}}
 //!   dir=in  表示从配置程序进入 agent；dir=out 表示 agent 发给配置程序。
 //!
-//! 非 Windows 平台回退到 Unix Domain Socket（路径 `~/.synapse-agent/agent.sock`），
+//! 非 Windows 平台回退到 Unix Domain Socket（路径 `<状态目录>/agent_<agent-id>.sock`，
+//! 状态目录缺省 `~/.synapse-agent`，可用 --config-dir / SYNAPSE_AGENT_DIR 覆盖），
 //! 让协议与逻辑可以在 Linux/macOS 上开发与测试；Windows 用命名管道
 //! `\\.\pipe\synapse_agent_<sanitized-agent-id>`。
 
@@ -43,17 +44,17 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// 管道/套接口名字。
+/// 管道/套接口名字。Windows 用命名管道（按 agent id 区分，与状态目录无关）；
+/// 非 Windows 的套接字放在状态目录下（缺省 ~/.synapse-agent，可用 --config-dir /
+/// SYNAPSE_AGENT_DIR 覆盖），文件名按 agent id 区分，同机多身份互不冲突。
 #[cfg(windows)]
-pub fn endpoint_name(agent_id: &str) -> String {
+pub fn endpoint_name(_dir: &std::path::Path, agent_id: &str) -> String {
     format!(r"\\.\pipe\synapse_agent_{}", sanitize(agent_id))
 }
 
 #[cfg(not(windows))]
-pub fn endpoint_name(agent_id: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let p = std::path::PathBuf::from(home).join(".synapse-agent")
-        .join(format!("agent_{}.sock", sanitize(agent_id)));
+pub fn endpoint_name(dir: &std::path::Path, agent_id: &str) -> String {
+    let p = dir.join(format!("agent_{}.sock", sanitize(agent_id)));
     p.to_string_lossy().to_string()
 }
 
@@ -293,5 +294,34 @@ pub fn send_one(name: &str, msg: &Value, wait_reply: bool) -> Result<Option<Stri
         Ok(Some(line.trim().to_string()))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn endpoint_name_lives_under_the_given_state_dir() {
+        // 套接字必须落在解析后的状态目录下：两个不同目录（或不同 agent id）互不冲突。
+        let d1 = std::path::PathBuf::from("/tmp/inst-a");
+        let d2 = std::path::PathBuf::from("/tmp/inst-b");
+        assert_eq!(
+            endpoint_name(&d1, "agent-1"),
+            "/tmp/inst-a/agent_agent-1.sock"
+        );
+        assert_ne!(endpoint_name(&d1, "agent-1"), endpoint_name(&d2, "agent-1"));
+        assert_ne!(endpoint_name(&d1, "agent-1"), endpoint_name(&d1, "agent-2"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_name_windows_pipe_ignores_state_dir() {
+        let d = std::path::PathBuf::from(r"C:\whatever");
+        assert_eq!(
+            endpoint_name(&d, "agent-1"),
+            r"\\.\pipe\synapse_agent_agent-1"
+        );
     }
 }

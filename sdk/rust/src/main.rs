@@ -104,8 +104,8 @@ impl Cfg {
                 map.insert(k.trim_start_matches("--").to_string(), v);
             }
         }
-        let dir = dirs_config();
-        // 命令行优先，其次读 ~/.synapse-agent/config.json（install 写入），最后才是默认
+        let dir = dirs_config(map.get("config-dir").map(|s| s.as_str()));
+        // 命令行优先，其次读 <状态目录>/config.json（install 写入），最后才是默认
         let saved: Value = fs::read_to_string(dir.join("config.json"))
             .ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
         let endpoint = map.get("endpoint").cloned()
@@ -177,10 +177,28 @@ impl Cfg {
     }
 }
 
-fn dirs_config() -> PathBuf {
+/// 解析状态目录（config.json / cursor.json / run.lock / run.state.json / 套接字都在此目录下）。
+/// 优先级：--config-dir 命令行 > SYNAPSE_AGENT_DIR 环境变量 > 缺省 ~/.synapse-agent。
+/// 显式覆盖时原样使用该目录（不再走 .yanshi-agent 兼容回退）；不传覆盖时与旧行为逐字一致。
+/// 纯函数版便于单测：home 与两个覆盖值都由调用方传入。
+fn resolve_state_dir(cli_dir: Option<&str>, env_dir: Option<&str>, home: &str) -> PathBuf {
+    if let Some(d) = cli_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(d);
+    }
+    if let Some(d) = env_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(d);
+    }
+    let n = PathBuf::from(home).join(".synapse-agent");
+    if !n.exists() && PathBuf::from(home).join(".yanshi-agent").exists() { PathBuf::from(home).join(".yanshi-agent") } else { n }
+}
+
+fn dirs_config(cli_dir: Option<&str>) -> PathBuf {
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
-    { let n = PathBuf::from(&home).join(".synapse-agent");
-        if !n.exists() && PathBuf::from(&home).join(".yanshi-agent").exists() { PathBuf::from(&home).join(".yanshi-agent") } else { n } }
+    resolve_state_dir(
+        cli_dir,
+        std::env::var("SYNAPSE_AGENT_DIR").ok().as_deref(),
+        &home,
+    )
 }
 
 /// 从文件读取 UTF-8 文本（发代码 / patch 用：绕开 Windows 命令行长度上限与转义）。
@@ -821,7 +839,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
         println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | subs | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
-  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
+  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n单机多身份（同一用户同时跑两个 synapse-agent 身份）:\n  所有子命令都可用 --config-dir <路径> 指定状态目录（config.json / cursor.json / run.lock /\n  run.state.json / 本机总线套接字都在该目录下）；也可用环境变量 SYNAPSE_AGENT_DIR 指定。\n  优先级：--config-dir > SYNAPSE_AGENT_DIR > 缺省 ~/.synapse-agent。\n  例：synapse-agent init --config-dir ~/.synapse-agent-2 --endpoint <url> --project <p> --token <t> --agent <id2>\n      synapse-agent run  --config-dir ~/.synapse-agent-2\n  不传覆盖时行为与旧版完全一致；不同目录的实例互不影响，同目录仍只允许一个 run 常驻。\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -1661,7 +1679,7 @@ fn main() {
         // ── 本机消息总线 ────────────────────────────────────────
         "bus-serve" => {
             let name = args_map.get("name").cloned()
-                .unwrap_or_else(|| localbus::endpoint_name(&cfg.agent_id));
+                .unwrap_or_else(|| localbus::endpoint_name(&cfg.dir, &cfg.agent_id));
             if let Err(e) = localbus::serve(&name, |v| {
                 // 收到一条消息就原样打印（供上游 agent / 配置程序读取），并回执 ok
                 println!("{}", serde_json::to_string(&v).unwrap_or_default());
@@ -1678,7 +1696,7 @@ fn main() {
             let topic = args_map.get("topic").cloned().unwrap_or_else(|| "announce".into());
             let sender = args_map.get("sender").cloned().unwrap_or_else(|| cfg.agent_id.clone());
             let name = args_map.get("name").cloned()
-                .unwrap_or_else(|| localbus::endpoint_name(&cfg.agent_id));
+                .unwrap_or_else(|| localbus::endpoint_name(&cfg.dir, &cfg.agent_id));
             let msg = localbus::make_msg(&dir, &sender, &topic, &text, json!({}));
             match localbus::send_one(&name, &msg, true) {
                 Ok(reply) => println!("{}", json!({
@@ -1695,7 +1713,7 @@ fn main() {
             let app = args_map.get("app").cloned().unwrap_or_default();
             let title = args_map.get("title").cloned().unwrap_or_default();
             let name = args_map.get("name").cloned()
-                .unwrap_or_else(|| localbus::endpoint_name(&cfg.agent_id));
+                .unwrap_or_else(|| localbus::endpoint_name(&cfg.dir, &cfg.agent_id));
             let poll_ms: u64 = args_map.get("poll").and_then(|s| s.parse().ok()).unwrap_or(3);
             let to_hub = args_map.get("hub").map(|v| v == "1" || v == "true").unwrap_or(true);
             let w = match resolve_target(&app, &title, &cfg.window_app) {
@@ -2760,6 +2778,38 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_dir_cli_override_wins_over_env_and_default() {
+        let got = resolve_state_dir(Some("/tmp/cli-dir"), Some("/tmp/env-dir"), "/tmp/home-x");
+        assert_eq!(got, PathBuf::from("/tmp/cli-dir"));
+    }
+
+    #[test]
+    fn state_dir_env_override_wins_over_default() {
+        let got = resolve_state_dir(None, Some("/tmp/env-dir"), "/tmp/home-x");
+        assert_eq!(got, PathBuf::from("/tmp/env-dir"));
+    }
+
+    #[test]
+    fn state_dir_blank_overrides_fall_through_to_default() {
+        // 空/纯空白的覆盖不算数，落回缺省 ~/.synapse-agent（该 home 下两目录都不存在）。
+        let home = scratch("statedir-home");
+        let got = resolve_state_dir(Some("  "), Some(""), home.to_str().unwrap());
+        assert_eq!(got, home.join(".synapse-agent"));
+    }
+
+    #[test]
+    fn state_dir_default_keeps_legacy_yanshi_fallback() {
+        // 缺省路径保留旧兼容：~/.synapse-agent 不存在而 ~/.yanshi-agent 存在时用后者。
+        let home = scratch("statedir-legacy");
+        fs::create_dir_all(home.join(".yanshi-agent")).unwrap();
+        let got = resolve_state_dir(None, None, home.to_str().unwrap());
+        assert_eq!(got, home.join(".yanshi-agent"));
+        // 显式覆盖时不走兼容回退，原样使用。
+        let got2 = resolve_state_dir(Some("/tmp/cli-dir"), None, home.to_str().unwrap());
+        assert_eq!(got2, PathBuf::from("/tmp/cli-dir"));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("synapse-test-{}-{}", std::process::id(), name));
