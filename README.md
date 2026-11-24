@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | Worker build | `submission-collect-20261120` |
-| SDK version | `0.5.4` |
+| SDK version | `0.5.5` |
 | 安装入口 | `https://synapse.wangda.today/dl/install.sh` |
 | Linux x64 二进制 | `/dl/synapse-agent-x86_64-linux-musl` |
 | Linux ARM64 二进制 | `/dl/synapse-agent-aarch64-linux-musl` |
@@ -56,7 +56,7 @@ sdk/rust/BINARIES.md      多平台编译与 R2 发布说明
 docs/WINDOW-BRIDGE.md     Windows 窗口桥 + 本机消息总线接入文档
 docs/TMUX-BRIDGE.md       Linux/macOS tmux/TUI 投递文档
 dist/                     当前 Linux x64/ARM64、Windows x64 二进制 + SHA256SUMS
-spec/openapi.yaml         协议定义（0.5.4）
+spec/openapi.yaml         协议定义（0.5.5）
 spec/conformance/         语言无关一致性用例
 prompts/                  客户端/管理节点提示词模板
 docs/                     当前接入、异步循环、唤醒说明

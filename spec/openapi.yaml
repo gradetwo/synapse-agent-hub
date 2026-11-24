@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Synapse Agent Hub
-  version: 0.5.4
+  version: 0.5.5
   description: |
     多项目 agent 协作中枢。data plane 使用 agent token；control plane 使用 admin token
     或 Cloudflare Access 会话。`/admin/*` 的浏览器别名是 `/console/admin/*`，CLI 别名是
