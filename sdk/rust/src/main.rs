@@ -3,7 +3,7 @@
 //!        synapse-agent run   --endpoint … --project … --token … [--heartbeat 60]
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
@@ -1263,7 +1263,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
         println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--event-cmd \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | subs | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
-  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n单机多身份（同一用户同时跑两个 synapse-agent 身份）:\n  所有子命令都可用 --config-dir <路径> 指定状态目录（config.json / cursor.json / run.lock /\n  run.state.json / 本机总线套接字都在该目录下）；也可用环境变量 SYNAPSE_AGENT_DIR 指定。\n  优先级：--config-dir > SYNAPSE_AGENT_DIR > 缺省 ~/.synapse-agent。\n  例：synapse-agent init --config-dir ~/.synapse-agent-2 --endpoint <url> --project <p> --token <t> --agent <id2>\n      synapse-agent run  --config-dir ~/.synapse-agent-2\n  不传覆盖时行为与旧版完全一致；不同目录的实例互不影响，同目录仍只允许一个 run 常驻。\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
+  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查；升级后首次 run 自动刷新 /ver → /capabilities → /skill\n\n单机多身份（同一用户同时跑两个 synapse-agent 身份）:\n  所有子命令都可用 --config-dir <路径> 指定状态目录（config.json / cursor.json / run.lock /\n  run.state.json / 本机总线套接字都在该目录下）；也可用环境变量 SYNAPSE_AGENT_DIR 指定。\n  优先级：--config-dir > SYNAPSE_AGENT_DIR > 缺省 ~/.synapse-agent。\n  例：synapse-agent init --config-dir ~/.synapse-agent-2 --endpoint <url> --project <p> --token <t> --agent <id2>\n      synapse-agent run  --config-dir ~/.synapse-agent-2\n  不传覆盖时行为与旧版完全一致；不同目录的实例互不影响，同目录仍只允许一个 run 常驻。\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -1339,6 +1339,10 @@ fn main() {
     } else {
         None
     };
+
+    // 能力发现先于收件：升级后的新二进制先读 /ver，按 hash 拉 /capabilities + /skill，
+    // 并把结果落到状态目录。失败只提示，不阻塞 run/wait。
+    refresh_discovery_on_start(&cfg, &agent, &base);
 
     // 两态机器（与 Python Loop / TS Loop 等价）：
     //   busy: 正常运行（本进程在干活），心跳照常
@@ -1537,6 +1541,7 @@ fn main() {
                             // Windows：运行中的 exe 被锁，保留 .new 让用户停进程后手动替换。
                             #[cfg(windows)]
                             {
+                                mark_upgrade_pending(&cfg, &mine, &latest, &platform);
                                 eprintln!("Windows 不能覆盖运行中的 exe；新版本已下载到：{tmp}");
                                 eprintln!("请先停止所有 synapse-agent 进程，再用 install.ps1 覆盖安装，或手动替换该文件。");
                                 std::process::exit(6);
@@ -1558,6 +1563,9 @@ fn main() {
                                             eprintln!("替换后补可执行位失败：{e}；新二进制已写入但可能无法启动");
                                             std::process::exit(5);
                                         }
+                                        // 新进程首次 run/init 读到该标记后，会重拉
+                                        // /ver → /capabilities → /skill，而不是只看 --help。
+                                        mark_upgrade_pending(&cfg, &mine, &latest, &platform);
                                         println!("{}", json!({"ok": true, "from": mine, "to": latest,
                                                                   "platform": platform, "bytes": b.len()}))
                                     }
@@ -2290,6 +2298,212 @@ fn admin_bytes_public(agent: &Agent, base: &str, path: &str) -> Result<Vec<u8>, 
     let mut buf: Vec<u8> = Vec::new();
     r.into_reader().read_to_end(&mut buf).map_err(|e| format!("{e}"))?;
     Ok(buf)
+}
+
+// ── 客户端能力发现：/ver → /capabilities → /skill ───────────────
+// 升级二进制本身不会让 agent 知道服务端新增了什么。这里在 run/init 首次启动
+// 时做一次带超时的公开 discovery，按 hash 缓存，避免每次重启重发整份 skill。
+
+#[derive(Clone, Debug)]
+struct SkillNotice {
+    key: String,
+    text: String,
+}
+
+fn discovery_path(cfg: &Cfg) -> PathBuf { cfg.dir.join("discovery.json") }
+fn upgrade_pending_path(cfg: &Cfg) -> PathBuf { cfg.dir.join("upgrade-pending.json") }
+fn skill_cache_path(cfg: &Cfg) -> PathBuf { cfg.dir.join("SKILL.md") }
+fn caps_cache_path(cfg: &Cfg) -> PathBuf { cfg.dir.join("capabilities.json") }
+fn whats_new_path(cfg: &Cfg) -> PathBuf { cfg.dir.join("WHATS-NEW.md") }
+
+fn read_json_file(path: &PathBuf) -> Value {
+    fs::read_to_string(path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn capability_ids(v: &Value) -> Vec<String> {
+    v["capabilities"].as_array().map(|a| {
+        a.iter().filter_map(|c| {
+            c["id"].as_str().or_else(|| c.as_str()).map(|s| s.to_string())
+        }).collect()
+    }).unwrap_or_default()
+}
+
+fn discovery_due(cfg: &Cfg) -> bool {
+    if upgrade_pending_path(cfg).exists() || !discovery_path(cfg).exists() {
+        return true;
+    }
+    let d = read_json_file(&discovery_path(cfg));
+    let fetched = d["fetched_at"].as_u64().unwrap_or(0);
+    let now = now_ms() as u64;
+    fetched == 0 || now.saturating_sub(fetched) > 6 * 60 * 60 * 1000
+}
+
+fn discovery_get(agent: &Agent, base: &str, path: &str) -> Result<Value, String> {
+    agent.get(&format!("{}{}", base, path))
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| format!("{e}"))
+        .and_then(|r| r.into_json::<Value>().map_err(|e| format!("{e}")))
+}
+
+fn discovery_bytes(agent: &Agent, base: &str, path: &str) -> Result<Vec<u8>, String> {
+    let r = agent.get(&format!("{}{}", base, path))
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map_err(|e| format!("{e}"))?;
+    let mut buf: Vec<u8> = Vec::new();
+    r.into_reader().read_to_end(&mut buf).map_err(|e| format!("{e}"))?;
+    Ok(buf)
+}
+
+fn refresh_discovery(cfg: &Cfg, agent: &Agent, base: &str) -> Result<Option<SkillNotice>, String> {
+    let ver = discovery_get(agent, base, "/ver")?;
+    let build = ver["build"].as_str().unwrap_or("").to_string();
+    let sdk = ver["sdk"].as_str().unwrap_or("").to_string();
+    let skill_sha = ver["skill_sha256"].as_str().unwrap_or("").to_string();
+    let caps_sha = ver["capabilities_sha256"].as_str().unwrap_or("").to_string();
+    let ver_ids = capability_ids(&ver);
+    let old = read_json_file(&discovery_path(cfg));
+    let old_ids = old["capability_ids"].as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let old_skill_sha = old["skill_sha256"].as_str().unwrap_or("").to_string();
+    let old_caps_sha = old["capabilities_sha256"].as_str().unwrap_or("").to_string();
+    let caps_changed = if !caps_sha.is_empty() {
+        old_caps_sha != caps_sha
+    } else {
+        old_ids != ver_ids
+    };
+    let skill_changed = if !skill_sha.is_empty() {
+        old_skill_sha != skill_sha
+    } else {
+        !skill_cache_path(cfg).exists()
+    };
+    if !caps_changed && !skill_changed {
+        return Ok(None);
+    }
+
+    // /capabilities 是程序判定面；旧服务端没有该端点时仍保留 /ver 的 ID 列表。
+    let caps = discovery_get(agent, base, "/capabilities")
+        .unwrap_or_else(|_| json!({"sdk": sdk, "build": build, "capabilities": ver_ids.clone()}));
+    let skill = discovery_bytes(agent, base, "/skill")?;
+    let new_ids = capability_ids(&caps);
+    let added: Vec<String> = new_ids.iter()
+        .filter(|id| !old_ids.contains(id)).cloned().collect();
+    let removed: Vec<String> = old_ids.iter()
+        .filter(|id| !new_ids.contains(id)).cloned().collect();
+    let effective_skill_sha = if skill_sha.is_empty() { sha256_hex(&skill) } else { skill_sha };
+    let effective_caps_sha = if caps_sha.is_empty() {
+        sha256_hex(serde_json::to_string(&caps).unwrap_or_default().as_bytes())
+    } else { caps_sha };
+    let key = format!("{build}:{effective_caps_sha}:{effective_skill_sha}");
+    let changed = match (added.is_empty(), removed.is_empty()) {
+        (false, false) => format!("新增 {}；移除 {}", added.join(", "), removed.join(", ")),
+        (false, true) => format!("新增 {}", added.join(", ")),
+        (true, false) => format!("移除 {}", removed.join(", ")),
+        (true, true) => "能力表内容有更新（status/summary 可能变化）".to_string(),
+    };
+    let notice_text = format!(
+        "[Synapse 能力更新] build={build} sdk={sdk}；{changed}。完整说明已缓存到 {}；请按 /capabilities 的能力 ID 核对，不要只看 --help。",
+        skill_cache_path(cfg).display()
+    );
+
+    atomic_write(&skill_cache_path(cfg), &skill);
+    atomic_write(&caps_cache_path(cfg),
+                 serde_json::to_vec_pretty(&caps).unwrap_or_default().as_slice());
+    let discovery = json!({
+        "endpoint": cfg.endpoint, "build": build, "sdk": sdk,
+        "capability_ids": new_ids, "capabilities_sha256": effective_caps_sha,
+        "skill_sha256": effective_skill_sha, "fetched_at": now_ms(),
+        "notice_key": key, "notice_text": notice_text,
+        "noticed_key": old["noticed_key"].clone(),
+    });
+    atomic_write(&discovery_path(cfg),
+                 serde_json::to_vec_pretty(&discovery).unwrap_or_default().as_slice());
+
+    let mut whats_new = vec![
+        "# Synapse 能力更新".to_string(),
+        String::new(),
+        format!("- build: {build}"),
+        format!("- sdk: {sdk}"),
+    ];
+    if !added.is_empty() { whats_new.push(format!("- 新增: {}", added.join(", "))); }
+    if !removed.is_empty() { whats_new.push(format!("- 移除: {}", removed.join(", "))); }
+    whats_new.push(String::new());
+    whats_new.push("完整说明见同目录 SKILL.md；程序判定见 capabilities.json。".to_string());
+    atomic_write(&whats_new_path(cfg), whats_new.join("\n").as_bytes());
+
+    Ok(Some(SkillNotice { key, text: notice_text }))
+}
+
+fn announce_discovery(cfg: &Cfg, notice: SkillNotice) -> bool {
+    let mut d = read_json_file(&discovery_path(cfg));
+    if d["noticed_key"].as_str() == Some(notice.key.as_str()) {
+        return true;
+    }
+    if cfg.surface_forward() {
+        // 这不是任务：to=本 agent、kind=notice、work_item=true；只投递一次，不 ack/claim。
+        let m = json!({
+            "topic": "system", "kind": "notice", "sender": "admin", "to": cfg.agent_id,
+            "payload": {"title": "Synapse 能力更新", "body": notice.text, "work_item": true}
+        });
+        if !forward_to_surface(cfg, &m) {
+            eprintln!("[discovery] 能力更新通知投递失败，保留到下次 run 重试");
+            return false;
+        }
+    } else {
+        eprintln!("{}", notice.text);
+    }
+    d["noticed_key"] = json!(notice.key);
+    d["noticed_at"] = json!(now_ms());
+    atomic_write(&discovery_path(cfg),
+                 serde_json::to_vec_pretty(&d).unwrap_or_default().as_slice());
+    true
+}
+
+fn mark_upgrade_pending(cfg: &Cfg, from: &str, to: &str, platform: &str) {
+    atomic_write(&upgrade_pending_path(cfg),
+                 serde_json::to_vec_pretty(&json!({
+                     "from": from, "to": to, "platform": platform, "at": now_ms()
+                 })).unwrap_or_default().as_slice());
+}
+
+fn refresh_discovery_on_start(cfg: &Cfg, agent: &Agent, base: &str) {
+    let _ = fs::create_dir_all(&cfg.dir);
+    let due = matches!(cfg.cmd.as_str(), "run" | "ws" | "init")
+        || (matches!(cfg.cmd.as_str(), "wait" | "peek") && discovery_due(cfg));
+    if !due { return; }
+    match refresh_discovery(cfg, agent, base) {
+        Ok(Some(n)) => {
+            if announce_discovery(cfg, n) {
+                let _ = fs::remove_file(upgrade_pending_path(cfg));
+            }
+        }
+        Ok(None) => {
+            // 上次通知投递失败时，refresh 不会再返回 Some（hash 未变），
+            // 但 discovery.json 里还留着未送达的 notice_key/notice_text。
+            let d = read_json_file(&discovery_path(cfg));
+            let pending_key = d["notice_key"].as_str().unwrap_or("");
+            let noticed_key = d["noticed_key"].as_str().unwrap_or("");
+            let pending_text = d["notice_text"].as_str().unwrap_or("");
+            if !pending_key.is_empty() && pending_key != noticed_key && !pending_text.is_empty() {
+                let announced = announce_discovery(cfg, SkillNotice {
+                    key: pending_key.to_string(), text: pending_text.to_string(),
+                });
+                if !announced { return; }
+            }
+            let _ = fs::remove_file(upgrade_pending_path(cfg));
+        }
+        Err(e) => eprintln!("[discovery] 能力发现失败，继续用本地缓存：{e}"),
+    }
 }
 
 fn admin_get(cfg: &Cfg, agent: &Agent, base: &str, path: &str) -> Result<Value, String> {
@@ -3750,5 +3964,26 @@ mod manifest_tests {
     fn explicit_override_is_single_tag() {
         let tags = upgrade_platform_tags("linux-x86_64-gnu");
         assert_eq!(tags, vec!["linux-x86_64-gnu".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn capability_ids_accepts_objects_and_strings() {
+        let v = json!({"capabilities": [
+            {"id": "a"}, {"id": "b"}
+        ]});
+        assert_eq!(capability_ids(&v), vec!["a".to_string(), "b".to_string()]);
+        let v = json!({"capabilities": ["c", "d"]});
+        assert_eq!(capability_ids(&v), vec!["c".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(sha256_hex(b"abc"),
+                   "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 }
