@@ -939,8 +939,8 @@ async function admin(req: Request, env: Env, url: URL) {
     return json(payload);
   }
 
-  // 管理台数据看板：最近 7 天消息/交付趋势 + 当前可见项目的交付状态分布。
-  // 只查 D1 聚合，不读 DO 正文；前端把任务/节点分布和这里拼成看板。
+  // 管理台数据看板：消息/交付/Issue 趋势 + 交付状态分布。支持 7/30/90 天，
+  // 同时返回上一个等长周期用于对比；只查 D1 聚合，不读 DO 正文。
   if (path === "/admin/analytics" && req.method === "GET") {
     const policy = await loadPolicy(env);
     const allRows = (await env.DB.prepare(
@@ -954,72 +954,82 @@ async function admin(req: Request, env: Env, url: URL) {
       projects = [only];
     }
     const now = Date.now();
+    const days = analyticsDays(url.searchParams.get("days"), 7);
     const fresh = url.searchParams.get("fresh") === "1";
-    const cacheKey = JSON.stringify([only, policy.mode, projects]);
+    const cacheKey = JSON.stringify([only, policy.mode, projects, days]);
     if (!fresh) {
       const cached = cacheGet(ANALYTICS_CACHE, cacheKey, 300_000);
       if (cached) return json({ ...cached, at: now, cached: true });
     }
-    const dayMs = 86_400_000;
-    const today = new Date();
-    const dayKeys: string[] = [];
-    for (let i = 6; i >= 0; i--) {
-      dayKeys.push(new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(),
-        today.getUTCDate()) - i * dayMs).toISOString().slice(0, 10));
-    }
+    const dayKeys = analyticsDayKeys(days);
+    const sinceDay = dayKeys[0];
+    const prevStartDay = analyticsPrevStartDay(dayKeys, days);
+    const prevStartMs = Date.parse(prevStartDay + "T00:00:00Z");
+    const range = {
+      days, from: sinceDay, to: dayKeys[dayKeys.length - 1],
+      previous_from: prevStartDay,
+      previous_to: new Date(Date.parse(sinceDay + "T00:00:00Z") - 86_400_000).toISOString().slice(0, 10),
+    };
     const zeroDaily = dayKeys.map((day) => ({ day, messages: 0, submissions: 0, issues: 0 }));
+    const zeroTotals = { messages: 0, submissions: 0, issues: 0 };
     if (!projects.length) {
-      return json({ at: now, scope: only || "all", projects: [], daily: zeroDaily,
+      return json({ at: now, scope: only || "all", projects: [], days, range,
+                    activity_available: true, daily: zeroDaily,
                     submission_states: {}, issue_states: {},
-                    totals: { messages: 0, submissions: 0, issues: 0 } });
+                    totals: zeroTotals, previous: zeroTotals });
     }
     const inSql = projects.map(() => "?").join(",");
-    const sinceDay = dayKeys[0];
-    const sinceMs = Date.parse(sinceDay + "T00:00:00Z");
     const [archive, subs, states, issueDaily, issueStates] = await Promise.all([
       env.DB.prepare(
         `SELECT substr(ts,1,10) AS day, COUNT(*) AS n FROM archive
           WHERE project IN (${inSql}) AND ts >= ? GROUP BY day`
-      ).bind(...projects, sinceDay).all<any>(),
+      ).bind(...projects, prevStartDay).all<any>(),
       env.DB.prepare(
         `SELECT date(created_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM submissions
           WHERE project IN (${inSql}) AND created_at >= ? GROUP BY day`
-      ).bind(...projects, sinceMs).all<any>(),
+      ).bind(...projects, prevStartMs).all<any>(),
       env.DB.prepare(
         `SELECT state, COUNT(*) AS n FROM submissions WHERE project IN (${inSql}) GROUP BY state`
       ).bind(...projects).all<any>(),
       env.DB.prepare(
         `SELECT date(created_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM issues
           WHERE project IN (${inSql}) AND created_at >= ? GROUP BY day`
-      ).bind(...projects, sinceMs).all<any>(),
+      ).bind(...projects, prevStartMs).all<any>(),
       env.DB.prepare(
         `SELECT status, COUNT(*) AS n FROM issues WHERE project IN (${inSql}) GROUP BY status`
       ).bind(...projects).all<any>(),
     ]);
-    const msgMap = new Map<string, number>(archive.results.map((r: any) => [String(r.day), Number(r.n)]));
-    const subMap = new Map<string, number>(subs.results.map((r: any) => [String(r.day), Number(r.n)]));
-    const issueMap = new Map<string, number>(issueDaily.results.map((r: any) => [String(r.day), Number(r.n)]));
+    const msgRows = activityRowsOf(archive);
+    const subRows = activityRowsOf(subs);
+    const issueRows = activityRowsOf(issueDaily);
+    const msgMap = activityCountMap(msgRows);
+    const subMap = activityCountMap(subRows);
+    const issueMap = activityCountMap(issueRows);
     const daily = dayKeys.map((day) => ({
       day, messages: msgMap.get(day) ?? 0, submissions: subMap.get(day) ?? 0,
       issues: issueMap.get(day) ?? 0,
     }));
+    const previous = {
+      messages: activityPrevious(msgRows, sinceDay),
+      submissions: activityPrevious(subRows, sinceDay),
+      issues: activityPrevious(issueRows, sinceDay),
+    };
+    const totals = daily.reduce((a, b) => ({
+      messages: a.messages + b.messages, submissions: a.submissions + b.submissions,
+      issues: a.issues + b.issues,
+    }), { messages: 0, submissions: 0, issues: 0 });
     const payload = {
       at: now,
       scope: only || "all",
-      projects,
+      projects, days, range, activity_available: true,
       daily,
       submission_states: Object.fromEntries(states.results.map((r: any) => [r.state, Number(r.n)])),
       issue_states: Object.fromEntries(issueStates.results.map((r: any) => [r.status, Number(r.n)])),
-      totals: {
-        messages: daily.reduce((a, b) => a + b.messages, 0),
-        submissions: daily.reduce((a, b) => a + b.submissions, 0),
-        issues: daily.reduce((a, b) => a + b.issues, 0),
-      },
+      totals, previous,
     };
     cacheSet(ANALYTICS_CACHE, cacheKey, payload);
     return json(payload);
   }
-
   if (path === "/admin/agents" && req.method === "GET") {
     const policy = await loadPolicy(env);
     const rows = (await env.DB.prepare(
@@ -1582,6 +1592,15 @@ async function admin(req: Request, env: Env, url: URL) {
 
     if (action === "snapshot") return stub.fetch(new Request("https://do/snapshot"));
 
+    // 单个 agent 的活动趋势：只回日粒度聚合，不把消息/任务正文拖进管理台；
+    // 供详情页的小图和“完整趋势”弹层共用，避免每次切换范围都重新拉整份详情。
+    const agentActivityMatch = action.match(/^agent\/([A-Za-z0-9._:-]{1,80})\/activity$/);
+    if (agentActivityMatch && req.method === "GET") {
+      const id = decodeURIComponent(agentActivityMatch[1]);
+      const days = analyticsDays(url.searchParams.get("days"), 7);
+      return json(await loadAgentActivity(env, project, id, days));
+    }
+
     // 吊销一个或多个 agent（幂等）：二次确认由前端承担，后端要 confirm 标记
     if (action === "revoke" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
@@ -1605,6 +1624,8 @@ async function admin(req: Request, env: Env, url: URL) {
     // 单个 agent 详情：资源曲线 + 消息 + 提交 + 任务履历/工作统计
     if (action.startsWith("agent/") && req.method === "GET") {
       const id = decodeURIComponent(action.slice(6));
+      const days = analyticsDays(url.searchParams.get("days"), 7);
+      const activity = await loadAgentActivity(env, project, id, days);
       const hb = await env.DB.prepare(
         `SELECT bucket,cpu_pct,mem_used_mb,disk_used_pct,work_state FROM hb_hist
          WHERE project=? AND agent_id=? ORDER BY bucket DESC LIMIT 120`
@@ -1678,6 +1699,7 @@ async function admin(req: Request, env: Env, url: URL) {
       const num0 = (x: any) => Number(x ?? 0);
       return json({
         agent: ag,
+        activity,
         hb: hb.results ?? [],
         submissions: subs.results ?? [],
         messages: msgs,
@@ -3353,6 +3375,83 @@ function cacheGet(map: Map<string, { at: number; data: any }>, key: string, ttlM
 function cacheSet(map: Map<string, { at: number; data: any }>, key: string, data: any) {
   if (map.size >= CACHE_MAX) map.delete(map.keys().next().value as string);
   map.set(key, { at: Date.now(), data });
+}
+
+/** 管理台趋势只开放三个稳定窗口，避免任意 days 参数把 D1 扫描放大。 */
+function analyticsDays(raw: string | null | undefined, fallback = 7): number {
+  const n = Number(raw);
+  return [7, 30, 90].includes(n) ? n : fallback;
+}
+/** 以 UTC 日期为桶；管理台全站都按 UTC 日期展示，避免客户端时区改变历史桶。 */
+function analyticsDayKeys(days: number): string[] {
+  const today = new Date();
+  const base = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  return Array.from({ length: days }, (_, i) =>
+    new Date(base - (days - 1 - i) * 86_400_000).toISOString().slice(0, 10));
+}
+function analyticsPrevStartDay(dayKeys: string[], days: number): string {
+  const first = Date.parse(dayKeys[0] + "T00:00:00Z");
+  return new Date(first - days * 86_400_000).toISOString().slice(0, 10);
+}
+function activityRowsOf(res: any): any[] {
+  return Array.isArray(res?.results) ? res.results : [];
+}
+function activityCountMap(rows: any[]): Map<string, number> {
+  return new Map(rows.map((r) => [String(r.day), Number(r.n ?? 0)]));
+}
+function activityPrevious(rows: any[], sinceDay: string): number {
+  return rows.reduce((a, r) => a + (String(r.day) < sinceDay ? Number(r.n ?? 0) : 0), 0);
+}
+
+/** 单个 agent 的日粒度活动：消息按 sender、交付按 agent_id、Issue 按 reporter。 */
+async function loadAgentActivity(env: Env, project: string, agentId: string, days: number): Promise<any> {
+  const dayKeys = analyticsDayKeys(days);
+  const sinceDay = dayKeys[0];
+  const prevStartDay = analyticsPrevStartDay(dayKeys, days);
+  const prevStartMs = Date.parse(prevStartDay + "T00:00:00Z");
+  let msg: any = null, sub: any = null, iss: any = null;
+  try {
+    [msg, sub, iss] = await Promise.all([
+      env.DB.prepare(
+        `SELECT substr(ts,1,10) AS day, COUNT(*) AS n FROM archive
+          WHERE project = ? AND sender = ? AND ts >= ? GROUP BY day`
+      ).bind(project, agentId, prevStartDay).all<any>(),
+      env.DB.prepare(
+        `SELECT date(created_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM submissions
+          WHERE project = ? AND agent_id = ? AND created_at >= ? GROUP BY day`
+      ).bind(project, agentId, prevStartMs).all<any>(),
+      env.DB.prepare(
+        `SELECT date(created_at / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM issues
+          WHERE project = ? AND reporter = ? AND created_at >= ? GROUP BY day`
+      ).bind(project, agentId, prevStartMs).all<any>(),
+    ]);
+  } catch { /* D1 抖动时返回不可用，不把 0 伪装成真实趋势 */ }
+  const zeroDaily = dayKeys.map((day) => ({ day, messages: 0, submissions: 0, issues: 0 }));
+  if (!msg || !sub || !iss) {
+    return { days, available: false, daily: zeroDaily, totals: null, previous: null,
+             range: { from: sinceDay, to: dayKeys[dayKeys.length - 1], previous_from: prevStartDay } };
+  }
+  const msgMap = activityCountMap(activityRowsOf(msg));
+  const subMap = activityCountMap(activityRowsOf(sub));
+  const issMap = activityCountMap(activityRowsOf(iss));
+  const daily = dayKeys.map((day) => ({
+    day, messages: msgMap.get(day) ?? 0, submissions: subMap.get(day) ?? 0,
+    issues: issMap.get(day) ?? 0,
+  }));
+  const totals = daily.reduce((a, b) => ({
+    messages: a.messages + b.messages, submissions: a.submissions + b.submissions,
+    issues: a.issues + b.issues,
+  }), { messages: 0, submissions: 0, issues: 0 });
+  const previous = {
+    messages: activityPrevious(activityRowsOf(msg), sinceDay),
+    submissions: activityPrevious(activityRowsOf(sub), sinceDay),
+    issues: activityPrevious(activityRowsOf(iss), sinceDay),
+  };
+  return {
+    days, available: true, daily, totals, previous,
+    range: { from: sinceDay, to: dayKeys[dayKeys.length - 1], previous_from: prevStartDay },
+    definition: { messages: "sender=该 agent 的归档消息", submissions: "agent_id=该 agent 的交付", issues: "reporter=该 agent 的 Issue" },
+  };
 }
 const html = (s: string) => new Response(s, { headers: { "content-type": "text/html; charset=utf-8" } });
 const text = (s: string, ct: string) => new Response(s, { headers: { "content-type": ct } });

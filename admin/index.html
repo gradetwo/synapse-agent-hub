@@ -177,10 +177,12 @@ if (location.search.includes("reset=1")) {
   .overlay[hidden]{display:none!important}
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20;padding:16px}
   .sheet{background:#0e1218;border:1px solid #222a35;border-radius:12px;width:min(920px,96vw);max-height:88vh;
-    display:flex;flex-direction:column;overflow:hidden;padding:0}
+    display:flex;flex-direction:column;overflow:hidden;padding:0;min-width:0}
   .sheetHead{padding:12px 16px;border-bottom:1px solid #1c2430;background:#12171f;flex:0 0 auto}
-  .sheetBody{overflow:auto;-webkit-overflow-scrolling:touch;padding:12px 16px 16px;flex:1 1 auto;min-height:0}
+  .sheetBody{overflow:auto;-webkit-overflow-scrolling:touch;padding:12px 16px 16px;flex:1 1 auto;min-height:0;min-width:0}
   .sheetHead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  #trendMeta{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+  #trendTitle{white-space:nowrap}
   .charts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
   @media(max-width:720px){
     .charts{grid-template-columns:1fr}
@@ -364,6 +366,48 @@ if (location.search.includes("reset=1")) {
   .projChip span{font-size:11px;color:var(--dim);white-space:nowrap}
   .projChip:hover{border-color:#2f6da8;background:#132234}
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
+.dashTile.clickable{cursor:pointer}
+.dashTile.clickable:hover,.dashTile.clickable:focus-visible{border-color:#2f6da8;background:#121d2a;outline:0}
+.dashMore{font-size:10px;color:#8fb8ff;border:1px solid #24406e;border-radius:6px;padding:2px 6px;white-space:nowrap}
+.trendToolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 10px}
+.trendSeg{display:inline-flex;align-items:center;gap:2px;padding:2px;border:1px solid #1d2530;border-radius:8px;background:#10161e}
+.trendSeg button{background:transparent;border:0;border-radius:6px;padding:5px 10px;min-height:28px;font-size:12px;color:#8b95a5}
+.trendSeg button.on{background:#1b2b3f;color:#eaf0f8}
+.trendSegSmall button{padding:3px 8px;min-height:24px;font-size:11px}
+.trendStatGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:8px 0 12px}
+.trendStat{background:#121820;border:1px solid #1d2530;border-radius:9px;padding:8px 10px;min-width:0}
+.trendStat .k{font-size:10px;color:#7d8798;letter-spacing:.03em}
+.trendStat .v{font-size:18px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.trendStat .s{font-size:10px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trendChartWrap{position:relative;background:#0b0f14;border:1px solid #1d2530;border-radius:10px;padding:7px 6px 2px;overflow:hidden}
+.trendChartWrap canvas{height:220px;border:0;background:transparent;display:block}
+.trendTip{position:absolute;z-index:3;pointer-events:none;background:#172234;border:1px solid #2f6da8;border-radius:7px;
+  color:#eaf0f8;font-size:11px;line-height:1.5;padding:5px 8px;box-shadow:0 8px 22px rgba(0,0,0,.45);white-space:nowrap}
+.trendMiniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+.trendMiniCard{text-align:left;background:#121820;border:1px solid #1d2530;border-radius:9px;padding:8px;min-width:0}
+.trendMiniCard:hover,.trendMiniCard.on{border-color:#2f6da8;background:#121d2a}
+.trendMiniCard .cap{display:flex;justify-content:space-between;align-items:center;gap:4px;font-size:10px;color:#8b95a5;white-space:nowrap}
+.trendMiniCard .val{font-size:16px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums}
+.trendMiniCard .sub{font-size:9px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trendMiniCard canvas{height:48px;border:0;background:transparent;display:block;margin-top:3px}
+.activityHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+.activityHead .cap{margin:0;flex:1;min-width:150px}
+.activityHead .trendSeg{margin-left:auto}
+.activityCharts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:6px}
+.activityCharts .cap{font-size:10px;margin-bottom:2px}
+.activityCharts canvas{height:70px;border:0;background:transparent}
+@media(max-width:600px){
+  .trendStatGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .trendChartWrap canvas{height:190px}
+  .trendMiniGrid{grid-template-columns:1fr}
+  .trendMiniCard{display:grid;grid-template-columns:minmax(0,1fr) 56px;grid-template-rows:auto auto auto;column-gap:8px}
+  .trendMiniCard canvas{grid-column:2;grid-row:1/4;height:42px;margin-top:0;align-self:center}
+  .activityHead .trendSeg{margin-left:0}
+  .activityHead .cap{flex:1 0 100%;min-width:0}
+  .activityHead .mini{margin-left:auto}
+  .activityCharts{grid-template-columns:1fr;gap:6px}
+  .activityCharts canvas{height:58px}
+}
   @media(max-width:900px){.dashGrid{grid-template-columns:1fr 1fr}.dashGrid .dashTile:first-child{grid-column:1/-1}}
   @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
   @media(max-width:600px){.dashGrid{grid-template-columns:1fr}.dashGrid .dashTile:first-child{grid-column:auto}}
@@ -502,8 +546,8 @@ if (location.search.includes("reset=1")) {
           <canvas id="dashAgentChart" aria-label="节点状态分布"></canvas>
           <div class="legend" id="dashAgentLegend"></div>
         </div>
-        <div class="dashTile">
-          <div class="dashHead">近 7 天 <span id="dashTrendTotal" class="muted"></span></div>
+        <div class="dashTile clickable" id="dashTrendTile" role="button" tabindex="0" title="点击查看活动趋势详情">
+          <div class="dashHead">近 7 天 <span id="dashTrendTotal" class="muted"></span><span class="dashMore">详情 ↗</span></div>
           <canvas id="dashTrendChart" aria-label="近七天消息、交付与 Issue 趋势"></canvas>
           <div class="legend" id="dashTrendLegend"></div>
         </div>
@@ -804,12 +848,55 @@ if (location.search.includes("reset=1")) {
   </div>
 </div>
 
+<div id="trendDetail" class="overlay" hidden>
+  <div class="sheet">
+    <div class="sheetHead"><b id="trendTitle">活动趋势</b><span class="muted" id="trendMeta"></span>
+      <button class="ghost iconBtn" id="trendClose" aria-label="关闭" title="关闭">×</button></div>
+    <div class="sheetBody">
+      <div class="trendToolbar">
+        <div class="trendSeg" id="trendRange" aria-label="时间范围">
+          <button type="button" data-trend-days="7" class="on">7 天</button>
+          <button type="button" data-trend-days="30">30 天</button>
+          <button type="button" data-trend-days="90">90 天</button>
+        </div>
+        <div class="trendSeg" id="trendMetric" aria-label="指标">
+          <button type="button" data-trend-metric="messages" class="on">消息</button>
+          <button type="button" data-trend-metric="submissions">交付</button>
+          <button type="button" data-trend-metric="issues">Issue</button>
+        </div>
+      </div>
+      <div class="trendStatGrid" id="trendStats"></div>
+      <div class="trendChartWrap">
+        <canvas id="trendDetailChart" aria-label="活动趋势折线图"></canvas>
+        <div class="trendTip" id="trendTip" hidden></div>
+      </div>
+      <div class="trendMiniGrid" id="trendMiniGrid"></div>
+      <div class="scopeHint" id="trendNote" style="margin-top:10px"></div>
+    </div>
+  </div>
+</div>
+
 <div id="detail" class="overlay" hidden>
   <div class="sheet">
     <div class="sheetHead"><b id="dName">agent</b><span class="muted" id="dMeta"></span>
       <button class="ghost iconBtn" id="dClose" aria-label="关闭" title="关闭">×</button></div>
     <div class="sheetBody">
     <div class="agentStats" id="dStats"></div>
+    <div class="activityHead">
+      <div class="cap">活动趋势 <span class="scopeHint" id="dActivityMeta"></span></div>
+      <div class="trendSeg trendSegSmall" id="dActivityRange" aria-label="agent 活动范围">
+        <button type="button" data-da-days="7" class="on">7 天</button>
+        <button type="button" data-da-days="30">30 天</button>
+        <button type="button" data-da-days="90">90 天</button>
+      </div>
+      <button class="mini" id="dActivityMore" type="button">完整趋势</button>
+    </div>
+    <div class="activityCharts">
+      <div><div class="cap">发出消息</div><canvas id="cActMsg" aria-label="agent 发出消息趋势"></canvas></div>
+      <div><div class="cap">交付</div><canvas id="cActSub" aria-label="agent 交付趋势"></canvas></div>
+      <div><div class="cap">Issue</div><canvas id="cActIssue" aria-label="agent Issue 趋势"></canvas></div>
+    </div>
+    <div class="scopeHint" id="dActivityNote"></div>
     <div class="agentViz">
       <div class="vizBox">
         <div class="cap">任务构成 <span class="scopeHint" id="dTaskTotal"></span></div>
@@ -930,6 +1017,17 @@ let IDLE_CONFIG = null;            // 当前项目空闲提醒配置
 let IDLE_CFG_DIRTY = false;        // 用户正在编辑时不被自动刷新覆盖
 let ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
 let ANALYTICS_STATE = "loading";   // loading / ready / error：0 只能来自 ready
+const TREND_METRICS = {
+  messages: { label: "消息", color: "#6aa9ff" },
+  submissions: { label: "交付", color: "#56d364" },
+  issues: { label: "Issue", color: "#d29922" },
+};
+let TREND_VIEW = {
+  open: false, mode: "global", agent: null, scope: "", days: 7,
+  metric: "messages", data: null, loading: false, error: "", epoch: 0,
+};
+let TREND_CHART_HIT = null;
+let detailDays = 7;
 let STATS_DATA = null;             // 最近一次顶部统计响应
 let STATS_STATE = "loading";       // loading / ready / error / stale
 let AGENTS_LOADED = false;         // 名册请求是否成功过（空数组也算成功）
@@ -1141,6 +1239,7 @@ function fillDetailProjects() {
 // 从“全部项目”或注册审批跳到具体项目：统一更新下拉、实时连接和项目级缓存。
 function activateProject(project) {
   if (!project || project === current) return;
+  if (TREND_VIEW.open) closeTrendSheet();
   current = project;
   const sel = $("proj");
   if (sel) sel.value = project;
@@ -2845,6 +2944,259 @@ function drawTrend(cv, daily, emptyText = "暂无活动") {
   });
 }
 
+function trendRows(data) {
+  return data && Array.isArray(data.daily) ? data.daily : [];
+}
+function trendPeak(rows, key) {
+  let best = null;
+  for (const row of rows) {
+    const value = Number(row[key] ?? 0);
+    if (!best || value > best.value) best = { day: String(row.day || ""), value };
+  }
+  return best;
+}
+function trendDeltaText(current, previous) {
+  if (previous === null || previous === undefined) return "—";
+  const cur = Number(current ?? 0), prev = Number(previous ?? 0);
+  if (!Number.isFinite(prev)) return "—";
+  if (prev === 0) return cur > 0 ? "新增" : "—";
+  const pct = Math.round((cur - prev) / prev * 100);
+  return `${pct > 0 ? "+" : ""}${pct}%`;
+}
+function trendAvailable(data) {
+  return !!data && data.available !== false && data.activity_available !== false;
+}
+function drawTrendSeries(cv, daily, key, opts = {}) {
+  if (!cv) return;
+  const cfg = TREND_METRICS[key] || TREND_METRICS.messages;
+  const mini = !!opts.mini;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.max(1, cv.clientWidth || (mini ? 120 : 340));
+  const h = Math.max(1, cv.clientHeight || (mini ? 48 : 220));
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const g = cv.getContext("2d");
+  if (!g) return;
+  if (!mini) TREND_CHART_HIT = null;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const rows = trendRows({ daily });
+  const vals = rows.map((r) => Number(r[key] ?? 0));
+  if (!rows.length) {
+    g.fillStyle = "#7d8798"; g.font = "11px ui-monospace,monospace"; g.textAlign = "center";
+    g.fillText("暂无数据", w / 2, h / 2);
+    return;
+  }
+  const max = Math.max(1, ...vals);
+  const pad = mini ? { l: 4, r: 4, t: 4, b: 4 } : { l: 38, r: 10, t: 16, b: 24 };
+  const pw = Math.max(1, w - pad.l - pad.r);
+  const ph = Math.max(1, h - pad.t - pad.b);
+  const px = (i) => pad.l + (rows.length === 1 ? pw / 2 : (i / (rows.length - 1)) * pw);
+  const py = (v) => pad.t + ph - (Number(v) / max) * ph;
+  g.strokeStyle = "#1d2530"; g.lineWidth = 1;
+  if (!mini) {
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.t + ph - (i / 4) * ph;
+      g.beginPath(); g.moveTo(pad.l, y); g.lineTo(pad.l + pw, y); g.stroke();
+    }
+    g.fillStyle = "#7d8798"; g.font = "10px ui-monospace,monospace"; g.textAlign = "right";
+    g.fillText(String(Math.round(max)), pad.l - 5, pad.t + 3);
+    g.fillText(String(Math.round(max / 2)), pad.l - 5, pad.t + ph / 2 + 3);
+    g.fillText("0", pad.l - 5, pad.t + ph + 3);
+    const step = rows.length <= 7 ? 1 : Math.ceil(rows.length / 6);
+    rows.forEach((r, i) => {
+      if (i % step !== 0 && i !== rows.length - 1) return;
+      const last = i === rows.length - 1;
+      g.textAlign = i === 0 ? "left" : last ? "right" : "center";
+      g.fillText(String(r.day || "").slice(5), last ? px(i) - 2 : px(i), h - 5);
+    });
+  }
+  const points = rows.map((r, i) => ({ x: px(i), y: py(vals[i]), value: vals[i], day: String(r.day || "") }));
+  // 面积只做轻提示，折线保持低对比背景上的可读性。
+  g.beginPath();
+  g.moveTo(points[0].x, pad.t + ph);
+  points.forEach((p) => g.lineTo(p.x, p.y));
+  g.lineTo(points[points.length - 1].x, pad.t + ph);
+  g.closePath();
+  const grad = g.createLinearGradient(0, pad.t, 0, pad.t + ph);
+  grad.addColorStop(0, cfg.color + "44");
+  grad.addColorStop(1, cfg.color + "00");
+  g.fillStyle = grad;
+  g.fill();
+  g.beginPath();
+  g.moveTo(points[0].x, points[0].y);
+  points.slice(1).forEach((p) => g.lineTo(p.x, p.y));
+  g.strokeStyle = cfg.color; g.lineWidth = mini ? 1.5 : 2; g.stroke();
+  if (!mini) {
+    g.fillStyle = cfg.color;
+    points.forEach((p) => { g.beginPath(); g.arc(p.x, p.y, 2.2, 0, Math.PI * 2); g.fill(); });
+  }
+  if (!mini) {
+    TREND_CHART_HIT = { points, rows, key, color: cfg.color, width: w, height: h };
+  }
+}
+
+function renderTrendStats() {
+  const el = $("trendStats");
+  if (!el) return;
+  const data = TREND_VIEW.data;
+  const metric = TREND_VIEW.metric;
+  const cfg = TREND_METRICS[metric];
+  const days = Number(data?.days ?? TREND_VIEW.days) || TREND_VIEW.days;
+  const rows = trendRows(data);
+  const available = trendAvailable(data);
+  const total = available && data?.totals ? Number(data.totals[metric] ?? 0) : null;
+  const avg = total === null ? "—" : (total / Math.max(1, days)).toFixed(total / Math.max(1, days) >= 10 ? 0 : 1);
+  const peak = available ? trendPeak(rows, metric) : null;
+  const previous = available && data?.previous ? data.previous[metric] : null;
+  const delta = trendDeltaText(total, previous);
+  const deltaHint = previous === null || previous === undefined ? "上一周期 —" : `vs 上一个 ${days} 天`;
+  if (!available) {
+    el.innerHTML = `<div class="trendStat"><div class="k">${esc(cfg.label)}</div><div class="v">—</div><div class="s">活动数据不可用</div></div>`;
+    return;
+  }
+  el.innerHTML = [
+    `<div class="trendStat"><div class="k">${esc(cfg.label)}总量</div><div class="v">${esc(String(total ?? 0))}</div><div class="s">${esc(days)} 天累计</div></div>`,
+    `<div class="trendStat"><div class="k">日均</div><div class="v">${esc(String(avg))}</div><div class="s">${esc(days)} 天平均</div></div>`,
+    `<div class="trendStat"><div class="k">峰值</div><div class="v">${peak ? esc(String(peak.value)) : "—"}</div><div class="s">${peak ? esc(peak.day.slice(5)) : "暂无"}</div></div>`,
+    `<div class="trendStat"><div class="k">周期变化</div><div class="v">${esc(delta)}</div><div class="s">${esc(deltaHint)}</div></div>`,
+  ].join("");
+}
+function renderTrendMinis() {
+  const el = $("trendMiniGrid");
+  if (!el) return;
+  const data = TREND_VIEW.data;
+  if (!trendAvailable(data)) { el.innerHTML = ""; return; }
+  const rows = trendRows(data);
+  const days = Number(data?.days ?? TREND_VIEW.days) || TREND_VIEW.days;
+  el.innerHTML = Object.entries(TREND_METRICS).map(([key, cfg]) => {
+    const total = Number(data?.totals?.[key] ?? 0);
+    const peak = trendPeak(rows, key);
+    const avg = (total / Math.max(1, days)).toFixed(total / Math.max(1, days) >= 10 ? 0 : 1);
+    return `<button type="button" class="trendMiniCard ${TREND_VIEW.metric === key ? "on" : ""}" data-trend-mini="${key}">
+      <span class="cap"><span>${esc(cfg.label)}</span><span>日均 ${esc(avg)}</span></span>
+      <span class="val">${esc(String(total))}</span>
+      <span class="sub">峰值 ${peak ? esc(String(peak.value)) : "—"}${peak ? ` · ${esc(peak.day.slice(5))}` : ""}</span>
+      <canvas data-trend-mini-chart="${key}" aria-label="${esc(cfg.label)}小型趋势图"></canvas>
+    </button>`;
+  }).join("");
+  el.querySelectorAll("[data-trend-mini-chart]").forEach((cv) => {
+    const key = cv.getAttribute("data-trend-mini-chart");
+    drawTrendSeries(cv, rows, key, { mini: true });
+  });
+}
+function renderTrendSheet() {
+  if (!TREND_VIEW.open) return;
+  const data = TREND_VIEW.data;
+  const rows = trendRows(data);
+  const metric = TREND_VIEW.metric;
+  const cfg = TREND_METRICS[metric] || TREND_METRICS.messages;
+  const scopeText = TREND_VIEW.mode === "agent" ? `agent · ${TREND_VIEW.agent || ""}`
+    : (current === "*" ? "全部项目" : current);
+  const range = data?.range;
+  const titleEl = $("trendTitle");
+  if (titleEl) titleEl.textContent = "活动趋势";
+  const metaEl = $("trendMeta");
+  if (metaEl) metaEl.textContent = TREND_VIEW.loading ? "加载中…" :
+    TREND_VIEW.error ? TREND_VIEW.error :
+    `${scopeText} · ${data?.days || TREND_VIEW.days} 天${range ? ` · ${range.from} ~ ${range.to}` : ""}`;
+  const noteEl = $("trendNote");
+  if (noteEl) {
+    noteEl.textContent = TREND_VIEW.error ? "请求失败，稍后重试。" :
+      TREND_VIEW.mode === "agent"
+        ? "消息=该 agent 发出的归档消息；交付=该 agent 提交；Issue=该 agent 上报。按 UTC 日桶聚合。"
+        : "消息=Hub 归档消息；交付/Issue=按创建时间计数。按 UTC 日桶聚合。";
+  }
+  document.querySelectorAll("#trendRange [data-trend-days]").forEach((b) => {
+    b.classList.toggle("on", Number(b.getAttribute("data-trend-days")) === TREND_VIEW.days);
+  });
+  document.querySelectorAll("#trendMetric [data-trend-metric]").forEach((b) => {
+    b.classList.toggle("on", b.getAttribute("data-trend-metric") === metric);
+  });
+  renderTrendStats();
+  renderTrendMinis();
+  drawTrendSeries($("trendDetailChart"), rows, metric);
+  const tip = $("trendTip"); if (tip) tip.hidden = true;
+  if (TREND_VIEW.loading) {
+    const stats = $("trendStats"); if (stats) stats.innerHTML = `<div class="trendStat"><div class="k">加载</div><div class="v">…</div><div class="s">读取活动趋势</div></div>`;
+  }
+}
+async function loadTrendSheet() {
+  const request = { mode: TREND_VIEW.mode, agent: TREND_VIEW.agent, days: TREND_VIEW.days, scope: TREND_VIEW.scope };
+  const epoch = ++TREND_VIEW.epoch;
+  TREND_VIEW.loading = true; TREND_VIEW.error = ""; renderTrendSheet();
+  const qs = new URLSearchParams({ days: String(request.days), fresh: "1" });
+  let path;
+  if (request.mode === "agent") {
+    path = `/admin/p/${encodeURIComponent(request.scope)}/agent/${encodeURIComponent(request.agent)}/activity?${qs}`;
+  } else {
+    if (request.scope !== "*") qs.set("project", request.scope);
+    path = `/admin/analytics?${qs}`;
+  }
+  try {
+    const d = await api(path);
+    if (!TREND_VIEW.open || TREND_VIEW.scope !== request.scope || TREND_VIEW.epoch !== epoch) return;
+    const data = request.mode === "agent" ? (d?.activity || d) : d;
+    if (!data || !Array.isArray(data.daily)) throw new Error("bad_trend_payload");
+    TREND_VIEW.data = data; TREND_VIEW.loading = false; TREND_VIEW.error = "";
+    renderTrendSheet();
+  } catch (e) {
+    if (!TREND_VIEW.open || TREND_VIEW.scope !== request.scope || TREND_VIEW.epoch !== epoch) return;
+    TREND_VIEW.loading = false; TREND_VIEW.error = "趋势加载失败";
+    TREND_VIEW.data = null;
+    renderTrendSheet();
+    showToast(`趋势加载失败：${e?.message || e}`);
+  }
+}
+function openTrendSheet(mode = "global", agent = null) {
+  const ov = $("trendDetail");
+  if (!ov) return;
+  if (mode === "agent" && (!current || current === "*")) {
+    showToast("请先选择具体项目，再查看 agent 活动趋势");
+    return;
+  }
+  TREND_VIEW = {
+    open: true, mode, agent, scope: current, days: mode === "agent" ? detailDays : 7,
+    metric: "messages", data: null, loading: false, error: "", epoch: 0,
+  };
+  $("trendTitle").textContent = "活动趋势";
+  ov.hidden = false; ov.style.display = "flex";
+  document.body.classList.add("has-sheet");
+  loadTrendSheet();
+}
+function closeTrendSheet() {
+  const ov = $("trendDetail");
+  if (ov) { ov.hidden = true; ov.style.display = ""; }
+  TREND_VIEW.open = false;
+  const detail = $("detail");
+  if (detail && !detail.hidden) document.body.classList.add("has-sheet");
+  else document.body.classList.remove("has-sheet");
+}
+function bindTrendChartHover() {
+  const cv = $("trendDetailChart");
+  if (!cv) return;
+  cv.onpointermove = (ev) => {
+    const meta = TREND_CHART_HIT;
+    const tip = $("trendTip");
+    if (!meta || !meta.points.length || !tip) return;
+    const rect = cv.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    let best = meta.points[0];
+    for (const p of meta.points) if (Math.abs(p.x - x) < Math.abs(best.x - x)) best = p;
+    tip.textContent = `${best.day.slice(5)} · ${TREND_METRICS[meta.key]?.label || meta.key} ${best.value}`;
+    tip.hidden = false;
+    const wrap = cv.parentElement;
+    if (!wrap) return;
+    const wr = wrap.getBoundingClientRect();
+    const left = Math.max(6, Math.min(wr.width - tip.offsetWidth - 8,
+      rect.left - wr.left + best.x + 10));
+    const top = Math.max(4, Math.min(wr.height - tip.offsetHeight - 4, best.y + 10));
+    tip.style.left = `${left}px`; tip.style.top = `${top}px`;
+  };
+  cv.onpointerleave = () => { const tip = $("trendTip"); if (tip) tip.hidden = true; };
+}
+
 function renderStack(el, parts) {
   if (!el) return;
   const known = parts.filter((p) => !p.unknown);
@@ -3013,7 +3365,10 @@ function renderDashboard() {
 let dashResizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(dashResizeTimer);
-  dashResizeTimer = setTimeout(renderDashboard, 120);
+  dashResizeTimer = setTimeout(() => {
+    renderDashboard();
+    if (TREND_VIEW.open) renderTrendSheet();
+  }, 120);
 });
 
 function drawLine(cv, vals, color) {
@@ -3169,6 +3524,49 @@ function renderAgentWork(d, live) {
     $("dIssues").insertAdjacentHTML("beforeend", `<div class="muted">列表仅显示最近 ${issues.length} 条</div>`);
 }
 
+function setActivityRange(days) {
+  document.querySelectorAll("#dActivityRange [data-da-days]").forEach((b) => {
+    b.classList.toggle("on", Number(b.getAttribute("data-da-days")) === Number(days));
+  });
+}
+function renderAgentActivity(activity) {
+  const data = activity || {};
+  const days = Number(data.days || detailDays) || 7;
+  const available = data.available !== false && Array.isArray(data.daily);
+  const rows = available ? data.daily : [];
+  const vals = (key) => rows.map((r) => Number(r[key] ?? 0));
+  drawLine($("cActMsg"), vals("messages"), "#6aa9ff");
+  drawLine($("cActSub"), vals("submissions"), "#56d364");
+  drawLine($("cActIssue"), vals("issues"), "#d29922");
+  setActivityRange(days);
+  if (!available) {
+    $("dActivityMeta").textContent = `${days} 天 · 活动数据不可用`;
+    $("dActivityNote").textContent = "D1 活动聚合读取失败，不把 0 当成真实趋势。";
+    return;
+  }
+  const total = data.totals || {};
+  $("dActivityMeta").textContent = `${days} 天 · 消息 ${Number(total.messages ?? 0)} · 交付 ${Number(total.submissions ?? 0)} · Issue ${Number(total.issues ?? 0)}`;
+  const range = data.range || {};
+  $("dActivityNote").textContent = `${range.from || "—"} ~ ${range.to || "—"} · 消息=该 agent 发出；交付=该 agent 提交；Issue=该 agent 上报。`;
+}
+async function refreshAgentActivity(days) {
+  const id = detailAgent;
+  if (!id) return;
+  detailDays = [7, 30, 90].includes(Number(days)) ? Number(days) : 7;
+  setActivityRange(detailDays);
+  $("dActivityMeta").textContent = `${detailDays} 天 · 加载中…`;
+  $("dActivityNote").textContent = "";
+  try {
+    const d = await api(`/admin/p/${encodeURIComponent(current)}/agent/${encodeURIComponent(id)}/activity?days=${detailDays}`);
+    if (id !== detailAgent) return;
+    renderAgentActivity(d);
+  } catch (e) {
+    if (id !== detailAgent) return;
+    $("dActivityMeta").textContent = `${detailDays} 天 · 活动数据不可用`;
+    $("dActivityNote").textContent = `活动趋势读取失败：${e?.message || e}`;
+  }
+}
+
 let detailAgent = null;
 let detailRole = "agent";
 let detailReady = false;
@@ -3224,7 +3622,8 @@ function setDetailReady(on) {
     if (el) el.disabled = !on;
   }
 }
-function openAgent(id, project) {
+function openAgent(id, project, days = detailDays) {
+  detailDays = [7, 30, 90].includes(Number(days)) ? Number(days) : 7;
   if (project && project !== current) {
     activateProject(project);
     refresh();
@@ -3244,6 +3643,13 @@ function openAgent(id, project) {
   $("dWorkBars").innerHTML = ""; $("dTaskLegend").innerHTML = "";
   $("dTaskTotal").textContent = ""; $("dIssueSummary").textContent = "";
   $("dPermSummary").textContent = "加载中…";
+  setActivityRange(detailDays);
+  $("dActivityMeta").textContent = `${detailDays} 天 · 加载中…`;
+  $("dActivityNote").textContent = "";
+  for (const id of ["cActMsg", "cActSub", "cActIssue"]) {
+    const cv = $(id); const g = cv && cv.getContext("2d");
+    if (cv && g) { cv.width = cv.width; g.clearRect(0, 0, cv.width, cv.height); }
+  }
   if (!sameAgentRefresh) {
     $("dToken").innerHTML = "";
     const pd = $("dPermDetails"); if (pd) pd.open = false;
@@ -3253,7 +3659,7 @@ function openAgent(id, project) {
   const idleRemindBtn = $("dIdleRemind");
   if (idleRemindBtn) idleRemindBtn.hidden = true;
   setDetailReady(false);
-  api(`/admin/p/${current}/agent/${encodeURIComponent(id)}`).then((d) => {
+  api(`/admin/p/${current}/agent/${encodeURIComponent(id)}?days=${detailDays}`).then((d) => {
     setDetailReady(true);
     const hb = (d.hb || []).slice().reverse();
     const role = d.agent?.role || "agent";
@@ -3289,6 +3695,7 @@ function openAgent(id, project) {
     drawLine($("cCpu"), hbVal("cpu_pct"), "#6aa9ff");
     drawLine($("cMem"), hbVal("mem_used_mb"), "#8ee08e");
     drawLine($("cDisk"), hbVal("disk_used_pct"), "#ffc46a");
+    renderAgentActivity(d.activity || { days: detailDays, available: false, daily: [] });
     $("dMsgs").innerHTML = d.messages_available === false
       ? `<div class="muted">消息读取失败</div>`
       : ((d.messages || []).slice().reverse().map((m) => {
@@ -4296,6 +4703,55 @@ const tlOv = $("taskTimeline");
 if (tlOv) tlOv.onclick = (e) => { if (e.target === tlOv) { tlOv.hidden = true; tlOv.style.display = ""; document.body.classList.remove("has-sheet"); } };
 const dOv = $("detail");
 if (dOv) dOv.onclick = (e) => { if (e.target === dOv) { dOv.hidden = true; document.body.classList.remove("has-sheet"); } };
+
+const trendTile = $("dashTrendTile");
+if (trendTile) {
+  trendTile.onclick = () => openTrendSheet("global");
+  trendTile.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrendSheet("global"); } };
+}
+const trendCloseEl = $("trendClose");
+if (trendCloseEl) trendCloseEl.onclick = closeTrendSheet;
+const trendOv = $("trendDetail");
+if (trendOv) trendOv.onclick = (e) => { if (e.target === trendOv) closeTrendSheet(); };
+const trendRangeEl = $("trendRange");
+if (trendRangeEl) trendRangeEl.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-trend-days]");
+  if (!b) return;
+  const days = Number(b.getAttribute("data-trend-days"));
+  if (![7, 30, 90].includes(days)) return;
+  TREND_VIEW.days = days;
+  loadTrendSheet();
+});
+const trendMetricEl = $("trendMetric");
+if (trendMetricEl) trendMetricEl.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-trend-metric]");
+  if (!b) return;
+  const metric = b.getAttribute("data-trend-metric");
+  if (!TREND_METRICS[metric]) return;
+  TREND_VIEW.metric = metric;
+  renderTrendSheet();
+});
+const trendMiniEl = $("trendMiniGrid");
+if (trendMiniEl) trendMiniEl.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-trend-mini]");
+  if (!b) return;
+  const metric = b.getAttribute("data-trend-mini");
+  if (!TREND_METRICS[metric]) return;
+  TREND_VIEW.metric = metric;
+  renderTrendSheet();
+});
+bindTrendChartHover();
+
+const dActivityRangeEl = $("dActivityRange");
+if (dActivityRangeEl) dActivityRangeEl.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-da-days]");
+  if (!b) return;
+  refreshAgentActivity(Number(b.getAttribute("data-da-days")));
+});
+const dActivityMoreEl = $("dActivityMore");
+if (dActivityMoreEl) dActivityMoreEl.onclick = () => {
+  if (detailAgent) openTrendSheet("agent", detailAgent);
+};
 $("btnSettings").onclick = settings;
 $("gateOk").onclick = async () => {
   if (await tryConnect($("gateInput").value)) { await loadProjects(); await refresh(); }
