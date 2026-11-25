@@ -2433,6 +2433,23 @@ function validatePatchText(text: string): string | null {
         if (j + 1 < lines.length && (/^diff --git /.test(lines[j + 1]) || /^@@ /.test(lines[j + 1]))) break;
         continue;
       }
+      // format-patch appends "-- " plus a version footer after the last hunk.
+      // Once the declared hunk counts are complete, it must not be counted as
+      // a deleted line; otherwise oldGot overshoots and the whole patch is 422.
+      // A -0,0 hunk starts with zero counts but still has body lines, so only
+      // apply the footer rule after at least one body line was consumed.
+      if (oldGot === oldNeed && newGot === newNeed
+          && (oldGot + newGot > 0 || (oldNeed === 0 && newNeed === 0))) {
+        if (body === "-- " || (body === "--" && (
+          j + 1 >= lines.length
+          || lines[j + 1] === ""
+          || /^\d+(?:\.\d+)+/.test(lines[j + 1])
+          || /^git version /.test(lines[j + 1])
+        ))) break;
+        if (body[0] === " " || body[0] === "-" || body[0] === "+")
+          return `patch_hunk_mismatch:${oldGot}/${oldNeed},${newGot}/${newNeed}`;
+        break;
+      }
       const c = body[0];
       if (c === " ") { oldGot++; newGot++; }
       else if (c === "-") oldGot++;
