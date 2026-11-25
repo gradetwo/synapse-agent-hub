@@ -223,29 +223,56 @@ class Client:
             if not events:
                 time.sleep(1)
 
-    def poll_events(self, topics: str | None = None, limit: int = 100) -> list[dict]:
-        """从独立事件游标拉一批事件；不阻塞、不 ACK。"""
+    def poll_events(self, topics: str | None = None, limit: int = 100,
+                    drain: bool = False) -> list[dict]:
+        """从独立事件游标拉一批事件；不阻塞、不 ACK。
+
+        大页经出口代理时可能被截断成 ChunkedEncodingError。服务端单页上限 200，
+        客户端遇到截断/解码失败时自动把本页降到 20 条再拉；drain=True 时
+        继续翻页直到游标不再前进，供 WS 重连后的离线补拉使用。
+        """
         since = self._event_cursor_load()
-        q = f"/p/{self.project}/events?since={since}&limit={limit}"
-        if topics:
-            q += f"&topics={quote(str(topics), safe='')}"
-        r = self._get(q)
-        ep = r.get("epoch")
-        if ep and ep != self._event_epoch_load():
-            # 房间重建：seq 归零，旧事件游标不能继续用
-            self._event_cursor_save(0, ep)
-            since = 0
-            q = f"/p/{self.project}/events?since=0&limit={limit}"
+        page_limit = max(1, min(200, int(limit)))
+        out: list[dict] = []
+        pages = 0
+        while True:
+            q = f"/p/{self.project}/events?since={since}&limit={page_limit}"
             if topics:
                 q += f"&topics={quote(str(topics), safe='')}"
-            r = self._get(q)
-        events = list(r.get("events") or [])
-        next_cursor = int(r.get("next_cursor") or since)
-        if events:
-            self._event_cursor_save(max(next_cursor, int(events[-1].get("seq") or 0)))
-        elif next_cursor > since:
-            self._event_cursor_save(next_cursor)
-        return events
+            try:
+                r = self._get(q)
+            except (requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ContentDecodingError,
+                    requests.ConnectionError) as e:
+                # 大页被代理截断时，同页重试再多次也没用；先降页长再拉。
+                if page_limit > 20 and not isinstance(e, requests.ConnectionError):
+                    page_limit = 20
+                    continue
+                if page_limit > 10:
+                    page_limit = 10
+                    continue
+                raise
+            ep = r.get("epoch")
+            if ep and ep != self._event_epoch_load():
+                # 房间重建：seq 归零，旧事件游标不能继续用
+                self._event_cursor_save(0, ep)
+                since = 0
+                q = f"/p/{self.project}/events?since=0&limit={page_limit}"
+                if topics:
+                    q += f"&topics={quote(str(topics), safe='')}"
+                r = self._get(q)
+            events = list(r.get("events") or [])
+            next_cursor = int(r.get("next_cursor") or since)
+            if events:
+                self._event_cursor_save(max(next_cursor, int(events[-1].get("seq") or 0)))
+            elif next_cursor > since:
+                self._event_cursor_save(next_cursor)
+            out.extend(events)
+            pages += 1
+            if not drain or next_cursor <= since or pages >= 20:
+                break
+            since = next_cursor
+        return out
 
     def on_event(self, handler):
         """注册实时事件回调；返回 handler 本身，可直接当装饰器使用。
@@ -500,7 +527,10 @@ class Client:
     def _headers(self) -> dict:
         return {"authorization": f"Bearer {self._token}", "x-sdk-version": __version__,
                 "user-agent": f"synapse-agent/{__version__} (python)",
-                "connection": "close", "content-type": "application/json"}
+                "connection": "close", "content-type": "application/json",
+                # 大页 JSON 经出口代理时，压缩/分块解码失败会表现为
+                # ChunkedEncodingError；请求 identity，避免代理重压后再截断。
+                "accept-encoding": "identity"}
 
     def check_update(self) -> dict:
         """问服务端 SDK 发版信息，判断是否需要升级（不下载、不改动本地）。"""

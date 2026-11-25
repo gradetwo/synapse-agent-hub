@@ -909,9 +909,15 @@ export class ProjectRoom implements DurableObject {
       .map((m: any) => ({ m, e: this.clientEventOf(m) }))
       .filter((x: any) => x.e && this.eventVisible(x.e, eventAtt))
       .map((x: any) => x.e);
-    const events = desc ? eventRows.slice(-limit) : eventRows.slice(0, limit);
-    return json({ messages: page, events, next_cursor: next, epoch,
-                  has_more: rawMessages.length > page.length });
+    const eventPage = desc ? eventRows.slice(-limit) : eventRows.slice(0, limit);
+    const events = eventPage;
+    // 事件游标不能复用消息页的 next：observer 的消息页通常为空/很小，
+    // 但事件可见性是全量；复用会把游标直接跳到 lastRawSeq，跳过中间事件。
+    const nextEvent = desc
+      ? (eventPage.length ? eventPage[eventPage.length - 1].seq : lastRawSeq)
+      : (eventPage.length < limit ? lastRawSeq : eventPage[eventPage.length - 1].seq);
+    return json({ messages: page, events, next_cursor: next, next_event_cursor: nextEvent,
+                  epoch, has_more: rawMessages.length > page.length });
   }
 
   /** 事件专用拉取：给没有 WebSocket 的客户端/降级通道用；游标与消息 seq 同源。 */
@@ -942,7 +948,8 @@ export class ProjectRoom implements DurableObject {
         });
       }
     }
-    return json({ events, next_cursor: d.next_cursor ?? since,
+    const nextEvent = d.next_event_cursor ?? d.next_cursor ?? since;
+    return json({ events, next_cursor: nextEvent, next_event_cursor: nextEvent,
                   epoch: d.epoch ?? null });
   }
 

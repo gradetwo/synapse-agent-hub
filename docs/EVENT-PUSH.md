@@ -114,12 +114,14 @@ synapse-agent status   # 输出 event_cursor / event_cmd
 {
   "events": [ ... ],
   "next_cursor": 124,
+  "next_event_cursor": 124,
   "epoch": "a1b2c3d4"
 }
 ```
 
 - `topics` 过滤事件类别：`task`、`submission`、`announce`、`admin`、`system`、`report`、`issue`、`status`、`alert`；`artifact` 是 `submission` 的兼容别名，`all` 表示不过滤。事件类别按 `type` 判断，不按原始消息 topic，因此 `submission.created` 不会被 `topics=submission` 漏掉。
-- `next_cursor` 与 `/inbox` 同源；即使整页都是不可见项目事件，客户端也必须保存 `next_cursor`，否则会反复拉旧段。
+- `next_cursor` / `next_event_cursor` 是事件游标，按事件页推进；不能复用 `/inbox` 的消息页游标。observer 的消息页经常为空或很小，若复用消息游标会直接跳到 `lastRawSeq`，跳过中间事件。
+- 即使整页都是不可见项目事件，客户端也必须保存推进后的游标，否则会反复拉旧段。
 - 房间重建时 `epoch` 变化，客户端应把事件游标归零。
 
 ## 5. Webhook

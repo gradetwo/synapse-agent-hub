@@ -27,6 +27,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 
 from .client import Client
@@ -56,6 +57,11 @@ class Loop:
         self._stop = threading.Event()
         self._catchup_lock = threading.Lock()
         self._poller: threading.Thread | None = None
+        # WS 实时事件与重连补拉可能同时看到同一条事件；按 seq 去重，
+        # 避免同一个 submission.created 被回调两次。只保留最近 2000 条，
+        # 补拉大量历史事件时不会无界增长。
+        self._event_seen: set[int] = set()
+        self._event_order: deque[int] = deque()
         self.c.start_heartbeat()          # 心跳从此不用管
         if transport in ("auto", "ws"):
             self._probe_ws()
@@ -84,14 +90,29 @@ class Loop:
             # 重连后必须补拉断线期间的消息；不补就会永久停在旧游标。
             self._catch_up()
 
+    def _emit_event(self, event: dict) -> None:
+        seq = int(event.get("seq") or 0)
+        if seq:
+            if seq in self._event_seen:
+                return
+            self._event_seen.add(seq)
+            self._event_order.append(seq)
+            if len(self._event_order) > 2000:
+                self._event_seen.discard(self._event_order.popleft())
+            self.c._event_cursor_save(max(seq, self.c._event_cursor_load()))
+        self.c._dispatch_event(event)
+
     def _on_ws_event(self, event: dict) -> None:
         # 事件只做通知，不进任务队列，不 ACK，不触发 exec/窗口注入。
-        self.c._dispatch_event(event)
+        # 事件游标必须随 WS 实时前移；否则断线重连时会把已经实时看过的
+        # 全部历史事件再补一遍，积压超过一页时还会漏掉真正断线期间的事件。
+        self._emit_event(event)
 
     def _poll_events(self) -> None:
         try:
-            for e in self.c.poll_events():
-                self.c._dispatch_event(e)
+            # 断线补拉必须翻完所有页，不能只取一页就认为追平。
+            for e in self.c.poll_events(drain=True):
+                self._emit_event(e)
         except Exception:                 # noqa: BLE001
             pass                          # 通知失败不能影响任务主循环
 
