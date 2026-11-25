@@ -180,7 +180,7 @@ synapse-agent ws --endpoint … --project … --token … --agent … \
 - 每条任务以**一行 JSON** 从 stdin 喂给 `--exec` 的进程；
 - 执行期间收件线程继续跑，新任务进队列排队，不丢；
 - 心跳里的 `work.state` / `work.phase` / `queue` 会显示“在忙什么、积了几条”；
-- 队列里只放“点名给我的 + 广播”，别人的定向消息和自己发的 ack 不入队。
+- 队列里只放 `to` 明确指向本 agent 的任务/提醒和管理端 `announce` 广播；其他普通 agent 的 `to=null` 广播（report/status/issue）只给管理身份，普通 agent 不入队；
 
 实测：3 条任务间隔 0.4 秒发出，每条执行耗时 2 秒，最终 3 条全部执行：
 

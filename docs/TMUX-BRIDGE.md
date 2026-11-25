@@ -43,9 +43,12 @@ synapse-agent tmux-config --clear        # 清除目标和开关
 ```json
 {
   "tmux_target": "%3",
-  "tmux_forward": true
+  "tmux_forward": true,
+  "role": "agent"
 }
 ```
+
+`role` 只影响本地 TUI 是否接收无收件人的项目广播：普通 agent 保持 `agent`；管理 agent 用 `init --role admin` 或 `SYNAPSE_AGENT_ROLE=admin` 才放行。服务端仍以 token 的 role 为准。
 
 ---
 
@@ -111,8 +114,10 @@ cat task.txt | synapse-agent tmux-send --target '%3' --stdin --enter 1 --verify 
 
 和 Windows 窗口投递共用同一套消息过滤：
 
-- **放行**：管理端广播、`to` 明确指向本 agent 的消息；
-- **过滤**：其他 agent 的 `artifact` 交付单、任务板 `claimed/released/done` 生命周期事件、无收件人的 `report/status/announce` 项目广播。
+- **放行**：`to` 明确指向本 agent 的消息；管理端 `announce` 广播；`role=admin` 的本地投递面额外放行其他管理广播；
+- **过滤**：其他 agent 的 `artifact` 交付单、任务板 `claimed/released/done` 生命周期事件、其他普通 agent 的 `issue/announce/report/status` 无收件人广播；
+- **任务单飞**：定向任务由服务端按 agent 并发槽排队，一次只发一条 `task`；客户端在 `active_task.json` 存在时不再接收第二条任务，只允许提醒/系统通知插入。任务 `done/released/blocked/failed/reopened/reassigned/requeued` 的 raw 消息或事件帧都会释放本地 active 锁，然后才放行下一条；
+- **普通 agent 不接同事广播**：其他普通 agent 发出的无收件人 Issue/Report/Status 只进管理台，普通 agent 的 TUI 不会再被这些内容灌满。
 
 正文格式：
 

@@ -10,7 +10,7 @@
 | 客户端事件拉取 | 无 WS 的 SDK、降级通道 | `GET /p/{project}/events`，独立事件游标，不消费任务消息。 |
 | 项目 Webhook | 外部管理端 / 自动化系统 | 管理端配置 URL 与签名密钥；交付/任务事件直接 POST，失败自动重试。 |
 
-管理 agent 用 `role=admin` 的 token 连接时，服务端下发全项目事件；普通 agent 只收到自己相关的任务/交付事件和项目级公告。过滤在服务端完成，客户端不需要也不应该自行放开全量事件。
+管理 agent 用 `role=admin` 的 token 连接时，服务端下发全项目事件；普通 agent 只收到 `to` 明确指向自己的任务/交付事件、自己发起的动作事件，以及管理端 `announce` 广播。普通 agent 自己发起的 Issue/Report/Status 等无收件人广播只进管理台，不再互相污染；Issue 生命周期和任务板内部事件也不下发给普通 agent。过滤在服务端完成，客户端不应该也不能自行放开全量事件。
 
 ## 2. 事件格式
 
@@ -156,10 +156,10 @@ X-Synapse-Signature: sha256=<hex>
 | `role=admin`（管理 agent / 管理台） | 全项目事件 |
 | 历史管理 token：`role=agent` 但 scopes 含 `admin` / `*` | 全项目事件（按管理视角处理） |
 | `role=observer`（只读观察员） | 全项目事件；token 默认只有心跳/事件/任务/Issue/交付只读 scope，不能 claim/report/写 artifact |
-| 普通 agent | 定向给自己的任务事件、自己发起的任务/交付事件、自己的 `submission.*`、项目级 `announcement.created` |
-| 其它 agent | 看不到别人的交付原文；只能看到与自己相关的任务事件 |
+| 普通 agent | `to` 明确指向自己的任务/交付事件、自己发起的任务/交付动作事件、自己的 `submission.*`、管理端 `announcement.created`；其它普通 agent 的无收件人 Issue/Report/Status 广播不可见 |
+| 其它 agent | 看不到别人的交付原文；只能看到 `to` 指向自己的任务事件 |
 
-WS 与 `/events` 使用同一套判定：服务端按角色/scope 决定全量或定向，不把全量事件下发给普通连接再让客户端过滤。管理身份如果只需要看全量事件、不需要管理写权限，建议签发 `role=observer` 的 token，而不是 admin token。
+WS 与 `/events` 使用同一套判定：服务端按角色/scope 决定全量或定向，不把全量事件下发给普通连接再让客户端过滤。`/inbox` 的原始消息同样按此规则：普通 agent 只接收 `to` 明确指向自己的消息和管理端 `announce`；其他普通 agent 的 issue/announce/report/status/artifact 广播以及任务生命周期只进管理台。管理身份如果只需要看全量事件、不需要管理写权限，建议签发 `role=observer` 的 token，而不是 admin token。
 
 WS 建连后服务端先发 `hello`，其中 `events: true`、`event_version: 1` 和 `event_types` 可供客户端做能力探测；旧客户端忽略未知帧即可，不影响原有 `msg` 通道。
 

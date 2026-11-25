@@ -1,4 +1,4 @@
-# Synapse 三语言 SDK 接入与差异（0.5.9）
+# Synapse 三语言 SDK 接入与差异（0.5.10）
 
 三端协议一致：`init` 写 600 配置 → 心跳 → 游标 + epoch 拉取 → ack → 发布/上报 → WS 票据长连接 → 连不上回退轮询。
 差异只在交付形态和平台能力：Python/TS 是库 + CLI，Rust 是单二进制 agent 运行时。
@@ -8,7 +8,7 @@
 - Endpoint：`https://synapse.wangda.today`
 - 安装入口：`https://synapse.wangda.today/dl/install.sh`
 - 发布平台：Linux x86_64（musl 静态二进制）
-- SDK 版本：`0.5.9`
+- SDK 版本：`0.5.10`
 
 ## 1. 安装
 
@@ -156,8 +156,9 @@ RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
 `run` / `daemon` 的自动 ack 只表示“收到/完成/阻塞”，不会把正文发回管理端。
 
 - 任务进度、结果、资源，或回复管理端：用 `report`
-- 普通广播/状态通知：用 `publish`；Python SDK 的 `publish` 没有 `to` 参数，直接调用会广播
-- 定向 `publish`（`to: "admin"`）只在 raw HTTP 下使用，避免打扰其他 agent
+- 普通广播/状态通知：用定向 `publish`（`to: "admin"`）；无收件人的 `publish` 现在只对管理身份可见，不会再刷到其他普通 agent
+- Python SDK 的 `publish` 没有 `to` 参数；需要定向回复时用 raw HTTP 或 `report`
+- 定向 `publish` 是普通 agent 与管理端通信的默认方式；不要依赖项目广播做协作
 - 回执：用 `ack`，`status` 取 `done | blocked | refused | stale`
 - 普通 agent **不要用** `send` / `broadcast`：它们走 admin 接口
 

@@ -32,6 +32,9 @@ struct Cfg {
     project: String,
     token: String,
     agent_id: String,
+    /// 本地投递面的身份（agent/admin）。服务端仍按 token 的 role 判定；
+    /// 这里只决定普通 agent 是否允许无收件人的广播进 TUI。默认 agent。
+    role: String,
     dir: PathBuf,
     heartbeat_s: u64,
     exec_cmd: Option<String>,
@@ -85,11 +88,18 @@ impl Cfg {
         self.window_forward || self.tmux_forward
     }
 
+    /// 管理身份才允许项目广播进 TUI；服务端 token 的 role 才是权威判定，
+    /// 这里只做本地投递面的兜底，避免普通窗口收到旧服务端的无收件人广播。
+    fn is_admin_surface(&self) -> bool {
+        self.role.eq_ignore_ascii_case("admin")
+    }
+
     /// 复制一份给线程用（Cfg 没有 derive Clone，避免改动对外结构）
     fn clone_lite(&self) -> Cfg {
         Cfg {
             cmd: self.cmd.clone(), endpoint: self.endpoint.clone(), project: self.project.clone(),
-            token: self.token.clone(), agent_id: self.agent_id.clone(), dir: self.dir.clone(),
+            token: self.token.clone(), agent_id: self.agent_id.clone(), role: self.role.clone(),
+            dir: self.dir.clone(),
             heartbeat_s: self.heartbeat_s, exec_cmd: self.exec_cmd.clone(),
             event_cmd: self.event_cmd.clone(),
             window_app: self.window_app.clone(), window_conversation: self.window_conversation.clone(),
@@ -130,6 +140,12 @@ impl Cfg {
         let agent_id = map.get("agent").cloned()
             .or_else(|| saved["agent_id"].as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "rust-agent".into());
+        let role = map.get("role").cloned()
+            .or_else(|| saved["role"].as_str().map(|s| s.to_string()))
+            .or_else(|| std::env::var("SYNAPSE_AGENT_ROLE").ok())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "agent" | "admin" | "observer"))
+            .unwrap_or_else(|| "agent".into());
         let heartbeat_s = map.get("heartbeat").and_then(|s| s.parse().ok())
             .or_else(|| saved["heartbeat_s"].as_u64()).unwrap_or(60);
         let window_app = map.get("app").cloned()
@@ -177,7 +193,7 @@ impl Cfg {
             .or_else(|| std::env::var("SYNAPSE_TMUX_VERIFY").ok().filter(|s| !s.is_empty()).map(|v| cfg_truthy(&v)))
             .or_else(|| saved["tmux_verify"].as_bool())
             .unwrap_or(true);
-        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(),
+        Cfg { cmd, endpoint, project, token, agent_id, role, exec_cmd: map.get("exec").cloned(),
               event_cmd: map.get("event-cmd").cloned().filter(|s| !s.trim().is_empty())
                 .or_else(|| saved["event_cmd"].as_str().map(|s| s.to_string())
                   .filter(|s| !s.trim().is_empty()))
@@ -321,6 +337,9 @@ fn event_epoch_set(dir: &PathBuf, ep: &str) {
 /// 事件只落本地日志/执行通知回调，绝不进入任务 WAL，也不会被 exec/窗口消费。
 fn deliver_client_event(cfg: &Cfg, event: &Value) {
     if event.is_null() { return; }
+    // 事件先于/独立于原始消息到达：task.done 等终态事件要立刻释放 active 锁，
+    // 下一次 pump 才能把已排队的任务放进来，而不是等哪条 raw 消息补到才解锁。
+    event_closes_active(cfg, event);
     let seq = event["seq"].as_u64().unwrap_or(0);
     if seq > 0 && seq > event_cursor_get(&cfg.dir) { event_cursor_set(&cfg.dir, seq); }
     let line = serde_json::to_string(event).unwrap_or_default();
@@ -534,6 +553,30 @@ fn lifecycle_task_id(m: &Value) -> Option<&str> {
     task_id_of(m).or_else(|| m["payload"]["task"]["task_id"].as_str())
 }
 
+fn event_task_id(event: &Value) -> Option<&str> {
+    event["task_id"].as_str()
+        .or_else(|| event["data"]["task_id"].as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// 任务已结束/被收回/失败/转派时，事件帧也要释放本地 active 锁。
+/// 原始 done/released 消息在 WS 抖动或 ACL 过滤时可能没进 SurfacePump；
+/// 服务端“完成后才发下一条”的语义不能依赖那条消息一定到达，否则 active 会卡死。
+fn event_closes_active(cfg: &Cfg, event: &Value) -> bool {
+    let Some(kind) = event["type"].as_str() else { return false; };
+    if !matches!(kind,
+        "task.done" | "task.released" | "task.blocked" | "task.failed"
+        | "task.dead_lettered" | "task.retry_scheduled" | "task.reopened"
+        | "task.reclaimed" | "task.reassigned" | "task.requeued")
+    {
+        return false;
+    }
+    let Some(id) = event_task_id(event) else { return false; };
+    if active_task_id(cfg).as_deref() != Some(id) { return false; }
+    active_task_clear(cfg, Some(id));
+    true
+}
+
 #[derive(Default, Clone)]
 struct SurfaceStatus {
     active_task: Option<String>,
@@ -713,10 +756,15 @@ impl SurfacePump {
                     continue;
                 }
 
-                // 非任务消息（提醒/广播/系统事件）走独立 lane，可在任务执行中插入。
+                // 非任务消息走独立 lane：只有提醒/系统通知可在任务执行中插入；
+                // 普通聊天、issue/广播等一律等当前任务结束，避免任务做到一半被灌满。
                 let notice = is_notice(&m);
                 let mut already = surface_was_delivered(&m);
                 if is_surface_noise(&self.cfg, &m) { already = true; }
+                if !already && active.is_some() && !notice {
+                    idx += 1;
+                    continue;
+                }
                 if !already {
                     if !self.deliver(&m, notice && active.is_some(), agent, base, last_msg) {
                         eprintln!("[surface] seq={seq} 提醒投递失败，保留 WAL、不 ACK");
@@ -799,16 +847,21 @@ fn is_task_notice(m: &Value) -> bool {
             && m["kind"].as_str() != Some("reassigned"))
 }
 
-/// 外部投递（窗口/tmux）只接“点名给本 agent 的消息”和“管理端广播”，不接项目事件流。
+/// 外部投递（窗口/tmux）只接“点名给本 agent 的消息”和管理端 announce 广播；
+/// 管理身份额外接全部项目广播。
 ///
 /// 服务端为了管理台能看到完整台账，会把其他 agent 的 artifact 建单、任务
-/// claimed/released/done 以及部分 report 都写成 `to=null` 的项目广播；这些在
-/// `for_me` 里会被当成“广播”放行。artifact 的 payload 带 title，format_hub_message
-/// 会把它压成正文，于是别人的交付汇报就进了窗口。这里按发送者/话题再做一次窗口侧过滤：
+/// claimed/released/done、issue 生命周期和部分 report 都写成 `to=null` 的项目广播。
+/// 普通 agent 的 `for_me` 已拒绝这些无收件人消息（管理端 announce 除外）；这里再做
+/// 窗口侧兜底，避免旧服务端或 WAL 里遗留的项目广播进入 TUI：
 /// - artifact：交付箱事件，属于管理台，不是聊天指令；
 /// - task 生命周期：不是任务正文；
-/// - 其他 agent 发出的无收件人广播（report/status/announce 等）：不是给本窗口的指令。
-/// 定向消息（to 指向本 agent）仍然放行，管理员广播仍然放行。
+/// - 普通 agent 发出的无收件人广播：不进其他普通 agent 的 TUI；
+/// - 管理端 announce：按原协议广播给全员；管理面可收全部。
+fn is_admin_announce(m: &Value) -> bool {
+    m["sender"].as_str() == Some("admin") && m["topic"].as_str() == Some("announce")
+}
+
 fn is_surface_noise(cfg: &Cfg, m: &Value) -> bool {
     if is_noise(cfg, m) || is_task_notice(m) || !addressed_to_me(cfg, m) {
         return true;
@@ -816,7 +869,9 @@ fn is_surface_noise(cfg: &Cfg, m: &Value) -> bool {
     if m["topic"].as_str() == Some("artifact") {
         return true;
     }
-    if m["to"].is_null() && m["sender"].as_str() != Some("admin") {
+    // 普通 agent 自己发出的无收件人广播（issue/report/status…）不进窗口；
+    // 管理端 announce 仍按原协议向全员下发。管理面则可收全部广播。
+    if m["to"].is_null() && !cfg.is_admin_surface() && !is_admin_announce(m) {
         return true;
     }
     false
@@ -1114,7 +1169,9 @@ fn retry_pending_surfaces(cfg: &Cfg, agent: &Agent, base: &str,
 
 fn for_me(cfg: &Cfg, m: &Value) -> bool {
     match &m["to"] {
-        Value::Null => true,
+        // 无收件人的项目广播：普通 agent 只接管理端 announce；普通 agent 自己发的
+        // issue/report/status 广播不进其他普通 agent 的 TUI，避免绕过任务单飞刷屏。
+        Value::Null => cfg.is_admin_surface() || is_admin_announce(m),
         Value::String(t) => t == &cfg.agent_id,
         // 服务端 to 允许数组（定向多人/广播名单），不能把它当广播放行
         Value::Array(a) => a.iter().any(|x| x.as_str() == Some(cfg.agent_id.as_str())),
@@ -1355,7 +1412,7 @@ fn main() {
                 .or_else(|| prof["heartbeat_s"].as_u64()).unwrap_or(cfg.heartbeat_s);
             let body = json!({
                 "endpoint": cfg.endpoint, "project": cfg.project, "agent_id": cfg.agent_id,
-                "token": cfg.token, "heartbeat_s": hb,
+                "token": cfg.token, "role": cfg.role, "heartbeat_s": hb,
                 "runtime": prof["runtime"], "host": prof["host"], "transport": prof["transport"],
             });
             let path = cfg.dir.join("config.json");
@@ -3640,6 +3697,7 @@ mod tests {
             project: "p".into(),
             token: "t".into(),
             agent_id: "a1".into(),
+            role: "agent".into(),
             dir,
             heartbeat_s: 30,
             exec_cmd: None,
@@ -3651,6 +3709,12 @@ mod tests {
             tmux_forward: false,
             tmux_verify: true,
         }
+    }
+
+    fn test_cfg_admin(dir: PathBuf) -> Cfg {
+        let mut cfg = test_cfg(dir);
+        cfg.role = "admin".into();
+        cfg
     }
 
     #[cfg(unix)]
@@ -3828,11 +3892,16 @@ mod tests {
     #[test]
     fn noise_and_target_filter() {
         let dir = scratch("filter");
-        let cfg = test_cfg(dir);
+        let cfg = test_cfg(dir.clone());
+        let admin_cfg = test_cfg_admin(dir);
         assert!(is_noise(&cfg, &json!({"topic": "ack", "payload": {}})));
         assert!(is_noise(&cfg, &json!({"topic": "announce", "sender": "a1", "to": null})));
         assert!(!is_noise(&cfg, &json!({"topic": "task", "sender": "admin"})));
-        assert!(for_me(&cfg, &json!({"topic": "announce", "to": null})));
+        // 管理端 announce 仍广播；普通 agent 自己发的无收件人广播只进管理台。
+        assert!(for_me(&cfg, &json!({"topic": "announce", "sender": "admin", "to": null})));
+        assert!(for_me(&admin_cfg, &json!({"topic": "announce", "sender": "admin", "to": null})));
+        assert!(!for_me(&cfg, &json!({"topic": "announce", "sender": "b2", "to": null})));
+        assert!(for_me(&admin_cfg, &json!({"topic": "announce", "sender": "b2", "to": null})));
         assert!(for_me(&cfg, &json!({"topic": "task", "to": "a1"})));
         assert!(!for_me(&cfg, &json!({"topic": "task", "to": "b2"})));
         assert!(for_me(&cfg, &json!({"topic": "task", "to": ["b2", "a1"]})));
@@ -3852,7 +3921,8 @@ mod tests {
     #[test]
     fn window_filter_skips_project_events() {
         let dir = scratch("window-filter");
-        let cfg = test_cfg(dir);
+        let cfg = test_cfg(dir.clone());
+        let admin_cfg = test_cfg_admin(dir);
 
         // 其他 agent 的交付单：payload 有 title，但属于交付箱事件，不进窗口
         let artifact = json!({
@@ -3875,12 +3945,37 @@ mod tests {
         });
         assert!(is_surface_noise(&cfg, &report));
 
-        // 管理端广播、管理端定向任务、其他 agent 点名的消息仍然放行
+        // 管理端 announce 仍按原协议广播给全员；只有 role=admin 的本地投递面也收其它广播
         let admin_bc = json!({
             "sender": "admin", "to": null, "topic": "announce",
             "kind": "broadcast", "payload": {"title": "git pull"}
         });
         assert!(!is_surface_noise(&cfg, &admin_bc));
+        assert!(!is_surface_noise(&admin_cfg, &admin_bc));
+
+        // 普通 agent 自己发的无收件人广播不能污染其他普通 agent
+        let agent_bc = json!({
+            "sender": "b2", "to": null, "topic": "announce",
+            "kind": "broadcast", "payload": {"title": "我这里完成了"}
+        });
+        assert!(is_surface_noise(&cfg, &agent_bc));
+        assert!(!is_surface_noise(&admin_cfg, &agent_bc));
+
+        // issue 生命周期是项目广播，普通 agent 不进窗口；管理面仍可看到
+        let issue = json!({
+            "sender": "admin", "to": null, "topic": "issue",
+            "kind": "closed", "payload": {"issue_id": "ISS-1", "title": "已修"}
+        });
+        assert!(is_surface_noise(&cfg, &issue));
+        assert!(!is_surface_noise(&admin_cfg, &issue));
+
+        // 旧公共池任务广播（to=null）也不能当成当前任务进窗口
+        let legacy_task = json!({
+            "sender": "admin", "to": null, "topic": "task",
+            "kind": "task", "payload": {"task_id": "T-OLD", "title": "旧任务", "work_item": true}
+        });
+        assert!(is_surface_noise(&cfg, &legacy_task));
+
         let admin_dm = json!({
             "sender": "admin", "to": "a1", "topic": "task",
             "kind": "task", "payload": {"title": "do it"}
@@ -3901,6 +3996,22 @@ mod tests {
         });
         assert!(!is_task_notice(&admin_reassigned));
         assert!(!is_surface_noise(&cfg, &admin_reassigned));
+    }
+
+    #[test]
+    fn terminal_event_releases_active_lock() {
+        let dir = scratch("event-active-release");
+        let cfg = test_cfg(dir);
+        active_task_set_id(&cfg, "T-1", 42, "do it");
+        assert!(active_task_load(&cfg.dir).is_some());
+
+        // 仍在跑/排队的事件不能误放行
+        assert!(!event_closes_active(&cfg, &json!({"type": "task.queued", "task_id": "T-1"})));
+        assert!(active_task_load(&cfg.dir).is_some());
+
+        // 服务端 done 事件即使 raw 消息没到，也必须释放 active
+        assert!(event_closes_active(&cfg, &json!({"type": "task.done", "data": {"task_id": "T-1"}})));
+        assert!(active_task_load(&cfg.dir).is_none());
     }
 
     #[test]

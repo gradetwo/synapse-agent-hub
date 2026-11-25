@@ -929,9 +929,25 @@ let IDLE_ROWS = [];                // 最近一次“待唤醒”快照
 let IDLE_CONFIG = null;            // 当前项目空闲提醒配置
 let IDLE_CFG_DIRTY = false;        // 用户正在编辑时不被自动刷新覆盖
 let ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
+let ANALYTICS_STATE = "loading";   // loading / ready / error：0 只能来自 ready
+let STATS_DATA = null;             // 最近一次顶部统计响应
+let STATS_STATE = "loading";       // loading / ready / error / stale
+let AGENTS_LOADED = false;         // 名册请求是否成功过（空数组也算成功）
+let AGENTS_PARTIAL = 0;            // 全部项目视图下加载失败的 project 数
+let AGENTS_FAILED_PROJECTS = [];   // 全部项目视图下名册读取失败的 project
+let TASK_LOADED = false;           // 任务台账请求是否成功过
+let TASK_PARTIAL = 0;              // 全部项目视图下任务加载失败的 project 数
+let TASK_FAILED_PROJECTS = [];     // 全部项目视图下任务读取失败的 project
+let ISSUE_PARTIAL = 0;             // 全部项目视图下 Issue 加载失败的 project 数
+let ISSUE_LOAD_ERROR = false;      // 当前 Issue 列表读取是否直接失败
+let ISSUE_FAILED_PROJECTS = [];    // 全部项目视图下 Issue 读取失败的 project
+let ISSUE_COUNTS = {};             // project -> {open,closed,merged} 全量计数
+let SUB_COUNTS = null;             // 交付箱全量计数（不是 LIMIT 100 的行数）
 let OBS = null;                    // 最近一次效率观测快照（队列/分位/死信）
 let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
 let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
+const hasNum = (v) => v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
+const numOrDash = (v) => hasNum(v) ? String(Number(v)) : "—";
 let toastTimer = null;
 
 function pendingFor(agentId) {
@@ -1072,7 +1088,11 @@ async function tryConnect(candidate) {
   }
 }
 
-const ago = (s) => s == null ? "—" : s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.round(s / 3600) + "h";
+const ago = (s) => {
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  return n < 90 ? n + "s" : n < 5400 ? Math.round(n / 60) + "m" : Math.round(n / 3600) + "h";
+};
 const pct = (v, bad) => v == null ? "—" : `<span class="${v >= bad ? "badv" : ""}">${v}%</span>`;
 
 async function loadProjects() {
@@ -1132,7 +1152,48 @@ function activateProject(project) {
   lastPending = null;
   SUB_ROWS = [];
   SUB_STATE = new Map();
-  ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
+  SUB_COUNTS = null;
+  TASK_ROWS = [];
+  ISSUE_ROWS = [];
+  ISSUE_COUNTS = {};
+  window._agents = [];
+  AGENTS_LOADED = false;
+  AGENTS_PARTIAL = 0;
+  AGENTS_FAILED_PROJECTS = [];
+  TASK_LOADED = false;
+  TASK_PARTIAL = 0;
+  TASK_FAILED_PROJECTS = [];
+  ISSUE_PARTIAL = 0;
+  ISSUE_FAILED_PROJECTS = [];
+  ISSUE_LOAD_ERROR = false;
+  ANALYTICS_STATE = "loading";
+  ANALYTICS = {};
+  STATS_DATA = null;
+  STATS_STATE = "loading";
+  OBS = null;
+  BADGES.task = 0; BADGES.deli = 0; BADGES.msg = 0; BADGES.issue = 0; BADGES.access = 0;
+  updateBadges();
+  const resetTable = (id, cols, text) => {
+    const el = $(id);
+    if (el) el.replaceChildren(emptyTableRow(cols, text));
+  };
+  for (const [id, text] of [["agentStat", "加载中…"], ["taskStat", "加载中…"],
+                             ["issueStat", "加载中…"], ["subStat", "加载中…"],
+                             ["msgStat", ""], ["idleStat", "加载中…"],
+                             ["enrStat", "加载中…"], ["secStat", "加载中…"]]) {
+    const el = $(id); if (el) el.textContent = text;
+  }
+  resetTable("agents", 10, "加载中…");
+  resetTable("tasks", 8, "加载中…");
+  resetTable("issues", 7, "加载中…");
+  resetTable("subs", 8, "加载中…");
+  resetTable("msgs", 6, "加载中…");
+  resetTable("idleAgents", 10, "加载中…");
+  resetTable("enr", 5, "加载中…");
+  resetTable("secs", 4, "加载中…");
+  renderDashboard();
+  renderStats();
+  renderObservability();
   fillDetailProjects();
   connectLive();
 }
@@ -1182,11 +1243,11 @@ function agentRow(a) {
   const projectName = (allProjects.find((p) => p.project === a.project)?.display_name) || a.project;
   const { tr, cells } = makeTableRow(["", "muted", "", "", "num", "num", "num", "mono", "muted", ""]);
   tr.classList.add("clickable");
-  if ((w.state || "idle") === "idle") tr.classList.add("idle");
+  if (w.state === "idle") tr.classList.add("idle");
   tr.dataset.agent = String(a.agent_id ?? "");
   tr.dataset.project = String(a.project ?? "");
-  tr.dataset.alive = String(a.alive ?? "offline");
-  tr.dataset.work = a.alive === "alive" ? String(w.state || "idle") : "";
+  tr.dataset.alive = String(a.alive || "");
+  tr.dataset.work = a.alive === "alive" ? String(w.state || "") : "";
 
   const dot = document.createElement("span");
   dot.className = `dot ${cls}`;
@@ -1202,10 +1263,16 @@ function agentRow(a) {
     cells[0].append(" ", badge);
   }
   cells[1].textContent = decEsc(projectName);
-  cells[2].textContent = a.alive === "alive" ? "忙" : a.alive === "late" ? "迟到" : "失联";
-  cells[3].textContent = a.alive === "alive" ? decEsc(w.phase || w.state || "—") : "—";
+  const state = String(w.state || "idle");
+  cells[2].textContent = a.alive === "alive"
+    ? (state === "blocked" ? "阻塞" : state === "busy" ? "忙" : state === "idle" ? "空闲" : state)
+    : a.alive === "late" ? "迟到" : a.alive === "offline" ? "失联" : "未知";
+  cells[3].textContent = a.alive === "alive"
+    ? decEsc(w.phase === "idle" || !w.phase ? (state === "idle" ? "空闲" : (state || "—")) : w.phase)
+    : "—";
   setPctCell(cells[4], l.cpu_pct, 85);
-  cells[5].textContent = l.mem_used_mb != null ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
+  cells[5].textContent = l.mem_used_mb != null && l.mem_total_mb != null
+    ? `${l.mem_used_mb}/${l.mem_total_mb}` : "—";
   if (dk && dk.used_pct != null) {
     setPctCell(cells[6], dk.used_pct, 90);
     if (dk.free_gb != null) {
@@ -1218,7 +1285,8 @@ function agentRow(a) {
     cells[6].textContent = "—";
   }
   cells[7].textContent = decEsc((a.env || {}).git_head || "—");
-  cells[8].textContent = `${ago(a.age_s)}前`;
+  const ageText = ago(a.age_s);
+  cells[8].textContent = ageText === "—" ? "—" : `${ageText}前`;
 
   cells[9].style.whiteSpace = "nowrap";
   const detail = document.createElement("button");
@@ -1288,19 +1356,19 @@ function taskRow(t, isAll) {
   stateBadge.className = `badge ${known.includes(st) ? st : "open"}`;
   stateBadge.textContent = taskStateLabel(st, t);
   cells[1].append(stateBadge);
-  const pr = Number(t.priority ?? 2);
+  const pr = hasNum(t.priority) ? Math.max(0, Math.min(3, Number(t.priority))) : null;
   const prBadge = document.createElement("span");
   prBadge.className = "badge";
   prBadge.style.marginLeft = "4px";
   prBadge.title = "P0 最高；排队 30 分钟自动提升一级";
-  prBadge.textContent = `P${Number.isFinite(pr) ? Math.max(0, Math.min(3, pr)) : 2}`;
-  if (pr <= 1) prBadge.style.color = pr === 0 ? "#ffb3ad" : "#ffd58a";
+  prBadge.textContent = pr === null ? "P?" : `P${pr}`;
+  if (pr !== null && pr <= 1) prBadge.style.color = pr === 0 ? "#ffb3ad" : "#ffd58a";
   cells[1].append(prBadge);
   if (Number(t.attempts ?? 0) > 0) {
     const at = document.createElement("span");
     at.className = "badge blocked";
     at.style.marginLeft = "4px";
-    at.textContent = `重试 ${Number(t.attempts)}/${Number(t.max_attempts ?? 3)}`;
+    at.textContent = `重试 ${Number(t.attempts)}${hasNum(t.max_attempts) ? `/${Number(t.max_attempts)}` : ""}`;
     cells[1].append(at);
   }
   if (t.merged_sha) {
@@ -1349,7 +1417,7 @@ function taskRow(t, isAll) {
   if (lease.cls) leaseSpan.className = lease.cls;
   leaseSpan.textContent = lease.text;
   cells[3].append(leaseSpan);
-  if (t.deadline_at) {
+  if (hasNum(t.deadline_at)) {
     const dl = document.createElement("div");
     dl.className = Number(t.sla_breached) ? "badv" : "muted";
     dl.style.fontSize = "10px";
@@ -1459,8 +1527,10 @@ function taskRow(t, isAll) {
 }
 
 function fmtDur(ms) {
+  if (ms === null || ms === undefined || ms === "") return "—";
   const n = Number(ms);
-  if (!Number.isFinite(n) || n <= 0) return "—";
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n === 0) return "0s";
   const s = Math.round(n / 1000);
   if (s < 60) return `${s}s`;
   const m = Math.round(s / 60);
@@ -1471,23 +1541,39 @@ function fmtDur(ms) {
 }
 
 function mergeObs(list) {
-  if (!list.length) return null;
-  const out = { ...list[0], summary: { ...list[0].summary }, lanes: [], recent_dead: [],
-                queue_alerts: [], health: { status: "ok", reasons: [] } };
-  for (const item of list.slice(1)) {
+  const valid = (list || []).filter((x) => x && x.summary);
+  if (!valid.length) return null;
+  const out = {
+    ...valid[0],
+    summary: {},
+    lanes: [],
+    recent_dead: [],
+    queue_alerts: [],
+    health: { status: "ok", reasons: [] },
+    window_ms: Math.max(...valid.map((x) => Number(x.window_ms) || 0)),
+  };
+  const sumKeys = ["tasks_total", "active", "wip", "claimed", "queued", "retry_wait", "public_pool",
+                   "done_window", "failed_window", "retries_window", "dead_letters", "sla_breaches",
+                   "throughput_per_hour"];
+  const maxKeys = ["oldest_queue_age_ms", "queue_wait_p50_ms", "queue_wait_p95_ms",
+                   "cycle_p50_ms", "cycle_p95_ms"];
+  let deadTotal = 0, queueTotal = 0, deadReturned = 0, queueReturned = 0;
+  let deadTotalKnown = true, queueTotalKnown = true;
+  for (const item of valid) {
     const a = out.summary, b = item.summary || {};
-    for (const k of ["tasks_total", "active", "wip", "claimed", "queued", "retry_wait", "public_pool",
-                     "done_window", "failed_window", "retries_window", "dead_letters", "sla_breaches"]) {
-      a[k] = Number(a[k] ?? 0) + Number(b[k] ?? 0);
+    for (const k of sumKeys) a[k] = Number(a[k] ?? 0) + Number(b[k] ?? 0);
+    for (const k of maxKeys) {
+      const v = hasNum(b[k]) ? Number(b[k]) : null;
+      a[k] = v === null ? (hasNum(a[k]) ? a[k] : null) : (a[k] === null || !hasNum(a[k]) ? v : Math.max(Number(a[k]), v));
     }
-    for (const k of ["oldest_queue_age_ms", "queue_wait_p50_ms", "queue_wait_p95_ms",
-                     "cycle_p50_ms", "cycle_p95_ms", "throughput_per_hour"]) {
-      a[k] = Math.max(Number(a[k] ?? 0) || 0, Number(b[k] ?? 0) || 0);
-    }
-  }
-  const done = Number(out.summary.done_window ?? 0), failed = Number(out.summary.failed_window ?? 0);
-  out.summary.failure_rate = done + failed ? Math.round((failed / (done + failed)) * 1000) / 1000 : 0;
-  for (const item of list) {
+    if (!hasNum(item.dead_letters_total)) deadTotalKnown = false;
+    if (!hasNum(item.queue_alerts_total)) queueTotalKnown = false;
+    deadTotal += hasNum(item.dead_letters_total) ? Number(item.dead_letters_total)
+      : (hasNum(b.dead_letters) ? Number(b.dead_letters) : 0);
+    queueTotal += hasNum(item.queue_alerts_total) ? Number(item.queue_alerts_total)
+      : (Array.isArray(item.queue_alerts) ? item.queue_alerts.length : 0);
+    deadReturned += Array.isArray(item.recent_dead) ? item.recent_dead.length : 0;
+    queueReturned += Array.isArray(item.queue_alerts) ? item.queue_alerts.length : 0;
     out.lanes.push(...(item.lanes || []).map((l) => ({ ...l, project: item.project })));
     out.recent_dead.push(...(item.recent_dead || []).map((d) => ({ ...d, project: item.project })));
     out.queue_alerts.push(...(item.queue_alerts || []).map((q) => ({ ...q, project: item.project })));
@@ -1495,84 +1581,155 @@ function mergeObs(list) {
     else if (item.health?.status === "warn" && out.health.status !== "bad") out.health.status = "warn";
     for (const r of item.health?.reasons || []) if (!out.health.reasons.includes(r)) out.health.reasons.push(r);
   }
+  const done = Number(out.summary.done_window ?? 0), failed = Number(out.summary.failed_window ?? 0);
+  out.summary.failure_rate = done + failed ? Math.round((failed / (done + failed)) * 1000) / 1000 : null;
+  out.summary.throughput_per_hour = Number(out.summary.throughput_per_hour ?? 0);
+  // 分位无法从各项目的分位值精确重算；明确标记成“各项目最高”，不冒充分位聚合。
+  if (valid.length > 1) {
+    out.summary.queue_wait_p50_is_max = true;
+    out.summary.queue_wait_p95_is_max = true;
+    out.summary.cycle_p50_is_max = true;
+    out.summary.cycle_p95_is_max = true;
+  }
+  out.dead_letters_total = deadTotal;
+  out.queue_alerts_total = queueTotal;
+  out.dead_letters_total_known = deadTotalKnown;
+  out.queue_alerts_total_known = queueTotalKnown;
+  out.recent_dead_returned = deadReturned;
+  out.queue_alerts_returned = queueReturned;
+  out.projects_loaded = valid.length;
   out.lanes.sort((a, b) => Number(b.queued ?? 0) - Number(a.queued ?? 0)
     || Number(b.retry_wait ?? 0) - Number(a.retry_wait ?? 0)
     || String(a.project || "").localeCompare(String(b.project || ""))
     || String(a.agent_id || "").localeCompare(String(b.agent_id || "")));
   return out;
 }
-
 async function loadObservability() {
   const project = current;
   if (!project || !$("obsCard")) return;
-  let obs = null;
+  let obs = null, failed = 0, total = 0;
   try {
     if (project === "*") {
       const projects = (allProjects || []).filter((p) => p.project !== "*");
+      total = projects.length;
       const got = await Promise.allSettled(projects.map((p) =>
         api(`/admin/p/${p.project}/observability?window_ms=${24 * 60 * 60_000}`).then((d) => ({ ...d, project: p.project }))));
       if (current !== project) return;
-      obs = mergeObs(got.filter((r) => r.status === "fulfilled").map((r) => r.value));
+      const ok = got.filter((r) => r.status === "fulfilled" && r.value && r.value.summary)
+        .map((r) => r.value);
+      failed = total - ok.length;
+      obs = mergeObs(ok);
+      if (obs) {
+        obs.partial = failed;
+        obs.projects_total = total;
+      } else {
+        OBS = { error: "所有项目观测读取失败", partial: failed, projects_total: total };
+        renderObservability();
+        return;
+      }
     } else {
       obs = await api(`/admin/p/${project}/observability?window_ms=${24 * 60 * 60_000}`);
       if (current !== project) return;
+      if (!obs || typeof obs !== "object" || obs.error || !obs.summary)
+        obs = { ...(obs || {}), error: obs?.error || "观测数据读取失败" };
     }
     OBS = obs;
     renderObservability();
   } catch (e) {
     if (current !== project) return;
     console.warn("[hub] observability failed", e);
-    OBS = null;
+    OBS = { error: e.message || "观测数据读取失败", partial: failed, projects_total: total };
     renderObservability();
   }
 }
-
 function renderObservability() {
   if (!$("obsCard")) return;
   if (!OBS) {
-    $("obsStat").textContent = "接口未就绪";
-    $("obsKpis").innerHTML = `<div class="stat"><div class="k">效率观测</div><div class="v">—</div><div class="sub">部署 0057 后自动出现</div></div>`;
-    $("obsLanes").innerHTML = `<div class="scopeHint">暂无数据</div>`;
-    $("obsDead").innerHTML = `<div class="scopeHint">没有死信</div>`;
-    if ($("obsQueue")) $("obsQueue").innerHTML = `<div class="scopeHint">暂无数据</div>`;
+    $("obsStat").textContent = "尚未加载";
+    $("obsStat").className = "muted";
+    $("obsKpis").innerHTML = `<div class="stat"><div class="k">效率观测</div><div class="v">—</div><div class="sub">正在读取</div></div>`;
+    $("obsLanes").innerHTML = `<div class="scopeHint">尚未加载</div>`;
+    $("obsDead").innerHTML = `<div class="scopeHint">尚未加载</div>`;
+    if ($("obsQueue")) $("obsQueue").innerHTML = `<div class="scopeHint">尚未加载</div>`;
+    if ($("obsLaneHint")) $("obsLaneHint").textContent = "尚未加载";
+    if ($("obsQueueHint")) $("obsQueueHint").textContent = "尚未加载";
+    if ($("obsDeadHint")) $("obsDeadHint").textContent = "尚未加载";
+    return;
+  }
+  if (OBS.error) {
+    const partialText = OBS.partial ? ` · ${OBS.partial}/${OBS.projects_total || "?"} 个项目读取失败` : "";
+    $("obsStat").textContent = `读取失败：${OBS.error}${partialText}`;
+    $("obsStat").className = "muted badv";
+    $("obsKpis").innerHTML = `<div class="stat"><div class="k">效率观测</div><div class="v">—</div><div class="sub">读取失败，不能用 0 代替</div></div>`;
+    $("obsLanes").innerHTML = `<div class="scopeHint">观测数据读取失败</div>`;
+    $("obsDead").innerHTML = `<div class="scopeHint">死信数据读取失败</div>`;
+    if ($("obsQueue")) $("obsQueue").innerHTML = `<div class="scopeHint">队列数据读取失败</div>`;
+    if ($("obsLaneHint")) $("obsLaneHint").textContent = "读取失败";
+    if ($("obsQueueHint")) $("obsQueueHint").textContent = "读取失败";
+    if ($("obsDeadHint")) $("obsDeadHint").textContent = "读取失败";
     return;
   }
   const s = OBS.summary || {};
   const health = OBS.health?.status || "ok";
-  const healthText = health === "bad" ? "风险" : health === "warn" ? "注意" : "健康";
+  const healthText = OBS.partial ? "部分数据" : health === "bad" ? "风险" : health === "warn" ? "注意" : "健康";
   const sv = OBS.server_version || {};
+  const obsNum = (v) => hasNum(v) ? Number(v) : null;
+  const partialText = OBS.partial ? ` · ${OBS.partial}/${OBS.projects_total || "?"} 个项目读取失败` : "";
+  const windowMs = hasNum(OBS.window_ms) && Number(OBS.window_ms) > 0 ? Number(OBS.window_ms) : null;
+  const windowText = windowMs === null ? "—" : `${Math.round(windowMs / 3_600_000)}h`;
   $("obsStat").textContent = `${healthText}${OBS.health?.reasons?.length ? " · " + OBS.health.reasons.join("；") : ""}`
-    + (current === "*" ? " · 全部项目" : ` · 近 ${Math.round((OBS.window_ms || 0) / 3_600_000)}h`)
-    + (sv.sdk ? ` · server ${sv.sdk}` : "");
-  $("obsStat").className = `muted ${health === "bad" ? "badv" : health === "warn" ? "warnv" : ""}`;
+    + (current === "*" ? ` · 全部项目${OBS.projects_loaded ? `（${OBS.projects_loaded} 个已读取）` : ""}`
+        : windowMs === null ? " · 窗口未知" : ` · 近 ${windowText}`)
+    + (sv.sdk ? ` · server ${sv.sdk}` : "") + partialText;
+  $("obsStat").className = `muted ${OBS.partial ? "warnv" : health === "bad" ? "badv" : health === "warn" ? "warnv" : ""}`;
+  const queueP95Label = s.queue_wait_p95_is_max ? "各项目最高 P95" : "P95";
+  const queueP50Label = s.queue_wait_p50_is_max ? "各项目最高 P50" : "P50";
+  const cycleP95Label = s.cycle_p95_is_max ? "各项目最高 P95" : "P95";
+  const cycleP50Label = s.cycle_p50_is_max ? "各项目最高 P50" : "P50";
+  const queued = obsNum(s.queued);
+  const oldest = obsNum(s.oldest_queue_age_ms);
+  const failureRate = obsNum(s.failure_rate);
+  const throughput = obsNum(s.throughput_per_hour);
+  const deadKpi = hasNum(OBS.dead_letters_total) && OBS.dead_letters_total_known !== false
+    ? Number(OBS.dead_letters_total) : obsNum(s.dead_letters);
   const kpis = [
-    { k: "队列深度", v: Number(s.queued ?? 0), sub: `退避 ${Number(s.retry_wait ?? 0)} · 公共池 ${Number(s.public_pool ?? 0)}`, cls: Number(s.queued ?? 0) ? "warn" : "ok" },
-    { k: "最老等待", v: fmtDur(s.oldest_queue_age_ms), sub: `P95 ${fmtDur(s.queue_wait_p95_ms)}`, cls: Number(s.oldest_queue_age_ms ?? 0) > 2 * 3600_000 ? "warn" : "" },
-    { k: "周期 P95", v: fmtDur(s.cycle_p95_ms), sub: `P50 ${fmtDur(s.cycle_p50_ms)}`, cls: "" },
-    { k: "吞吐 / 时", v: Number(s.throughput_per_hour ?? 0), sub: `完成 ${Number(s.done_window ?? 0)}（窗口）`, cls: "accent" },
-    { k: "失败率", v: `${Math.round(Number(s.failure_rate ?? 0) * 100)}%`, sub: `失败 ${Number(s.failed_window ?? 0)} · 重试 ${Number(s.retries_window ?? 0)}`, cls: Number(s.failure_rate ?? 0) > .2 ? "warn" : "" },
-    { k: "死信 / SLA", v: `${Number(s.dead_letters ?? 0)} / ${Number(s.sla_breaches ?? 0)}`, sub: `执行中 ${Number(s.wip ?? 0)} · 完成 ${Number(s.done_window ?? 0)}`, cls: Number(s.dead_letters ?? 0) ? "warn" : "" },
+    { k: "队列深度", v: numOrDash(queued), sub: `退避 ${numOrDash(s.retry_wait)} · 公共池 ${numOrDash(s.public_pool)}`, cls: queued ? "warn" : "ok" },
+    { k: "最老等待", v: fmtDur(s.oldest_queue_age_ms), sub: `${queueP95Label} ${fmtDur(s.queue_wait_p95_ms)}`, cls: oldest !== null && oldest > 2 * 3600_000 ? "warn" : "" },
+    { k: "周期 P95", v: fmtDur(s.cycle_p95_ms), sub: `${cycleP50Label} ${fmtDur(s.cycle_p50_ms)}`, cls: "" },
+    { k: current === "*" ? "吞吐 / 时（合计）" : "吞吐 / 时", v: numOrDash(throughput), sub: `完成 ${numOrDash(s.done_window)}（窗口）`, cls: "accent" },
+    { k: "失败率", v: failureRate === null ? "—" : `${Math.round(failureRate * 100)}%`, sub: `失败 ${numOrDash(s.failed_window)} · 重试 ${numOrDash(s.retries_window)}`, cls: failureRate !== null && failureRate > .2 ? "warn" : "" },
+    { k: "死信 / SLA", v: `${numOrDash(deadKpi)} / ${numOrDash(s.sla_breaches)}`, sub: `执行中 ${numOrDash(s.wip)} · 完成 ${numOrDash(s.done_window)}`, cls: deadKpi ? "warn" : "" },
   ];
   $("obsKpis").innerHTML = kpis.map((x) =>
     `<div class="stat ${x.cls}"><div class="k">${x.k}</div><div class="v">${esc(String(x.v))}<span class="sub">${esc(x.sub)}</span></div></div>`).join("");
   const lanes = OBS.lanes || [];
-  $("obsLaneHint").textContent = `${lanes.length} 个节点 · 窗口 ${Math.round((OBS.window_ms || 0) / 3_600_000)}h`;
+  $("obsLaneHint").textContent = `${lanes.length} 个节点 · 窗口 ${windowText}`;
   $("obsLanes").innerHTML = lanes.length ? lanes.map((l) => {
     const pct = Math.max(0, Math.min(100, Number(l.utilization ?? 0)));
     const dot = l.alive === "alive" ? "alive" : l.alive === "late" ? "late" : "offline";
     const name = current === "*" ? `${l.project || "?"}/${l.agent_id}` : l.agent_id;
     return `<div class="obsLane">
       <div><i class="dot ${dot}"></i> <span class="mono">${esc(name)}</span></div>
-      <div><span class="mono">${Number(l.in_flight ?? 0)}/${Number(l.max_parallel ?? 0)}</span><div class="bar"><i style="width:${pct}%"></i></div></div>
-      <div><span class="mono">${Number(l.queued ?? 0)}</span>${Number(l.retry_wait ?? 0) ? `<span class="muted"> +${Number(l.retry_wait)}</span>` : ""}</div>
-      <div class="${Number(l.oldest_queue_age_ms ?? 0) > 2 * 3600_000 ? "badv" : ""}">${fmtDur(l.oldest_queue_age_ms)}</div>
+      <div><span class="mono">${numOrDash(l.in_flight)}/${numOrDash(l.max_parallel)}</span><div class="bar"><i style="width:${pct}%"></i></div></div>
+      <div><span class="mono">${numOrDash(l.queued)}</span>${hasNum(l.retry_wait) && Number(l.retry_wait) ? `<span class="muted"> +${Number(l.retry_wait)}</span>` : ""}</div>
+      <div class="${hasNum(l.oldest_queue_age_ms) && Number(l.oldest_queue_age_ms) > 2 * 3600_000 ? "badv" : ""}">${fmtDur(l.oldest_queue_age_ms)}</div>
       <div>${fmtDur(l.wait_p95_ms)}</div>
-      <div class="muted">${Number(l.completed_window ?? 0)} / <span class="${Number(l.failed_window ?? 0) ? "badv" : ""}">${Number(l.failed_window ?? 0)}</span></div>
+      <div class="muted">${numOrDash(l.completed_window)} / <span class="${hasNum(l.failed_window) && Number(l.failed_window) ? "badv" : ""}">${numOrDash(l.failed_window)}</span></div>
     </div>`;
   }).join("") : `<div class="scopeHint">没有接入节点</div>`;
   const queues = OBS.queue_alerts || [];
   if ($("obsQueue")) {
-    $("obsQueueHint").textContent = queues.length ? `${queues.length} 个需处理` : "没有超阈值排队";
+    const queueTotalKnown = hasNum(OBS.queue_alerts_total) && OBS.queue_alerts_total_known !== false;
+    const queueTotal = queueTotalKnown ? Math.max(Number(OBS.queue_alerts_total), queues.length) : queues.length;
+    const queueReturned = hasNum(OBS.queue_alerts_returned)
+      ? Math.max(Number(OBS.queue_alerts_returned), queues.length) : queues.length;
+    $("obsQueueHint").textContent = queueTotalKnown
+      ? (queueTotal
+          ? `${queueTotal} 个需处理${queueTotal > queueReturned
+              ? (queueReturned ? ` · 列表仅显示最近 ${queueReturned} 条` : " · 明细未返回")
+              : ""}`
+          : "没有超阈值排队")
+      : (queues.length ? `列表 ${queues.length} 条 · 总数未知` : "暂无数据 · 总数未知");
     $("obsQueue").innerHTML = queues.length ? queues.map((q) => {
       const id = String(q.task_id || "");
       const proj = q.project && current === "*" ? ` · ${esc(q.project)}` : "";
@@ -1588,16 +1745,30 @@ function renderObservability() {
           title="退回公共池，原定向节点不再收到该任务"
           style="white-space:nowrap">退回公共池</button>
       </div>`;
-    }).join("") : `<div class="scopeHint">没有超过阈值的排队任务；超过 2h 或目标离线超过 1h 会出现在这里。</div>`;
+    }).join("") : `<div class="scopeHint">${queueTotalKnown && queueTotal
+      ? "有排队任务但明细未返回"
+      : "没有超过阈值的排队任务；超过 2h 或目标离线超过 1h 会出现在这里。"}</div>`;
   }
   const dead = OBS.recent_dead || [];
-  $("obsDeadHint").textContent = dead.length ? `${dead.length} 个待重试` : "没有死信";
+  const deadTotalKnown = hasNum(OBS.dead_letters_total) && OBS.dead_letters_total_known !== false;
+  const deadTotal = deadTotalKnown ? Math.max(Number(OBS.dead_letters_total), dead.length) : dead.length;
+  const deadReturned = hasNum(OBS.recent_dead_returned)
+    ? Math.max(Number(OBS.recent_dead_returned), dead.length) : dead.length;
+  $("obsDeadHint").textContent = deadTotalKnown
+    ? (deadTotal
+        ? `${deadTotal} 个待重试${deadTotal > deadReturned
+            ? (deadReturned ? ` · 列表仅显示最近 ${deadReturned} 条` : " · 明细未返回")
+            : ""}`
+        : "没有死信")
+    : (dead.length ? `列表 ${dead.length} 条 · 总数未知` : "暂无数据 · 总数未知");
   $("obsDead").innerHTML = dead.length ? dead.map((d) =>
     `<button type="button" data-task-timeline="${esc(String(d.task_id || ""))}" title="查看时间线并重试">
       <div class="tid">${esc(String(d.task_id || ""))}${d.project && current === "*" ? ` · ${esc(d.project)}` : ""}</div>
-      <div class="muted" style="font-size:11px">${esc(String(d.title || ""))} → ${esc(String(d.to || "公共池"))} · ${Number(d.attempts ?? 0)}/${Number(d.max_attempts ?? 3)}</div>
+      <div class="muted" style="font-size:11px">${esc(String(d.title || ""))} → ${esc(String(d.to || "公共池"))} · ${numOrDash(d.attempts)}/${numOrDash(d.max_attempts)}</div>
       <div class="err">${esc(String(d.last_error || ""))}</div>
-    </button>`).join("") : `<div class="scopeHint">没有死信；失败任务会自动退避重试。</div>`;
+    </button>`).join("") : `<div class="scopeHint">${deadTotalKnown && deadTotal
+      ? "有死信但明细未返回"
+      : "没有死信；失败任务会自动退避重试。"}</div>`;
 }
 
 async function showTaskTimeline(taskId) {
@@ -1614,7 +1785,7 @@ async function showTaskTimeline(taskId) {
     const d = await api(`/admin/p/${current}/tasks/timeline?task_id=${encodeURIComponent(taskId)}`);
     const t = d.task || {};
     $("tlMeta").textContent = `${taskStateLabel(t.state, t)} · P${Number(t.priority ?? 2)} · `
-      + `${Number(t.attempts ?? 0)}/${Number(t.max_attempts ?? 3)} 次 · ${d.count || 0} 个事件`;
+      + `${numOrDash(t.attempts)}/${numOrDash(t.max_attempts)} 次 · ${numOrDash(d.count)} 个事件`;
     const typeLabel = {
       "task.created": "创建", "task.queued": "排队", "task.dispatched": "下发",
       "task.claimed": "领取", "task.retry_scheduled": "失败退避", "task.retried": "重新下发",
@@ -1653,19 +1824,52 @@ async function showTaskTimeline(taskId) {
 async function loadAgents() {
   const project = current;
   const isAll = project === "*";
-  const d = isAll ? await api("/admin/agents") : await api(`/admin/p/${project}/agents`);
+  let d;
+  try {
+    d = isAll ? await api("/admin/agents") : await api(`/admin/p/${project}/agents`);
+    if (!d || !Array.isArray(d.agents)) throw new Error("bad agents payload");
+  } catch (e) {
+    if (current !== project) return;
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] agents failed", e);
+    AGENTS_LOADED = false;
+    AGENTS_PARTIAL = 0;
+    AGENTS_FAILED_PROJECTS = [];
+    window._agents = [];
+    $("agentStat").textContent = "名册读取失败";
+    $("agents").replaceChildren(emptyTableRow(10, "名册读取失败，请稍后重试"));
+    renderDashboard();
+    renderStats();
+    return;
+  }
   if (current !== project) return;   // 切项目/切视图后，旧请求只允许静默丢弃
   const rows = (d.agents || []).map((a) => ({ ...a, project: a.project || project }));
   const alive = rows.filter(a => a.alive === "alive").length;
   const outdated = rows.filter(a => a.sdk_outdated).length;
-  $("agentStat").textContent = `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}` +
-    (outdated ? ` · ${outdated} 个旧版 SDK` : "");
-  $("agents").replaceChildren(...(rows.length ? rows.map(agentRow) : [emptyTableRow(10, "还没有 agent 接入")]));
+  AGENTS_PARTIAL = Number(d.projects_failed ?? 0);
+  AGENTS_FAILED_PROJECTS = Array.isArray(d.projects_failed_names) ? d.projects_failed_names : [];
+  const projectsTotal = isAll ? Number(d.projects_total ?? (allProjects || []).length) : 1;
+  // 所有项目都失败时，空数组不是“0 个 agent”，而是“没读到”；这时撤掉
+  // 名册的 0/0 和顶部在线 0，让界面回到“统计不可用/名册读取失败”。
+  const allFailed = projectsTotal > 0 && AGENTS_PARTIAL >= projectsTotal;
+  AGENTS_LOADED = !allFailed;
+  const partialNote = isAll && AGENTS_PARTIAL
+    ? ` · ${AGENTS_PARTIAL} 个项目未加载` : "";
+  $("agentStat").textContent = allFailed
+    ? `名册读取失败 · ${AGENTS_PARTIAL}/${projectsTotal} 个项目`
+    : (isAll && AGENTS_PARTIAL
+        ? `≥${alive} 在线 · ${rows.length} 个已加载 · 全部项目${partialNote}`
+        : `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}` +
+          (outdated ? ` · ${outdated} 个旧版 SDK` : "") + partialNote);
+  $("agents").replaceChildren(...(allFailed
+    ? [emptyTableRow(10, "名册读取失败，请稍后重试")]
+    : rows.length ? rows.map(agentRow) : [emptyTableRow(10, "还没有 agent 接入")]));
   window._agents = rows;
   bindBulk();
   reapplyFilters();
   renderSndWho(rows);
   renderDashboard();
+  renderStats();
 }
 
 function taskAgentOptions(selected, allowOffline = false) {
@@ -1688,8 +1892,9 @@ function taskLease(t) {
     cls: "",
   };
   if (!t.owner) return { text: "—", cls: "" };
-  if (t.lease_left_ms <= 0) return { text: "已过期", cls: "badv" };
-  const s = Math.ceil(t.lease_left_ms / 1000);
+  if (!hasNum(t.lease_left_ms)) return { text: "—", cls: "" };
+  if (Number(t.lease_left_ms) <= 0) return { text: "已过期", cls: "badv" };
+  const s = Math.ceil(Number(t.lease_left_ms) / 1000);
   return t.owner_online === false
     ? { text: "节点离线", cls: "badv" }
     : { text: `${s}s`, cls: s <= 60 ? "warnv" : "" };
@@ -1722,7 +1927,8 @@ function taskIsStale(t) {
     if (t.to_alive === "offline") return age > 2 * 60 * 1000;
     return age > 10 * 60 * 1000;
   }
-  if (t.state === "claimed") return t.owner_online === false || Number(t.lease_left_ms) <= 0;
+  if (t.state === "claimed") return t.owner_online === false
+    || (hasNum(t.lease_left_ms) && Number(t.lease_left_ms) <= 0);
   return false;
 }
 
@@ -1730,31 +1936,81 @@ async function loadTasks() {
   const project = current;
   const isAll = project === "*";
   let rows = [];
+  let failedProjects = 0;
+  const failedNames = [];
+  TASK_LOADED = false;
+  TASK_PARTIAL = 0;
+  TASK_FAILED_PROJECTS = [];
   if (isAll) {
     const projects = (allProjects || []).filter((p) => p.project !== "*");
     const got = await Promise.allSettled(projects.map((p) => api(`/admin/p/${p.project}/tasks`)));
     if (current !== project) return;
     got.forEach((r, i) => {
-      if (r.status !== "fulfilled") { console.warn("[hub] task list failed", projects[i]?.project, r.reason); return; }
+      if (r.status !== "fulfilled") {
+        failedProjects++;
+        failedNames.push(projects[i]?.project);
+        console.warn("[hub] task list failed", projects[i]?.project, r.reason);
+        return;
+      }
       const raw = r.value;
-      const list = Array.isArray(raw) ? raw : (raw.tasks || []);
+      const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.tasks) ? raw.tasks : null);
+      if (!list) {
+        failedProjects++;
+        failedNames.push(projects[i]?.project);
+        console.warn("[hub] task list bad payload", projects[i]?.project);
+        return;
+      }
       rows.push(...list.map((t) => ({ ...t, project: t.project || projects[i].project })));
     });
+    TASK_FAILED_PROJECTS = failedNames.filter(Boolean);
   } else {
-    const raw = await api(`/admin/p/${project}/tasks`);
+    let raw;
+    try {
+      raw = await api(`/admin/p/${project}/tasks`);
+      if (!Array.isArray(raw) && !(raw && Array.isArray(raw.tasks))) throw new Error("bad tasks payload");
+    } catch (e) {
+      if (current !== project) return;
+      if (e instanceof AuthError) throw e;
+      console.warn("[hub] tasks failed", e);
+      TASK_ROWS = [];
+      BADGES.task = 0;
+      updateBadges();
+      $("taskStat").textContent = "任务读取失败";
+      $("tasks").replaceChildren(emptyTableRow(8, "任务读取失败，请稍后重试"));
+      renderDashboard();
+      syncBulkAvailability();
+      return;
+    }
     if (current !== project) return;
     rows = Array.isArray(raw) ? raw : (raw.tasks || []);
   }
+  if (isAll && failedProjects && failedProjects === (allProjects || []).filter((p) => p.project !== "*").length) {
+    TASK_ROWS = [];
+    TASK_PARTIAL = failedProjects;
+    BADGES.task = 0;
+    updateBadges();
+    $("taskStat").textContent = `任务读取失败：${failedProjects} 个项目全部未加载`;
+    $("tasks").replaceChildren(emptyTableRow(8, "任务读取失败，请稍后重试"));
+    renderDashboard();
+    syncBulkAvailability();
+    return;
+  }
+  TASK_PARTIAL = isAll ? failedProjects : 0;
+  TASK_LOADED = true;
   const rank = (st) => st === "claimed" ? 0 : st === "open" ? 1 : st === "released" ? 2
     : st === "blocked" ? 3 : st === "failed" ? 4 : 5;
   rows.sort((a, b) => rank(a.state) - rank(b.state)
     || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
   TASK_ROWS = rows;
-  const active = rows.filter((t) => t.state !== "done").length;
+  // “活跃”只算还能推进的任务；failed 是终态，不能算活跃（看板会单独列为死信）。
+  const active = rows.filter((t) => !["done", "failed"].includes(String(t.state))).length;
   const staleCount = rows.filter(taskIsStale).length;
-  $("taskStat").textContent = isAll
-    ? `${active} 活跃 / 共 ${rows.length}${staleCount ? ` · 滞留 ${staleCount}` : ""} · 全部项目（只读）`
-    : `${active} 活跃 / 共 ${rows.length}${staleCount ? ` · 滞留 ${staleCount}` : ""}`;
+  const partialNote = isAll && TASK_PARTIAL ? ` · ${TASK_PARTIAL} 个项目未加载` : "";
+  $("taskStat").textContent = isAll && TASK_PARTIAL
+    ? `≥${active} 活跃 · ≥${rows.length} 条已加载${staleCount ? ` · 滞留 ${staleCount}` : ""} · 全部项目（只读）${partialNote}`
+    : isAll
+      ? `${active} 活跃 / 共 ${rows.length}${staleCount ? ` · 滞留 ${staleCount}` : ""} · 全部项目（只读）${partialNote}`
+      : `${active} 活跃 / 共 ${rows.length}${staleCount ? ` · 滞留 ${staleCount}` : ""}`;
   BADGES.task = active;
   updateBadges();
   const keepTo = $("taskTo").value;
@@ -1771,38 +2027,109 @@ async function loadTasks() {
 const ISSUE_STATE_LABEL = { open: "待处理", closed: "已关闭", merged: "已合并" };
 const ISSUE_PRIORITY_LABEL = { low: "低", normal: "普通", high: "高", urgent: "紧急" };
 
+function issueCountsOf(d, list) {
+  const c = d && !Array.isArray(d) ? d.counts : null;
+  // 新接口的 counts 是 GROUP BY 全量结果：缺失的状态就是 0，可以标为精确。
+  if (c && typeof c === "object") {
+    return { open: Number(c.open ?? 0), closed: Number(c.closed ?? 0),
+             merged: Number(c.merged ?? 0), exact: true };
+  }
+  // 兼容旧接口返回数组：只能按当前列表推导，exact=false 让 UI 显示 ≥。
+  const out = { open: 0, closed: 0, merged: 0, exact: false };
+  for (const x of list) {
+    const st = String(x.status || "open");
+    if (st in out) out[st]++;
+  }
+  return out;
+}
+
 async function loadIssues() {
   const project = current;
   const isAll = project === "*";
   let rows = [];
-  const counts = { open: 0, closed: 0, merged: 0 };
+  let counts = { open: 0, closed: 0, merged: 0 };
+  let approx = false;
+  let failedProjects = 0;
+  const failedNames = [];
+  ISSUE_COUNTS = {};
+  ISSUE_ROWS = [];
+  ISSUE_PARTIAL = 0;
+  ISSUE_LOAD_ERROR = false;
+  ISSUE_FAILED_PROJECTS = [];
   if (isAll) {
     const projects = (allProjects || []).filter((p) => p.project !== "*");
     const got = await Promise.allSettled(projects.map((p) => api(`/admin/p/${p.project}/issues`)));
     if (current !== project) return;
     got.forEach((r, i) => {
-      if (r.status !== "fulfilled") { console.warn("[hub] issue list failed", projects[i]?.project, r.reason); return; }
-      const d = r.value || {};
-      const list = Array.isArray(d) ? d : (d.issues || []);
+      if (r.status !== "fulfilled") {
+        failedProjects++;
+        failedNames.push(projects[i]?.project);
+        console.warn("[hub] issue list failed", projects[i]?.project, r.reason);
+        return;
+      }
+      const d = r.value;
+      const list = Array.isArray(d) ? d : (d && Array.isArray(d.issues) ? d.issues : null);
+      if (!list) {
+        failedProjects++;
+        failedNames.push(projects[i]?.project);
+        console.warn("[hub] issue list bad payload", projects[i]?.project);
+        return;
+      }
+      const c = issueCountsOf(d, list);
+      ISSUE_COUNTS[projects[i].project] = c;
+      for (const k of ["open", "closed", "merged"]) counts[k] += c[k];
+      if (!c.exact) approx = true;
       rows.push(...list.map((x) => ({ ...x, project: projects[i].project })));
-      const c = d.counts || {};
-      for (const k of ["open", "closed", "merged"]) counts[k] += Number(c[k] ?? 0);
     });
+    ISSUE_FAILED_PROJECTS = failedNames.filter(Boolean);
   } else {
-    const d = await api(`/admin/p/${project}/issues`);
+    let d;
+    try {
+      d = await api(`/admin/p/${project}/issues`);
+      if (!Array.isArray(d) && !(d && Array.isArray(d.issues))) throw new Error("bad issues payload");
+    } catch (e) {
+      if (current !== project) return;
+      if (e instanceof AuthError) throw e;
+      console.warn("[hub] issues failed", e);
+      ISSUE_LOAD_ERROR = true;
+      BADGES.issue = 0;
+      updateBadges();
+      $("issueStat").textContent = "Issue 读取失败";
+      renderIssueRows();
+      renderDashboard();
+      return;
+    }
     if (current !== project) return;
     rows = Array.isArray(d) ? d : (d.issues || []);
-    const c = d.counts || {};
-    for (const k of ["open", "closed", "merged"]) counts[k] = Number(c[k] ?? 0);
+    const c = issueCountsOf(d, rows);
+    ISSUE_COUNTS[project] = c;
+    counts = { open: c.open, closed: c.closed, merged: c.merged };
+    approx = !c.exact;
+  }
+  if (isAll && failedProjects && failedProjects === (allProjects || []).filter((p) => p.project !== "*").length) {
+    ISSUE_PARTIAL = failedProjects;
+    ISSUE_LOAD_ERROR = true;
+    ISSUE_COUNTS = {};
+    BADGES.issue = 0;
+    updateBadges();
+    $("issueStat").textContent = `Issue 读取失败：${failedProjects} 个项目全部未加载`;
+    renderIssueRows();
+    renderDashboard();
+    return;
   }
   const rank = (st) => st === "open" ? 0 : st === "closed" ? 1 : 2;
   rows.sort((a, b) => rank(a.status) - rank(b.status)
     || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
   ISSUE_ROWS = rows;
+  ISSUE_PARTIAL = isAll ? failedProjects : 0;
+  const prefix = (approx || ISSUE_PARTIAL) ? "≥" : "";
   const open = counts.open;
   const total = counts.open + counts.closed + counts.merged;
-  $("issueStat").textContent = `${open} 待处理 · ${counts.closed} 已关闭 · ${counts.merged} 已合并 · 共 ${total}`
-    + (isAll ? " · 全部项目" : "");
+  $("issueStat").textContent = `${prefix}${open} 待处理 · ${prefix}${counts.closed} 已关闭 · ${prefix}${counts.merged} 已合并 · 共 ${prefix}${total}`
+    + (isAll ? " · 全部项目" : "")
+    + (approx ? " · 计数只覆盖当前列表" : "")
+    + (total > rows.length ? ` · 列表仅显示 ${rows.length} 条` : "")
+    + (isAll && ISSUE_PARTIAL ? ` · ${ISSUE_PARTIAL} 个项目未加载` : "");
   BADGES.issue = open;
   updateBadges();
   renderIssueRows();
@@ -1819,28 +2146,61 @@ async function loadIdle() {
     $("idleAgents").innerHTML = `<tr><td colspan="10" class="empty">选择具体项目查看</td></tr>`;
     return;
   }
-  const d = await api(`/admin/p/${project}/idle`);
+  let d;
+  try {
+    d = await api(`/admin/p/${project}/idle`);
+  } catch (e) {
+    if (current !== project) return;
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] idle failed", e);
+    d = { config: { ready: false, enabled: false }, agents: [], list_error: "idle_load_failed" };
+  }
   if (current !== project) return;
-  IDLE_CONFIG = d.config || {};
-  IDLE_ROWS = d.agents || [];
-  if (!IDLE_CFG_DIRTY) {
+  if (!d || typeof d !== "object") d = {};
+  const hasConfig = d.config && typeof d.config === "object";
+  IDLE_CONFIG = hasConfig ? d.config : {};
+  IDLE_ROWS = Array.isArray(d.agents) ? d.agents : [];
+  const ready = hasConfig && IDLE_CONFIG.ready !== false;
+  const listError = !!(d.list_error || d.error) || !Array.isArray(d.agents);
+  const idleMin = (v) => Math.max(1, Math.round((hasNum(v) ? Number(v) : 600) / 60));
+  if (!ready && !IDLE_CFG_DIRTY) {
+    $("idleEnabled").value = "0";
+    $("idleAfter").value = "";
+    $("idleFollowup").value = "";
+    $("idleMessage").value = "";
+  } else if (!IDLE_CFG_DIRTY) {
     $("idleEnabled").value = IDLE_CONFIG.enabled ? "1" : "0";
-    $("idleAfter").value = String(Math.max(1, Math.round(Number(IDLE_CONFIG.idle_after_s || 600) / 60)));
-    $("idleFollowup").value = String(Math.max(1, Math.round(Number(IDLE_CONFIG.followup_after_s || 600) / 60)));
+    $("idleAfter").value = String(idleMin(IDLE_CONFIG.idle_after_s));
+    $("idleFollowup").value = String(idleMin(IDLE_CONFIG.followup_after_s));
     $("idleMessage").value = IDLE_CONFIG.message || "";
   }
-  $("idleHint").textContent = d.migration_required || IDLE_CONFIG.ready === false
+  const editable = ready;
+  for (const id of ["idleEnabled", "idleAfter", "idleFollowup", "idleMessage", "btnIdleSave"])
+    if ($(id)) $(id).disabled = !editable;
+  $("idleHint").textContent = d.migration_required
     ? "⚠️ 空闲提醒表尚未迁移：请先执行 worker/migrations/20261124-idle-reminder.sql"
-    : "";
-  $("idleStat").textContent = !IDLE_CONFIG.enabled
-    ? "自动提醒已关闭"
-    : `${IDLE_ROWS.length} 台待唤醒 · 空闲 ${Math.round(Number(IDLE_CONFIG.idle_after_s || 600) / 60)} 分钟提醒`;
-  const fmt = (ms) => Number(ms) > 0 ? new Date(Number(ms)).toLocaleString() : "—";
-  $("idleAgents").innerHTML = IDLE_ROWS.length ? IDLE_ROWS.map((a) => `
+    : (!ready ? "空闲提醒配置读取失败，当前数值不可用"
+      : (listError ? "待唤醒列表读取失败，当前数量不可用" : ""));
+  $("idleStat").textContent = !ready
+    ? "配置不可用"
+    : !IDLE_CONFIG.enabled ? "自动提醒已关闭"
+    : (listError ? "列表读取失败"
+      : `${IDLE_ROWS.length} 台待唤醒 · 空闲 ${idleMin(IDLE_CONFIG.idle_after_s)} 分钟提醒`);
+  const fmt = (ms) => {
+    const t = Number(ms);
+    return Number.isFinite(t) && t > 0 ? new Date(t).toLocaleString() : "—";
+  };
+  $("idleAgents").innerHTML = !ready
+    ? `<tr><td colspan="10" class="empty">空闲提醒配置读取失败</td></tr>`
+    : (!IDLE_CONFIG.enabled
+      ? `<tr><td colspan="10" class="empty">自动提醒关闭中</td></tr>`
+      : (listError
+        ? `<tr><td colspan="10" class="empty">待唤醒列表读取失败</td></tr>`
+        : (IDLE_ROWS.length ? IDLE_ROWS.map((a) => `
     <tr class="clickable" style="cursor:pointer" data-agent="${esc(a.agent_id)}" data-project="${esc(project)}" title="点击查看 Agent 详情">
       <td><span class="mono">${esc(a.agent_id)}</span></td>
       <td><span class="badge alive">在线</span></td>
-      <td class="num">${Number(a.active_tasks ?? 0)}</td>
+      <td class="num">${hasNum(a.active_tasks) ? a.active_tasks : "—"}</td>
       <td class="muted">${fmt(a.idle_since_ms)}</td>
       <td class="muted">${fmt(a.reminded_at)}</td>
       <td class="muted">${fmt(a.flagged_at)}</td>
@@ -1849,7 +2209,7 @@ async function loadIdle() {
       <td class="muted">${fmt(a.last_active_ms)}</td>
       <td><button class="ghost mini" data-idle-remind="${esc(a.agent_id)}" data-project="${esc(project)}">重发提醒</button></td>
     </tr>`).join("")
-    : `<tr><td colspan="10" class="empty">${IDLE_CONFIG.enabled ? "暂无上榜节点" : "自动提醒关闭中"}</td></tr>`;
+    : `<tr><td colspan="10" class="empty">${IDLE_CONFIG.enabled ? "暂无上榜节点" : "自动提醒关闭中"}</td></tr>`)));
 }
 
 async function sendAgentNotice(agentId) {
@@ -1956,7 +2316,9 @@ async function resendIdleReminder(agentId, project, fromDetail = false) {
 function renderIssueRows() {
   const isAll = current === "*";
   const rows = ISSUE_ROWS || [];
-  $("issues").innerHTML = rows.length ? rows.map((i) => {
+  $("issues").innerHTML = ISSUE_LOAD_ERROR
+    ? `<tr><td colspan="8" class="empty">Issue 读取失败，请稍后重试</td></tr>`
+    : rows.length ? rows.map((i) => {
     const id = i.issue_id || "";
     const st = i.status || "open";
     const pri = i.priority || "normal";
@@ -2015,19 +2377,49 @@ function showIssueDetail(issue) {
 async function loadSubs() {
   const project = current;
   if (!project || project === "*") return;
-  const raw = await api(`/admin/p/${project}/submissions`);
+  let raw;
+  try {
+    raw = await api(`/admin/p/${project}/submissions?counts=1`);
+    if (!Array.isArray(raw) && !(raw && Array.isArray(raw.submissions))) throw new Error("bad submissions payload");
+  } catch (e) {
+    if (current !== project) return;
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] submissions failed", e);
+    SUB_ROWS = [];
+    SUB_STATE = new Map();
+    SUB_COUNTS = null;
+    lastPending = null;
+    $("subStat").textContent = "交付箱读取失败";
+    $("subs").innerHTML = `<tr><td colspan="8" class="empty">交付箱读取失败，请稍后重试</td></tr>`;
+    BADGES.deli = 0;
+    updateBadges();
+    renderDeliveryAlert([], 0);
+    return;
+  }
   if (current !== project) return;
-  const d = Array.isArray(raw) ? raw : (raw.submissions || []);
+  const legacy = Array.isArray(raw);
+  const d = legacy ? raw : (raw.submissions || []);
   SUB_ROWS = d;
   SUB_STATE = new Map(d.map((s) => [s.submission_id, s.state]));
   const pendingRows = d.filter((s) => s.state === "delivered");
-  const pending = pendingRows.length;
-  const pendingReview = d.filter((s) => ["pending", "accepted"].includes(s.review_state || "pending")
-    && s.state !== "archived").length;
-  $("subStat").textContent = `${pending} 待取 · ${pendingReview} 待裁决 / 共 ${d.length}`;
+  const counts = legacy ? null : raw;
+  const pending = counts && hasNum(counts.delivered)
+    ? Math.max(Number(counts.delivered), pendingRows.length) : pendingRows.length;
+  const reviewRows = d.filter((s) =>
+    ["pending", "accepted"].includes(s.review_state || "pending") && s.state !== "archived").length;
+  const pendingReview = counts && hasNum(counts.pending_review)
+    ? Math.max(Number(counts.pending_review), reviewRows) : reviewRows;
+  const total = counts && hasNum(counts.total) ? Math.max(Number(counts.total), d.length) : d.length;
+  SUB_COUNTS = counts ? { ...counts, total, delivered: pending, pending_review: pendingReview,
+                          estimated: false } : { total, delivered: pending, pending_review: pendingReview,
+                                                 estimated: true };
+  const shown = Math.min(40, d.length);
+  const more = total > shown ? ` · 列表仅显示最近 ${shown} 条` : "";
+  const approx = !counts ? " · 计数按当前列表" : "";
+  $("subStat").textContent = `${pending} 待取 · ${pendingReview} 待裁决 / 共 ${total}${more}${approx}`;
   BADGES.deli = pending;
   updateBadges();
-  renderDeliveryAlert(pendingRows);
+  renderDeliveryAlert(pendingRows, pending);
   if (pending > 0) setCardOpen("交付箱", true);
   if (pending > (lastPending ?? 0)) {
     const add = pending - (lastPending ?? 0);
@@ -2055,23 +2447,26 @@ async function loadSubs() {
       <td>${s.kind}</td>
       <td><span class="badge ${s.state}">${{delivered:"待取",collected:"已取",archived:"归档"}[s.state]}</span></td>
       <td><span class="badge ${review}">${revLabel[review] || review}</span></td>
-      <td class="muted">${new Date(s.created_at).toLocaleString()}</td>
+      <td class="muted">${hasNum(s.created_at) ? new Date(Number(s.created_at)).toLocaleString() : "—"}</td>
       <td style="white-space:nowrap">${actions}</td>
     </tr>`;
-  }).join("") : `<tr><td colspan="8" class="empty">暂无交付</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">${total > 0 ? `有 ${total} 条交付，列表未返回` : "暂无交付"}</td></tr>`;
   reapplyFilters();
   renderDashboard();
 }
 
-function renderDeliveryAlert(pendingRows) {
+function renderDeliveryAlert(pendingRows, total = pendingRows.length) {
   const el = $("deliveryAlert");
   if (!el) return;
-  const n = pendingRows.length;
+  const n = Number(total ?? pendingRows.length);
   document.title = n ? `(${n}) ${BASE_TITLE}` : BASE_TITLE;
   if (!n) { el.hidden = true; return; }
   const agents = [...new Set(pendingRows.map((s) => s.agent_id))];
-  const who = agents.slice(0, 3).join("、") + (agents.length > 3 ? ` 等 ${agents.length} 个 agent` : "");
-  $("deliveryAlertText").textContent = `有 ${n} 份交付待取（${who}）`;
+  const who = agents.length
+    ? agents.slice(0, 3).join("、") + (agents.length > 3 ? ` 等 ${agents.length} 个 agent` : "")
+    : "列表未返回";
+  $("deliveryAlertText").textContent = `有 ${n} 份交付待取（${who}）`
+    + (n > pendingRows.length ? `，其中列表外 ${n - pendingRows.length} 份` : "");
   el.hidden = false;
 }
 
@@ -2195,28 +2590,60 @@ async function settings() {
 }
 
 async function loadSec() {
-  const d = await api("/admin/security/blocks");
+  let d;
+  try {
+    d = await api("/admin/security/blocks");
+    if (!d || !Array.isArray(d.blocks)) throw new Error("bad security payload");
+  } catch (e) {
+    if (e instanceof AuthError) throw e;
+    $("secStat").textContent = "读取失败";
+    $("secs").innerHTML = `<tr><td colspan="4" class="empty">封禁列表读取失败</td></tr>`;
+    return;
+  }
   const rows = (d.blocks || []).filter((b) => b.active || b.permanent);
-  $("secStat").textContent = rows.length ? `${rows.length} 条生效` : "无封禁";
+  $("secStat").textContent = `${rows.length} 条生效`;
   $("secs").innerHTML = rows.length
-    ? rows.map((b) => `<tr>
+    ? rows.map((b) => {
+        const until = b.permanent ? "永久" : (() => {
+          const t = new Date(b.until).getTime();
+          return Number.isFinite(t) ? new Date(t).toLocaleString() : "—";
+        })();
+        return `<tr>
         <td class="mono">${b.ip}</td>
-        <td class="muted">${b.fails}</td>
-        <td class="muted">${b.permanent ? "永久" : new Date(b.until).toLocaleString()}</td>
+        <td class="muted">${hasNum(b.fails) ? b.fails : "—"}</td>
+        <td class="muted">${until}</td>
         <td><button class="mini" data-unblock="${b.ip}">解封</button></td>
-      </tr>`).join("")
+      </tr>`;
+      }).join("")
     : `<tr><td colspan="4" class="empty">暂无封禁</td></tr>`;
 }
 
 async function loadEnr() {
   if (!current) return;
   let d;
-  try { d = await api("/admin/enrollments"); } catch { return; }
+  try {
+    d = await api("/admin/enrollments");
+    if (!d || !Array.isArray(d.enrollments)) throw new Error("bad enrollments payload");
+  } catch (e) {
+    if (e instanceof AuthError) throw e;
+    $("enrStat").textContent = "读取失败";
+    BADGES.access = 0;
+    updateBadges();
+    $("enr").innerHTML = `<tr><td colspan="5" class="empty">注册申请读取失败</td></tr>`;
+    return;
+  }
   const rows = (d.enrollments || []).filter((e) => e.status === "pending");
-  $("enrStat").textContent = rows.length ? `${rows.length} 待审` : "";
-  BADGES.access = rows.length;
+  const pending = hasNum(d.counts?.pending)
+    ? Math.max(Number(d.counts.pending), rows.length) : rows.length;
+  const more = rows.length && pending > rows.length ? ` · 列表仅显示最近 ${rows.length} 条` : "";
+  const approx = !hasNum(d.counts?.pending) ? " · 计数按当前列表" : "";
+  $("enrStat").textContent = `${pending} 待审（全部项目）${more}${approx}`;
+  BADGES.access = pending;
   updateBadges();
-  if (!rows.length) { $("enr").innerHTML = `<tr><td colspan="5" class="empty">无待审申请</td></tr>`; return; }
+  if (!rows.length) {
+    $("enr").innerHTML = `<tr><td colspan="5" class="empty">${pending ? `有 ${pending} 条待审申请，当前列表未显示` : "无待审申请"}</td></tr>`;
+    return;
+  }
   const scopeCell = (e) => {
     const scopes = scopeList(e.scopes);
     if (!scopes.length) return '<span class="muted">无额外权限</span>';
@@ -2235,7 +2662,7 @@ async function loadEnr() {
       <span class="enrIdHint">批准前可改</span>
     </td><td><span class="badge">${esc(e.project)}</span></td>
       <td>${scopeCell(e)}</td>
-      <td class="muted">${new Date(e.created_at).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</td>
+      <td class="muted">${hasNum(e.created_at) ? new Date(Number(e.created_at)).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
       <td><div class="enrActions">
         <button class="actIcon ok" data-approve="${e.id}" data-project="${e.project}" title="批准" aria-label="批准">✓</button>
         <button class="actIcon no" data-reject="${e.id}" title="拒绝" aria-label="拒绝">✕</button>
@@ -2347,7 +2774,8 @@ async function revoke(id, project) {
   alert(`已吊销：${(r.revoked || []).join(", ")}`);
 }
 
-function drawDonut(cv, parts, centerText) {
+function drawDonut(cv, parts, centerText, emptyText = "暂无数据") {
+  if (!cv) return;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = cv.clientWidth || 240, h = cv.clientHeight || 112;
   cv.width = w * dpr; cv.height = h * dpr;
@@ -2355,7 +2783,7 @@ function drawDonut(cv, parts, centerText) {
   const total = parts.reduce((a, p) => a + Math.max(0, p.value), 0);
   if (!total) {
     g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
-    g.textAlign = "center"; g.fillText("暂无数据", w / 2, h / 2);
+    g.textAlign = "center"; g.fillText(emptyText, w / 2, h / 2);
     return;
   }
   const cx = w / 2, cy = h / 2, r = Math.min(w, h) * 0.36;
@@ -2376,12 +2804,18 @@ function drawDonut(cv, parts, centerText) {
   g.fillText(centerText || "", cx, cy + 17);
 }
 
-function drawTrend(cv, daily) {
+function drawTrend(cv, daily, emptyText = "暂无活动") {
+  if (!cv) return;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = cv.clientWidth || 280, h = cv.clientHeight || 112;
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
   const rows = (daily || []).slice(-7);
+  if (!rows.length) {
+    g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
+    g.textAlign = "center"; g.fillText(emptyText, w / 2, h / 2);
+    return;
+  }
   const max = Math.max(1, ...rows.map((x) => Math.max(Number(x.messages) || 0,
     Number(x.submissions) || 0, Number(x.issues) || 0)));
   const pad = { l: 5, r: 5, t: 13, b: 17 };
@@ -2393,11 +2827,6 @@ function drawTrend(cv, daily) {
   });
   g.fillStyle = "#7d8798"; g.font = "8px ui-monospace,monospace"; g.textAlign = "right";
   g.fillText(String(max), w - pad.r, 9);
-  if (!rows.length) {
-    g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
-    g.textAlign = "center"; g.fillText("暂无活动", w / 2, h / 2);
-    return;
-  }
   const gw = pw / rows.length, bw = Math.max(2, gw * 0.2);
   rows.forEach((row, i) => {
     const x = pad.l + gw * i + gw / 2;
@@ -2418,18 +2847,19 @@ function drawTrend(cv, daily) {
 
 function renderStack(el, parts) {
   if (!el) return;
-  const total = parts.reduce((a, p) => a + Math.max(0, p.value), 0);
+  const known = parts.filter((p) => !p.unknown);
+  const total = known.reduce((a, p) => a + Math.max(0, p.value), 0);
   el.innerHTML = total
-    ? parts.filter((p) => p.value > 0).map((p) =>
+    ? known.filter((p) => p.value > 0).map((p) =>
         `<span class="seg" style="flex:${p.value};background:${p.color}" title="${esc(p.label)} ${p.value}"></span>`).join("")
-    : `<span class="stackEmpty">暂无</span>`;
+    : `<span class="stackEmpty">${known.length ? "暂无" : "数据不可用"}</span>`;
 }
 
 function renderLegend(el, parts, kind) {
   if (!el) return;
   el.innerHTML = parts.map((p) =>
-    `<button type="button" class="${p.value ? "" : "zero"}" data-dash-${kind}="${p.key}" title="点击筛选">
-      <i style="background:${p.color}"></i><span>${esc(p.label)}</span><b>${p.value}</b>
+    `<button type="button" class="${p.unknown ? "zero" : p.value ? "" : "zero"}" data-dash-${kind}="${p.key}" title="点击筛选"${p.unknown ? " disabled" : ""}>
+      <i style="background:${p.color}"></i><span>${esc(p.label)}</span><b>${p.unknown ? "—" : p.value}</b>
     </button>`).join("");
 }
 
@@ -2449,7 +2879,15 @@ function renderDashboard() {
   if (!document.getElementById("dashTaskBar")) return;
   const scope = current === "*" ? "全部项目"
     : ((allProjects.find((p) => p.project === current)?.display_name) || current || "—");
-  const scopeEl = $("dashScope"); if (scopeEl) scopeEl.textContent = scope;
+  const analyticsReady = ANALYTICS_STATE === "ready";
+  const agentsReady = AGENTS_LOADED;
+  const taskReady = TASK_LOADED;
+  const partials = [];
+  if (AGENTS_PARTIAL) partials.push(`名册 ${AGENTS_PARTIAL} 个项目未加载`);
+  if (TASK_PARTIAL) partials.push(`任务 ${TASK_PARTIAL} 个项目未加载`);
+  if (ISSUE_PARTIAL) partials.push(`Issue ${ISSUE_PARTIAL} 个项目未加载`);
+  const scopeEl = $("dashScope");
+  if (scopeEl) scopeEl.textContent = scope + (partials.length ? ` · ${partials.join("；")}` : "");
   const taskParts = [
     { key: "open", label: "待领取", color: "#7d8798", value: 0 },
     { key: "claimed", label: "执行中", color: "#6aa9ff", value: 0 },
@@ -2458,19 +2896,24 @@ function renderDashboard() {
     { key: "failed", label: "死信", color: "#ff7b72", value: 0 },
     { key: "done", label: "完成", color: "#56d364", value: 0 },
   ];
-  for (const t of (TASK_ROWS || [])) {
-    const p = taskParts.find((x) => x.key === t.state);
-    if (p) p.value++;
+  if (taskReady) {
+    for (const t of (TASK_ROWS || [])) {
+      const p = taskParts.find((x) => x.key === t.state);
+      if (p) p.value++;
+    }
+  } else {
+    taskParts.forEach((p) => { p.unknown = true; });
   }
   const taskTotal = taskParts.reduce((a, p) => a + p.value, 0);
-  $("dashTaskTotal").textContent = taskTotal ? `${taskTotal}` : "—";
+  $("dashTaskTotal").textContent = taskReady
+    ? `${TASK_PARTIAL ? "≥" : ""}${taskTotal}` : "—";
   renderStack($("dashTaskBar"), taskParts);
   renderLegend($("dashTaskLegend"), taskParts, "task");
 
-  const stale = (TASK_ROWS || []).filter(taskIsStale).length;
+  const stale = taskReady ? (TASK_ROWS || []).filter(taskIsStale).length : 0;
   const staleBtn = $("dashStale");
   if (staleBtn) {
-    staleBtn.hidden = !stale;
+    staleBtn.hidden = !taskReady || !stale;
     staleBtn.textContent = current === "*"
       ? `滞留 ${stale} 个 · 点这里筛选`
       : `滞留 ${stale} 个 · 点这里筛选并回收`;
@@ -2484,63 +2927,82 @@ function renderDashboard() {
     if (!projStrip.hidden) {
       projStrip.innerHTML = projects.map((p) => {
         const tasks = (TASK_ROWS || []).filter((t) => (t.project || "") === p.project);
-        const active = tasks.filter((t) => t.state !== "done").length;
+        const active = tasks.filter((t) => !["done", "failed"].includes(String(t.state))).length;
         const agents = (window._agents || []).filter((a) => (a.project || "") === p.project);
         const online = agents.filter((a) => a.alive === "alive").length;
+        const c = ISSUE_COUNTS[p.project];
+        const agentFailed = AGENTS_FAILED_PROJECTS.includes(p.project);
+        const taskFailed = TASK_FAILED_PROJECTS.includes(p.project);
+        const activeText = taskReady && !taskFailed ? `${active} 活跃` : "活跃 —";
+        const onlineText = agentsReady && !agentFailed ? `${online}/${agents.length} 在线` : "在线 —";
+        const issueText = c && hasNum(c.open) ? `${c.exact ? "" : "≥"}${c.open} Issue` : "Issue ?";
         return `<button class="projChip" data-goto-project="${p.project}" title="切到该项目">
-          <i class="dot ${agents.length && online === agents.length ? "alive" : online > 0 ? "late" : "offline"}"></i>
+          <i class="dot ${!agentsReady || agentFailed ? "offline" : agents.length && online === agents.length ? "alive" : online > 0 ? "late" : "offline"}"></i>
           <b>${esc(p.display_name || p.project)}</b>
-          <span>${active} 活跃 · ${online}/${agents.length} 在线 · ${(ISSUE_ROWS || []).filter((i) => (i.project || "") === p.project && i.status === "open").length} Issue</span></button>`;
+          <span>${activeText} · ${onlineText} · ${issueText}</span></button>`;
       }).join("");
     }
   }
 
-  const subStates = ANALYTICS.submission_states || {};
+  const subStates = analyticsReady ? ANALYTICS.submission_states : null;
+  const subUnknown = !subStates || typeof subStates !== "object";
   const subParts = [
-    { key: "delivered", label: "待取", color: "#6aa9ff", value: Number(subStates.delivered) || 0 },
-    { key: "collected", label: "已取", color: "#56d364", value: Number(subStates.collected) || 0 },
-    { key: "archived", label: "归档", color: "#7d8798", value: Number(subStates.archived) || 0 },
+    { key: "delivered", label: "待取", color: "#6aa9ff", value: subUnknown ? 0 : (Number(subStates.delivered) || 0), unknown: subUnknown },
+    { key: "collected", label: "已取", color: "#56d364", value: subUnknown ? 0 : (Number(subStates.collected) || 0), unknown: subUnknown },
+    { key: "archived", label: "归档", color: "#7d8798", value: subUnknown ? 0 : (Number(subStates.archived) || 0), unknown: subUnknown },
   ];
-  const subTotal = subParts.reduce((a, p) => a + p.value, 0);
-  $("dashSubTotal").textContent = subTotal ? `${subTotal}` : "—";
+  const subTotal = subUnknown ? null : subParts.reduce((a, p) => a + p.value, 0);
+  $("dashSubTotal").textContent = subUnknown ? "—" : `${subTotal}`;
   renderStack($("dashSubBar"), subParts);
   renderLegend($("dashSubLegend"), subParts, "sub");
 
-  const issueStates = ANALYTICS.issue_states || {};
+  const issueStates = analyticsReady ? ANALYTICS.issue_states : null;
+  const issueUnknown = !issueStates || typeof issueStates !== "object";
   const issueParts = [
-    { key: "open", label: "待处理", color: "#d29922", value: Number(issueStates.open) || 0 },
-    { key: "closed", label: "已关闭", color: "#56d364", value: Number(issueStates.closed) || 0 },
-    { key: "merged", label: "已合并", color: "#6aa9ff", value: Number(issueStates.merged) || 0 },
+    { key: "open", label: "待处理", color: "#d29922", value: issueUnknown ? 0 : (Number(issueStates.open) || 0), unknown: issueUnknown },
+    { key: "closed", label: "已关闭", color: "#56d364", value: issueUnknown ? 0 : (Number(issueStates.closed) || 0), unknown: issueUnknown },
+    { key: "merged", label: "已合并", color: "#6aa9ff", value: issueUnknown ? 0 : (Number(issueStates.merged) || 0), unknown: issueUnknown },
   ];
-  const issueTotal = issueParts.reduce((a, p) => a + p.value, 0);
-  $("dashIssueTotal").textContent = issueTotal ? `${issueTotal}` : "—";
+  const issueTotal = issueUnknown ? null : issueParts.reduce((a, p) => a + p.value, 0);
+  $("dashIssueTotal").textContent = issueUnknown ? "—" : `${issueTotal}`;
   renderStack($("dashIssueBar"), issueParts);
   renderLegend($("dashIssueLegend"), issueParts, "issue");
 
   const agentParts = [
-    { key: "work:idle", label: "空闲", color: "#56d364", value: 0 },
-    { key: "work:work", label: "忙碌", color: "#6aa9ff", value: 0 },
-    { key: "work:blocked", label: "阻塞", color: "#d29922", value: 0 },
-    { key: "alive:late", label: "迟到", color: "#d29922", value: 0 },
-    { key: "alive:offline", label: "失联", color: "#f85149", value: 0 },
+    { key: "work:idle", label: "空闲", color: "#56d364", value: 0, unknown: !agentsReady },
+    { key: "work:work", label: "忙碌", color: "#6aa9ff", value: 0, unknown: !agentsReady },
+    { key: "work:blocked", label: "阻塞", color: "#d29922", value: 0, unknown: !agentsReady },
+    { key: "work:other", label: "其他", color: "#8b98a9", value: 0, unknown: !agentsReady },
+    { key: "alive:late", label: "迟到", color: "#d29922", value: 0, unknown: !agentsReady },
+    { key: "alive:offline", label: "失联", color: "#f85149", value: 0, unknown: !agentsReady },
+    { key: "alive:unknown", label: "未知", color: "#8b98a9", value: 0, unknown: !agentsReady },
   ];
-  for (const a of (window._agents || [])) {
-    const work = (a.work || {}).state || "idle";
-    const key = a.alive !== "alive" ? `alive:${a.alive || "offline"}`
-      : (work === "busy" ? "work:work" : work === "blocked" ? "work:blocked" : "work:idle");
-    const p = agentParts.find((x) => x.key === key);
-    if (p) p.value++;
+  if (agentsReady) {
+    for (const a of (window._agents || [])) {
+      const work = String((a.work || {}).state || "");
+      const key = a.alive !== "alive"
+        ? (a.alive === "late" ? "alive:late" : a.alive === "offline" ? "alive:offline" : "alive:unknown")
+        : (work === "busy" ? "work:work"
+            : work === "blocked" ? "work:blocked"
+            : work === "idle" ? "work:idle" : "work:other");
+      const p = agentParts.find((x) => x.key === key);
+      if (p) p.value++;
+    }
   }
   const agentTotal = agentParts.reduce((a, p) => a + p.value, 0);
-  $("dashAgentTotal").textContent = agentTotal ? `${agentTotal} 个` : "—";
-  drawDonut($("dashAgentChart"), agentParts, "节点");
+  $("dashAgentTotal").textContent = agentsReady
+    ? `${AGENTS_PARTIAL ? "≥" : ""}${agentTotal} 个` : "—";
+  drawDonut($("dashAgentChart"), agentParts, "节点", agentsReady ? "暂无数据" : "节点统计不可用");
   renderLegend($("dashAgentLegend"), agentParts, "agent");
 
-  const daily = ANALYTICS.daily || [];
-  const sums = ANALYTICS.totals || {};
-  $("dashTrendTotal").textContent = daily.length
-    ? `${sums.messages ?? 0} 条消息 · ${sums.submissions ?? 0} 交付 · ${sums.issues ?? 0} Issue` : "";
-  drawTrend($("dashTrendChart"), daily);
+  const daily = analyticsReady ? (ANALYTICS.daily || []) : [];
+  const sums = analyticsReady ? (ANALYTICS.totals || {}) : {};
+  $("dashTrendTotal").textContent = !analyticsReady
+    ? "趋势数据不可用"
+    : daily.length
+      ? `${numOrDash(sums.messages)} 条消息 · ${numOrDash(sums.submissions)} 交付 · ${numOrDash(sums.issues)} Issue`
+      : "暂无趋势数据";
+  drawTrend($("dashTrendChart"), daily, analyticsReady ? "暂无活动" : "趋势数据不可用");
   const trendLegend = $("dashTrendLegend");
   if (trendLegend) trendLegend.innerHTML =
     `<span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#6aa9ff"></i>消息</span>
@@ -2555,105 +3017,108 @@ window.addEventListener("resize", () => {
 });
 
 function drawLine(cv, vals, color) {
+  if (!cv) return;
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth || 260, h = cv.clientHeight || 86;
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
-  if (!vals.length) return;
-  const max = Math.max(...vals, 1), min = Math.min(...vals, 0);
+  const points = (vals || []).map((v, i) => ({ v: hasNum(v) ? Number(v) : null, i }))
+    .filter((p) => p.v !== null);
+  if (!points.length) return;
+  const max = Math.max(...points.map((p) => p.v), 1);
+  const min = Math.min(...points.map((p) => p.v), 0);
   g.strokeStyle = color; g.lineWidth = 1.4; g.beginPath();
-  vals.forEach((v, i) => {
-    const x = (i / Math.max(vals.length - 1, 1)) * (w - 8) + 4;
-    const y = h - 6 - ((v - min) / Math.max(max - min, 1)) * (h - 14);
-    i ? g.lineTo(x, y) : g.moveTo(x, y);
-  });
+  let started = false;
+  for (const p of points) {
+    const x = (p.i / Math.max((vals || []).length - 1, 1)) * (w - 8) + 4;
+    const y = h - 6 - ((p.v - min) / Math.max(max - min, 1)) * (h - 14);
+    if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+  }
   g.stroke();
   // 三列窄图里 "now … / max …" 会相互覆盖；当前值和峰值分开贴左右角，小屏也不糊
   g.fillStyle = "#7d8798"; g.font = "9px ui-monospace,monospace"; g.textAlign = "left";
+  const last = points[points.length - 1].v;
   if (w >= 150) {
-    g.fillText(`now ${Math.round(vals[vals.length - 1])} / max ${Math.round(max)}`, 5, 11);
+    g.fillText(`now ${Math.round(last)} / max ${Math.round(max)}`, 5, 11);
   } else {
     // 三列窄图只放当前值；峰值由上方标题承担，避免左右两段文字叠在一起
-    g.fillText(`${Math.round(vals[vals.length - 1])}`, 5, 11);
+    g.fillText(`${Math.round(last)}`, 5, 11);
   }
 }
 
 const TASK_COLORS = { open: "#8b98a9", claimed: "#6aa9ff", released: "#ffd58a", blocked: "#ff9b9b", done: "#86d99e" };
-function drawDonut(cv, parts) {
-  if (!cv) return;
-  const dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth || 240, h = cv.clientHeight || 112;
-  cv.width = w * dpr; cv.height = h * dpr;
-  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
-  const total = parts.reduce((n, p) => n + Math.max(0, p.value), 0);
-  const cx = w / 2, cy = h / 2, r = Math.max(20, Math.min(w / 2 - 18, h / 2 - 8));
-  if (!total) {
-    g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.strokeStyle = "#27313d"; g.lineWidth = 9; g.stroke();
-    g.fillStyle = "#7d8798"; g.font = "11px system-ui,sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
-    g.fillText("暂无任务", cx, cy);
-    return;
-  }
-  let a = -Math.PI / 2;
-  for (const p of parts) {
-    const v = Math.max(0, p.value);
-    if (!v) continue;
-    const sweep = (v / total) * Math.PI * 2;
-    g.beginPath(); g.arc(cx, cy, r, a + 0.015, a + sweep - 0.015);
-    g.strokeStyle = p.color; g.lineWidth = 9; g.stroke();
-    a += sweep;
-  }
-  g.fillStyle = "#e6edf5"; g.font = "700 17px system-ui,sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
-  g.fillText(String(total), cx, cy - 1);
-  g.fillStyle = "#7d8798"; g.font = "10px system-ui,sans-serif";
-  g.fillText("任务", cx, cy + 15);
-}
 
 function fmtLast(ms) {
-  if (!ms) return "—";
+  if (!hasNum(ms)) return "—";
   const age = Math.max(0, Date.now() - Number(ms));
   return age < 86400_000 ? ago(age / 1000) + "前" : new Date(Number(ms)).toLocaleDateString();
 }
 
 function renderAgentWork(d, live) {
   const st = d.stats || {};
-  const n = (x) => Number(x ?? 0);
+  const n = (x) => hasNum(x) ? Number(x) : null;
   const total = n(st.tasks_total), done = n(st.tasks_done), blocked = n(st.tasks_blocked);
-  const claimed = n(st.tasks_claimed), released = n(st.tasks_released);
+  const claimed = n(st.tasks_claimed), released = n(st.tasks_released), failed = n(st.tasks_failed);
   const subTotal = n(st.submissions_total), approved = n(st.submissions_approved);
   const rejected = n(st.submissions_rejected), pending = n(st.submissions_pending);
   const issueTotal = n(st.issues_total), issueOpen = n(st.issues_open);
-  const issueClosed = n(st.issues_closed) + n(st.issues_merged);
-  const rate = total ? Math.round(done / total * 100) : 0;
+  const issueClosedN = n(st.issues_closed), issueMergedN = n(st.issues_merged);
+  const issueClosed = issueClosedN === null || issueMergedN === null ? null : issueClosedN + issueMergedN;
+  const rate = total !== null && done !== null && total > 0 ? Math.round(done / total * 100) : null;
   const alive = live?.alive;
   const statusText = alive === "alive" ? "在线" : alive === "late" ? "迟到" : alive === "offline" ? "离线" : "未上报";
   const lastMs = Number(st.last_active_ms || live?.last_hb_ms || 0);
-  const workText = alive === "alive" ? (live?.work?.phase || live?.work?.state || "空闲")
+  const workState = String(live?.work?.state || "");
+  const workPhase = String(live?.work?.phase || "");
+  const workText = alive === "alive"
+    ? (workPhase && workPhase !== "idle" ? workPhase
+        : workState === "busy" ? "忙碌"
+        : workState === "blocked" ? "阻塞"
+        : workState === "idle" ? "空闲"
+        : (workState || "状态未上报"))
     : (lastMs ? `最后活动 ${fmtLast(lastMs)}` : "无活动记录");
   const card = (k, v, s, cls = "") =>
     `<div class="agentStat ${cls}"><div class="k">${esc(k)}</div><div class="v">${esc(String(v))}</div><div class="s">${esc(s)}</div></div>`;
+  const taskNote = total === null ? "任务统计不可用" : `历史任务 ${total}`;
+  const blockedNote = blocked === null ? "统计不可用"
+    : released === null ? "待取统计不可用"
+    : (released ? `另有 ${released} 条待取` : "无");
+  const deliveryNote = subTotal === null ? "统计不可用"
+    : `待裁决 ${pending ?? "—"} · 拒收 ${rejected ?? "—"}`;
+  const issueNote = issueTotal === null ? "统计不可用" : `open ${issueOpen ?? "—"}`;
   $("dStats").innerHTML = [
     card("状态", statusText, workText, alive === "alive" ? "ok" : alive === "late" ? "warn" : ""),
-    card("执行中", claimed, `历史任务 ${total}`, "accent"),
-    card("已完成", done, `完成率 ${rate}%`, "ok"),
-    card("阻塞", blocked, released ? `另有 ${released} 条待取` : "无", blocked ? "warn" : ""),
-    card("交付通过", `${approved}/${subTotal}`, `待裁决 ${pending} · 拒收 ${rejected}`),
-    card("Issue", `${issueClosed}/${issueTotal}`, `open ${issueOpen}`),
+    card("执行中", claimed ?? "—", taskNote, "accent"),
+    card("已完成", done ?? "—", rate === null ? "完成率 —" : `完成率 ${rate}%`, "ok"),
+    card("阻塞", blocked ?? "—", blockedNote, blocked ? "warn" : ""),
+    card("交付通过", `${approved ?? "—"}/${subTotal ?? "—"}`, deliveryNote),
+    card("Issue", `${issueClosed ?? "—"}/${issueTotal ?? "—"}`, issueNote),
   ].join("");
 
+  const taskUnknown = total === null;
   const parts = [
-    { key: "claimed", label: "执行中", value: claimed, color: TASK_COLORS.claimed },
-    { key: "open", label: "待领取", value: n(st.tasks_open), color: TASK_COLORS.open },
-    { key: "released", label: "待取", value: released, color: TASK_COLORS.released },
-    { key: "blocked", label: "阻塞", value: blocked, color: TASK_COLORS.blocked },
-    { key: "done", label: "已完成", value: done, color: TASK_COLORS.done },
+    { key: "claimed", label: "执行中", value: claimed ?? 0, color: TASK_COLORS.claimed, unknown: taskUnknown },
+    { key: "open", label: "待领取", value: n(st.tasks_open) ?? 0, color: TASK_COLORS.open, unknown: taskUnknown },
+    { key: "released", label: "待取", value: released ?? 0, color: TASK_COLORS.released, unknown: taskUnknown },
+    { key: "blocked", label: "阻塞", value: blocked ?? 0, color: TASK_COLORS.blocked, unknown: taskUnknown },
+    { key: "done", label: "已完成", value: done ?? 0, color: TASK_COLORS.done, unknown: taskUnknown },
+    { key: "failed", label: "死信/失败", value: failed ?? 0, color: "#ff7b72", unknown: taskUnknown },
   ];
-  $("dTaskTotal").textContent = `共 ${total} 条`;
+  const taskList = d.tasks || [];
+  $("dTaskTotal").textContent = total === null ? "统计不可用"
+    : d.stats_available?.tasks === false ? `共 ${total} 条 · 任务列表读取失败`
+    : `共 ${total} 条${total > taskList.length
+        ? (taskList.length ? ` · 列表仅显示最近 ${taskList.length} 条` : " · 列表未返回")
+        : ""}`;
   $("dTaskLegend").innerHTML = parts.map((p) =>
-    `<span><i class="vizDot" style="background:${p.color}"></i>${p.label} <b>${p.value}</b></span>`).join("");
-  drawDonut($("dTaskDonut"), parts);
+    `<span><i class="vizDot" style="background:${p.color}"></i>${p.label} <b>${p.unknown ? "—" : p.value}</b></span>`).join("");
+  drawDonut($("dTaskDonut"), parts, "任务", taskUnknown ? "统计不可用" : "暂无任务");
 
   const bar = (label, value, denom, color) => {
-    const at = denom ? Math.max(0, Math.min(100, Math.round(value / denom * 100))) : 0;
+    if (value === null || denom === null || !denom)
+      return `<div class="workBar"><div class="t"><span>${esc(label)}</span><b>—</b></div>
+        <div class="barTrack"><div class="barFill" style="width:0%;background:${color}"></div></div></div>`;
+    const at = Math.round(value / denom * 100);
     return `<div class="workBar"><div class="t"><span>${esc(label)}</span><b>${value}/${denom}</b></div>
       <div class="barTrack"><div class="barFill" style="width:${at}%;background:${color}"></div></div></div>`;
   };
@@ -2665,6 +3130,7 @@ function renderAgentWork(d, live) {
   ].join("");
 
   const tasks = d.tasks || [];
+  const tasksMissing = d.stats_available?.tasks === false;
   $("dTasks").innerHTML = tasks.length ? tasks.map((t) => {
     const id = t.task_id || t.id || "";
     const to = Array.isArray(t.to) ? t.to : t.to ? [t.to] : [];
@@ -2679,16 +3145,28 @@ function renderAgentWork(d, live) {
       ${t.dispatch_state === "queued" ? `<span class="badge released">排队${Number(t.queue_position || 0) ? ` #${Number(t.queue_position)}` : ""}</span>` : ""}
       ${Number(t.pending_submissions || 0) ? `<span class="warnv">待取 ${Number(t.pending_submissions)}</span>` : ""}
       <span class="when" title="${ts ? new Date(ts).toLocaleString() : ""}">${ts ? ago((Date.now() - ts) / 1000) + "前" : "—"}</span></div>`;
-  }).join("") : `<div class="muted">暂无任务记录</div>`;
+  }).join("") : `<div class="muted">${tasksMissing ? "任务列表读取失败"
+    : (total !== null && total > 0 ? "任务列表未返回" : "暂无任务记录")}</div>`;
+  if (!tasksMissing && tasks.length && total !== null && total > tasks.length)
+    $("dTasks").insertAdjacentHTML("beforeend", `<div class="muted">列表仅显示最近 ${tasks.length} 条</div>`);
 
   const issues = d.issues || [];
-  $("dIssueSummary").textContent = `${issueTotal} 条 · open ${issueOpen}`;
+  const issuesMissing = d.stats_available?.issues === false;
+  $("dIssueSummary").textContent = issueTotal === null
+    ? "统计不可用"
+    : issuesMissing ? `${issueTotal} 条 · Issue 列表读取失败`
+    : `${issueTotal} 条 · open ${issueOpen ?? "—"}${issueTotal > issues.length
+        ? (issues.length ? ` · 列表仅显示最近 ${issues.length} 条` : " · 列表未返回")
+        : ""}`;
   $("dIssues").innerHTML = issues.length ? issues.map((i) => {
     const ts = Number(i.created_at || 0);
     return `<div class="workRow"><span class="badge ${i.status === "open" ? "issue-open" : "issue-closed"}">${esc(i.status)}</span>
       <span class="tid">${esc(i.issue_id)}</span><span class="wtitle">${esc(i.title || "—")}</span>
       <span class="when" title="${ts ? new Date(ts).toLocaleString() : ""}">${ts ? ago((Date.now() - ts) / 1000) + "前" : "—"}</span></div>`;
-  }).join("") : `<div class="muted">暂无上报 Issue</div>`;
+  }).join("") : `<div class="muted">${issuesMissing ? "Issue 列表读取失败"
+    : (issueTotal !== null && issueTotal > 0 ? "Issue 列表未返回" : "暂无上报 Issue")}</div>`;
+  if (!issuesMissing && issues.length && issueTotal !== null && issueTotal > issues.length)
+    $("dIssues").insertAdjacentHTML("beforeend", `<div class="muted">列表仅显示最近 ${issues.length} 条</div>`);
 }
 
 let detailAgent = null;
@@ -2807,24 +3285,29 @@ function openAgent(id, project) {
     }
     renderScopeEditor(scopes);
     fillDetailProjects();
-    drawLine($("cCpu"), hb.map((x) => x.cpu_pct ?? 0), "#6aa9ff");
-    drawLine($("cMem"), hb.map((x) => x.mem_used_mb ?? 0), "#8ee08e");
-    drawLine($("cDisk"), hb.map((x) => x.disk_used_pct ?? 0), "#ffc46a");
-    $("dMsgs").innerHTML = (d.messages || []).slice().reverse().map((m) => {
+    const hbVal = (k) => hb.map((x) => hasNum(x[k]) ? Number(x[k]) : null);
+    drawLine($("cCpu"), hbVal("cpu_pct"), "#6aa9ff");
+    drawLine($("cMem"), hbVal("mem_used_mb"), "#8ee08e");
+    drawLine($("cDisk"), hbVal("disk_used_pct"), "#ffc46a");
+    $("dMsgs").innerHTML = d.messages_available === false
+      ? `<div class="muted">消息读取失败</div>`
+      : ((d.messages || []).slice().reverse().map((m) => {
       const pl = m.payload || {};
       const done = m.kind === "done" || pl.status === "done" || (pl.task && pl.task.state === "done");
       const pend = done ? pendingFor(String(m.sender || "")) : 0;
       const text = String(messageText(m));   // messageText 已经过 deepEsc；这里不能再 esc 一次
       const kindLabel = m.kind === "released"
-        ? `已交付 · 待取 ${pl.pending_submissions ?? ""}`.trim()
+        ? (`已交付${hasNum(pl.pending_submissions) ? ` · 待取 ${Number(pl.pending_submissions)}` : ""}`)
         : (done && pend ? "完成待取" : (m.kind || ""));
       return `<div class="row"><span class="muted">#${m.seq}</span><span>${m.topic || ""}${kindLabel ? ` · ${kindLabel}` : ""}</span>
         <span class="mono">${m.sender || ""}${m.to ? " → " + m.to : (["ack", "report"].includes(m.topic || "") ? " → 管理端" : "")}</span>
         <span class="muted" title="${text}">${text.slice(0, 46)}${pend
           ? ` <span class="warnv">· 交付待取 ${pend}</span>` : ""}</span>
-        <span class="muted" style="margin-left:auto">${m.at ? new Date(m.at).toLocaleTimeString() : ""}</span></div>`;
-    }).join("") || `<div class="muted">暂无</div>`;
-    $("dSubs").innerHTML = (d.submissions || []).map((x) => `
+        <span class="muted" style="margin-left:auto">${hasNum(m.at) ? new Date(Number(m.at)).toLocaleTimeString() : ""}</span></div>`;
+    }).join("") || `<div class="muted">暂无</div>`);
+    const subsMissing = d.stats_available?.submissions === false;
+    const subTotal = hasNum(d.stats?.submissions_total) ? Number(d.stats.submissions_total) : null;
+    $("dSubs").innerHTML = subsMissing ? `<div class="muted">交付列表读取失败</div>` : (d.submissions || []).map((x) => `
       <div class="row subrow"><span class="mono subid">${x.submission_id}</span><span>${x.kind}</span>
         <span class="badge ${x.state}">${x.state}</span>
         <span class="badge ${x.review_state || "pending"}">${{pending:"待裁决",accepted:"已收待批",approved:"已批准",rejected:"已拒收"}[x.review_state || "pending"] || "待裁决"}</span>
@@ -2832,11 +3315,26 @@ function openAgent(id, project) {
         ${x.state === "delivered"
           ? `<button class="ghost" data-collect="${x.submission_id}">下载并取走</button>`
           : `<button class="ghost" data-dl="${x.submission_id}">下载</button>`}
-        <span class="muted" style="margin-left:auto">${new Date(x.created_at).toLocaleString()}</span></div>`).join("")
-      || `<div class="muted">暂无</div>`;
+        <span class="muted" style="margin-left:auto">${hasNum(x.created_at) ? new Date(Number(x.created_at)).toLocaleString() : "—"}</span></div>`).join("")
+      || `<div class="muted">${subTotal !== null && subTotal > 0 ? "交付列表未返回" : "暂无"}</div>`;
+    if (!subsMissing && (d.submissions || []).length && subTotal !== null
+        && subTotal > (d.submissions || []).length)
+      $("dSubs").insertAdjacentHTML("beforeend", `<div class="muted">${(d.submissions || []).length
+        ? `列表仅显示最近 ${(d.submissions || []).length} 条`
+        : "列表未返回"}</div>`);
     // 详情页的下载按钮也要知道状态，否则会漏掉"下载即取走"
     (d.submissions || []).forEach((x) => SUB_STATE.set(x.submission_id, x.state));
-  }).catch((e) => { $("dMeta").textContent = "加载失败：" + e.message; setDetailReady(false); });
+  }).catch((e) => {
+    $("dMeta").textContent = "加载失败：" + e.message;
+    $("dStats").innerHTML = `<div class="muted">详情读取失败，无法显示统计</div>`;
+    $("dTaskTotal").textContent = "统计不可用";
+    $("dIssueSummary").textContent = "统计不可用";
+    $("dTasks").innerHTML = `<div class="muted">详情读取失败</div>`;
+    $("dIssues").innerHTML = `<div class="muted">详情读取失败</div>`;
+    $("dSubs").innerHTML = `<div class="muted">详情读取失败</div>`;
+    $("dMsgs").innerHTML = `<div class="muted">详情读取失败</div>`;
+    setDetailReady(false);
+  });
 }
 
 
@@ -3162,12 +3660,19 @@ function bindFilters() {
         { v: "alive:alive", label: "在线" },
         { v: "alive:late", label: "迟到" },
         { v: "alive:offline", label: "失联" },
+        { v: "alive:unknown", label: "未知" },
         { v: "work:work", label: "忙" },
         { v: "work:idle", label: "闲" },
         { v: "work:blocked", label: "阻塞" },
+        { v: "work:other", label: "其他进行态" },
       ],
       test: (row, v) => {
         if (v === "all") return true;
+        if (v === "alive:unknown")
+          return !["alive", "late", "offline"].includes(row.dataset.alive || "");
+        if (v === "work:other")
+          return (row.dataset.alive || "") === "alive"
+            && !["idle", "busy", "blocked"].includes(row.dataset.work || "");
         const [k, want] = v.split(":");
         return (row.dataset[k] || "") === want;
       },
@@ -3426,7 +3931,19 @@ async function loadMsgs() {
   const project = current;
   if (project === "*") return;
   let d;
-  try { d = await api(`/admin/p/${project}/messages?limit=120`); } catch { return; }
+  try {
+    d = await api(`/admin/p/${project}/messages?limit=120`);
+    if (!d || !Array.isArray(d.messages)) throw new Error("bad messages payload");
+  } catch (e) {
+    if (current !== project) return;
+    if (e instanceof AuthError) throw e;
+    console.warn("[hub] messages failed", e);
+    $("msgStat").textContent = "消息读取失败";
+    $("msgs").innerHTML = `<tr><td colspan="6" class="empty">消息读取失败，请稍后重试</td></tr>`;
+    BADGES.msg = 0;
+    updateBadges();
+    return;
+  }
   if (current !== project) return;
   const rows = (d.messages || []).slice().reverse();
   MSG_MAX = rows.reduce((a, m) => Math.max(a, m.seq || 0), 0);
@@ -3449,7 +3966,7 @@ async function loadMsgs() {
       <td class="muted">${m.to ? `<b>${m.to}</b>` : (["ack", "report"].includes(m.topic || "") ? "管理端" : "广播")}</td>
       <td class="muted" title="${txt}">${txt.slice(0, 60)}${pending
         ? ` <span class="warnv">· 该 agent 还有 ${pending} 份交付待取</span>` : ""}</td>
-      <td class="muted">${(m.ts || m.at) ? new Date(m.ts || m.at).toLocaleTimeString() : "—"}</td>
+      <td class="muted">${hasNum(m.ts || m.at) ? new Date(Number(m.ts || m.at)).toLocaleTimeString() : "—"}</td>
     </tr>
     <tr class="msgDetail" data-msg-detail="${m.seq}" hidden>
       <td colspan="6"><pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">${JSON.stringify(m, null, 2)}</pre></td>
@@ -3460,40 +3977,98 @@ async function loadMsgs() {
 
 async function loadStats(fresh = false) {
   if (!current) return;
-  const d = await api("/admin/stats" + (fresh ? "?fresh=1" : "")).catch(() => null);
-  if (!d) return;
-  const sub = d.submissions || {};
-  const issue = d.issues || {};
-  const total = Object.values(sub).reduce((a, b) => a + b, 0);
+  const scope = current;
+  const qs = new URLSearchParams();
+  if (scope !== "*") qs.set("project", scope);
+  if (fresh) qs.set("fresh", "1");
+  let d;
+  try {
+    d = await api("/admin/stats" + (qs.toString() ? `?${qs}` : ""));
+    if (!d || typeof d !== "object") throw new Error("bad stats payload");
+  } catch (e) {
+    if (scope !== current) return;
+    STATS_STATE = STATS_DATA ? "stale" : "error";
+    renderStats();
+    return;
+  }
+  if (scope !== current) return;
+  STATS_DATA = d || {};
+  STATS_STATE = "ready";
+  renderStats();
+}
+
+function renderStats() {
+  const host = $("stats");
+  if (!host) return;
+  if (!STATS_DATA) {
+    host.innerHTML = `<div class="stat"><div class="k">${STATS_STATE === "error" ? "统计不可用" : "加载中"}</div><div class="v">—</div></div>`;
+    $("ovAt").textContent = STATS_STATE === "error" ? "读取失败" : "—";
+    return;
+  }
+  const d = STATS_DATA;
+  const subKnown = d.submissions && typeof d.submissions === "object";
+  const sub = subKnown ? d.submissions : {};
+  const issue = d.issues && typeof d.issues === "object" ? d.issues : {};
+  const subVals = Object.values(sub).filter(hasNum).map(Number);
+  const total = subKnown ? subVals.reduce((a, b) => a + b, 0) : "—";
+  // 名册加载成功时，顶部在线数与名册使用同一 2 分钟 alive 口径；未加载时才退回
+  // 服务端 hb_hist 的“近 5–10 分钟心跳”数，并把标签写清楚。
+  const onlineRaw = AGENTS_LOADED
+    ? (window._agents || []).filter((a) => a.alive === "alive").length
+    : d.agents_online;
+  const onlineText = AGENTS_LOADED && AGENTS_PARTIAL ? `≥${numOrDash(onlineRaw)}` : numOrDash(onlineRaw);
+  const onlineNote = AGENTS_LOADED
+    ? (AGENTS_PARTIAL ? `${AGENTS_PARTIAL} 个项目未加载` : "")
+    : (hasNum(d.agents_online) ? "近 5–10 分钟心跳" : "统计不可用");
+  const issueNote = `关闭 ${numOrDash(issue.closed)} · 合并 ${numOrDash(issue.merged)}`;
   const items = [
-    ["在线 agent", d.agents_online ?? 0, "", "ok"],
-    ["注册 agent", d.agents_active ?? 0],
-    ["24h 有心跳", d.agents_heartbeat_24h ?? 0],
-    ["待审注册", d.enrollments_pending ?? 0, "", "warn"],
-    ["项目", d.projects ?? 0],
-    ["交付", total, `待取 ${sub.delivered ?? 0}`, "accent"],
-    ["Issue", issue.open ?? 0, `关闭 ${issue.closed ?? 0}`, "warn"],
+    ["在线 agent", onlineText, onlineNote, "ok"],
+    ["注册 agent", numOrDash(d.agents_active)],
+    ["24h 有心跳", numOrDash(d.agents_heartbeat_24h)],
+    ["待审注册", numOrDash(d.enrollments_pending), d.scope === "*" ? "全部项目" : "当前项目", "warn"],
+    ["项目", numOrDash(d.projects)],
+    ["交付", numOrDash(total), `待取 ${numOrDash(subKnown ? sub.delivered : undefined)}`, "accent"],
+    ["Issue (open)", numOrDash(issue.open), issueNote, "warn"],
   ];
-  $("stats").innerHTML = items.map(([k, v, note, cls]) =>
+  host.innerHTML = items.map(([k, v, note, cls]) =>
     `<div class="stat${cls ? " " + cls : ""}"><div class="k">${k}</div><div class="v">${v}${note ? `<span class="sub">${note}</span>` : ""}</div></div>`).join("");
-  $("ovAt").textContent = new Date(d.at).toLocaleTimeString();
+  const at = d.generated_at ?? d.at;
+  const stamp = hasNum(at) ? new Date(Number(at)).toLocaleTimeString() : "—";
+  const scopeText = d.scope === "*" ? "全部项目" : (d.scope || current);
+  $("ovAt").textContent = STATS_STATE === "stale"
+    ? `${stamp} · ${scopeText} · 上次成功，刷新失败`
+    : `${stamp} · ${scopeText}${d.cached ? " · 缓存" : ""}`;
 }
 
 async function loadAnalytics(fresh = false) {
   if (!current) return;
   const scope = current;
+  if (ANALYTICS_STATE !== "ready") {
+    ANALYTICS_STATE = "loading";
+    renderDashboard();
+  }
   const qs = new URLSearchParams();
   if (scope !== "*") qs.set("project", scope);
   if (fresh) qs.set("fresh", "1");
   const q = qs.toString() ? `?${qs.toString()}` : "";
-  const d = await api("/admin/analytics" + q).catch((e) => {
+  try {
+    const d = await api("/admin/analytics" + q);
+    if (scope !== current) return;
+    if (!d || typeof d !== "object" || !Array.isArray(d.daily)
+      || !d.submission_states || typeof d.submission_states !== "object"
+      || !d.issue_states || typeof d.issue_states !== "object")
+      throw new Error("empty analytics response");
+    ANALYTICS = d;
+    ANALYTICS_STATE = "ready";
+    renderDashboard();
+  } catch (e) {
     if (e instanceof AuthError) throw e;
+    if (scope !== current) return;
     console.warn("[hub] analytics failed", e);
-    return null;
-  });
-  if (!d || scope !== current) return;
-  ANALYTICS = d;
-  renderDashboard();
+    ANALYTICS = {};
+    ANALYTICS_STATE = "error";
+    renderDashboard();
+  }
 }
 
 function setProjectPanels(enabled) {
@@ -3515,9 +4090,9 @@ function setProjectPanels(enabled) {
   }
   // 全部项目只做聚合总览；涉及写操作/交付/消息的卡片必须回到具体项目。
   $("taskStat").textContent = "加载全部项目任务…";
-  $("tasks").innerHTML = `<tr><td colspan="7" class="empty">加载全部项目任务…</td></tr>`;
+  $("tasks").innerHTML = `<tr><td colspan="8" class="empty">加载全部项目任务…</td></tr>`;
   $("subStat").textContent = "全部项目视图不汇总";
-  $("subs").innerHTML = `<tr><td colspan="7" class="empty">选择具体项目查看交付箱</td></tr>`;
+  $("subs").innerHTML = `<tr><td colspan="8" class="empty">选择具体项目查看交付箱</td></tr>`;
   $("msgStat").textContent = "";
   $("msgs").innerHTML = `<tr><td colspan="6" class="empty">选择具体项目查看消息流</td></tr>`;
   $("sndWho").innerHTML = "";
@@ -3531,8 +4106,12 @@ function setProjectPanels(enabled) {
   BADGES.task = 0;
   updateBadges();
   TASK_ROWS = [];
+  TASK_LOADED = false;
+  TASK_PARTIAL = 0;
+  TASK_FAILED_PROJECTS = [];
   SUB_ROWS = [];
   SUB_STATE = new Map();
+  SUB_COUNTS = null;
   lastPending = null;
   const ov = $("detail");
   if (ov) { ov.hidden = true; ov.style.display = ""; document.body.classList.remove("has-sheet"); }
@@ -3583,16 +4162,10 @@ async function refresh(forceFresh = false) {
 }
 
 $("proj").onchange = (e) => {
-  current = e.target.value;
-  try { localStorage.setItem("hub.project", current); } catch {}
-  updateScopeLabel();
-  lastPending = null;
-  SUB_ROWS = [];
-  SUB_STATE = new Map();
-  ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
-  fillDetailProjects();
+  const next = e.target.value;
+  if (!next || next === current) return;
+  activateProject(next);
   refresh();
-  connectLive();
 };
 // 消息流：点一行展开完整 payload；筛选时不把展开行计入
 const msgTable = $("msgs");

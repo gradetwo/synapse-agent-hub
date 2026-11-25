@@ -18,7 +18,7 @@ const OBSERVER_SCOPES = ["poll", "heartbeat", "tasks.read", "issues.read", "subm
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
 const BUILD_TAG = "events-visibility-20261125";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
-const SDK_VERSION = "0.5.9";
+const SDK_VERSION = "0.5.10";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -879,39 +879,63 @@ async function admin(req: Request, env: Env, url: URL) {
   if (path === "/admin/stats" && req.method === "GET") {
     const now = Date.now();
     const fresh = url.searchParams.get("fresh") === "1";
+    const project = String(url.searchParams.get("project") ?? "").trim();
+    const policy = await loadPolicy(env);
+    const allRows = (await env.DB.prepare(
+      "SELECT project FROM projects WHERE status='active' ORDER BY created_at"
+    ).all<any>()).results.map((r: any) => String(r.project));
+    let visible = policy.mode === "all" ? allRows : allRows.filter((p) => (policy.projects || []).includes(p));
+    if (project) {
+      if (!/^[a-z0-9-]{2,40}$/.test(project)) return err(422, "bad_project");
+      if (!visible.includes(project)) return err(403, "project_not_visible");
+      visible = [project];
+    }
+    // 统计卡必须和其它管理台列表使用同一套可见项目口径；全局视图不能把
+    // policy 隐藏或已归档的项目算进来，否则顶部“项目/交付/Issue”会和列表对不上。
+    const scope = project || "*";
+    const cacheKey = project ? `p:${project}` : `g:${policy.mode}:${visible.join(",")}`;
     if (!fresh) {
-      const cached = cacheGet(STATS_CACHE, "global", 180_000);
+      const cached = cacheGet(STATS_CACHE, cacheKey, 180_000);
       if (cached) return json({ ...cached, at: now, cached: true });
     }
-    const pr = await env.DB.prepare("SELECT COUNT(*) AS n FROM projects WHERE status='active'").first<any>();
+    const inSql = visible.length
+      ? ` AND project IN (${visible.map(() => "?").join(",")})`
+      : " AND 0";
+    const args = visible.length ? [...visible] : [];
+    const sub = await env.DB.prepare(
+      "SELECT state, COUNT(*) AS n FROM submissions WHERE 1=1" + inSql + " GROUP BY state"
+    ).bind(...args).all<any>();
+    const issue = await env.DB.prepare(
+      "SELECT status, COUNT(*) AS n FROM issues WHERE 1=1" + inSql + " GROUP BY status"
+    ).bind(...args).all<any>();
     const ag = await env.DB.prepare(
-      "SELECT COUNT(*) AS n FROM agents WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)"
-    ).bind(now).first<any>();
-    const sub = await env.DB.prepare("SELECT state, COUNT(*) AS n FROM submissions GROUP BY state").all<any>();
-    const issue = await env.DB.prepare("SELECT status, COUNT(*) AS n FROM issues GROUP BY status").all<any>();
-    const enr = await env.DB.prepare("SELECT COUNT(*) AS n FROM enrollments WHERE status='pending'").first<any>();
+      "SELECT COUNT(*) AS n FROM agents WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)" + inSql
+    ).bind(now, ...args).first<any>();
+    const enr = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM enrollments WHERE status='pending'" + inSql
+    ).bind(...args).first<any>();
     const hb = await env.DB.prepare(
-      "SELECT COUNT(DISTINCT project || ':' || agent_id) AS n FROM hb_hist WHERE bucket > ?"
-    ).bind(Math.floor(now / 300000) - 288).first<any>();
+      "SELECT COUNT(DISTINCT project || ':' || agent_id) AS n FROM hb_hist WHERE bucket > ?" + inSql
+    ).bind(Math.floor(now / 300000) - 288, ...args).first<any>();
     const perProj = await env.DB.prepare(
       `SELECT project, COUNT(*) AS agents FROM agents
-        WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
-        GROUP BY project ORDER BY project`
-    ).bind(now).all<any>();
+        WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)` + inSql +
+      ` GROUP BY project ORDER BY project`
+    ).bind(now, ...args).all<any>();
     const online = await env.DB.prepare(
-      "SELECT COUNT(DISTINCT project || ':' || agent_id) AS n FROM hb_hist WHERE bucket >= ?"
-    ).bind(Math.floor(now / 300000) - 1).first<any>();
+      "SELECT COUNT(DISTINCT project || ':' || agent_id) AS n FROM hb_hist WHERE bucket >= ?" + inSql
+    ).bind(Math.floor(now / 300000) - 1, ...args).first<any>();
     const payload = {
-      projects: pr?.n ?? 0,
+      projects: visible.length,
       agents_online: online?.n ?? 0,
       agents_active: ag?.n ?? 0, enrollments_pending: enr?.n ?? 0,
       agents_heartbeat_24h: hb?.n ?? 0,
       submissions: Object.fromEntries(sub.results.map((r: any) => [r.state, Number(r.n ?? 0)])),
       issues: Object.fromEntries(issue.results.map((r: any) => [r.status, Number(r.n ?? 0)])),
       per_project: perProj.results,
-      at: now,
+      scope, generated_at: now, at: now, cached: false,
     };
-    cacheSet(STATS_CACHE, "global", payload);
+    cacheSet(STATS_CACHE, cacheKey, payload);
     return json(payload);
   }
 
@@ -1005,27 +1029,54 @@ async function admin(req: Request, env: Env, url: URL) {
       .map((r) => r.project as string)
       .filter((p) => policy.mode === "all" || (policy.projects || []).includes(p));
     const agents: any[] = [];
+    let projectsOk = 0;
+    const failedProjects: string[] = [];
     for (const project of visible) {
       try {
-        const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+        const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.IDFromName("v9:" + project));
         const r = await stub.fetch(new Request("https://do/agent/list"));
-        const d = await r.json<any>().catch(() => ({ agents: [] }));
-        for (const a of (Array.isArray(d.agents) ? d.agents : [])) agents.push({ ...a, project });
-      } catch { /* 单个项目的 DO 抖动不影响其它项目的总览 */ }
+        const d = await r.json<any>().catch(() => null);
+        if (!r.ok) throw new Error(`agent_list_${r.status}`);
+        if (!d || !Array.isArray(d.agents)) throw new Error("agent_list_bad_payload");
+        for (const a of d.agents) agents.push({ ...a, project });
+        projectsOk++;
+      } catch { failedProjects.push(project); /* 单个项目的 DO 抖动不影响其它项目的总览，但必须让前端知道少了一个项目 */ }
     }
     agents.sort((a, b) =>
       String(a.project ?? "").localeCompare(String(b.project ?? "")) ||
       String(a.agent_id ?? "").localeCompare(String(b.agent_id ?? "")));
-    return json({ agents, at: Date.now() });
+    const projectsFailed = visible.length - projectsOk;
+    return json({ agents, at: Date.now(), projects_total: visible.length,
+                  projects_ok: projectsOk, projects_failed: projectsFailed,
+                  projects_failed_names: failedProjects, partial: projectsFailed > 0 });
   }
 
   if (path === "/admin/enrollments" && req.method === "GET") {
+    const policy = await loadPolicy(env);
+    const active = (await env.DB.prepare(
+      "SELECT project FROM projects WHERE status='active' ORDER BY created_at"
+    ).all<any>()).results.map((r: any) => String(r.project));
+    const visible = policy.mode === "all" ? active : active.filter((p) => (policy.projects || []).includes(p));
+    const inSql = visible.length ? ` AND project IN (${visible.map(() => "?").join(",")})` : " AND 0";
+    const args = visible.length ? [...visible] : [];
     const rows = await env.DB.prepare(
       `SELECT id, project, agent_id, scopes, machine, created_at, status, code
-         FROM enrollments WHERE status IN ('pending','approved','rejected')
-        ORDER BY created_at DESC LIMIT 50`
-    ).all();
-    return json({ enrollments: rows.results });
+         FROM enrollments WHERE status IN ('pending','approved','rejected')` + inSql +
+      ` ORDER BY created_at DESC LIMIT 50`
+    ).bind(...args).all();
+    const countRows = await env.DB.prepare(
+      `SELECT status, COUNT(*) AS n FROM enrollments
+        WHERE status IN ('pending','approved','rejected')` + inSql + ` GROUP BY status`
+    ).bind(...args).all<any>();
+    const counts: Record<string, number> = { pending: 0, approved: 0, rejected: 0, total: 0 };
+    for (const r of countRows.results ?? []) {
+      const k = String(r.status ?? "");
+      const n = Number(r.n ?? 0);
+      if (k in counts) counts[k] = n;
+      counts.total += n;
+    }
+    return json({ enrollments: rows.results, counts, total: counts.total, limit: 50,
+                  returned: rows.results.length, truncated: counts.total > rows.results.length });
   }
   const em = path.match(/^\/admin\/enrollments\/([a-f0-9]{16})\/(approve|reject)$/);
   if (em && req.method === "POST") {
@@ -1189,8 +1240,10 @@ async function admin(req: Request, env: Env, url: URL) {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ project }),
       })).catch(() => null);
-      const d: any = r && r.ok ? await r.json().catch(() => ({ agents: [] })) : { agents: [] };
-      return json({ config, agents: config.enabled ? (d.agents ?? []) : [] });
+      const d: any = r && r.ok ? await r.json().catch(() => null) : null;
+      const listError = !r || !r.ok || !d || !!d.error || !Array.isArray(d.agents);
+      return json({ config, agents: config.enabled && !listError ? d.agents : [],
+                    list_error: listError, list_error_detail: d?.error ?? null });
     }
     if (action === "idle" && (req.method === "POST" || req.method === "PUT")) {
       const b: any = await req.json().catch(() => ({}));
@@ -1565,19 +1618,29 @@ async function admin(req: Request, env: Env, url: URL) {
         `SELECT agent_id,role,scopes,created_at,expires_at,revoked_at FROM agents
          WHERE project=? AND agent_id=? AND revoked_at IS NULL
          ORDER BY created_at DESC LIMIT 1`).bind(project, id).first();
-      const inbox: any = await (await stub.fetch(new Request(
-        `https://do/inbox?since=0&limit=200&agent=*&desc=1`))).json().catch(() => ({ messages: [] }));
+      let inbox: any = { messages: [] };
+      let messagesAvailable = false;
+      try {
+        const ir = await stub.fetch(new Request(`https://do/inbox?since=0&limit=200&agent=*&desc=1`));
+        const idata: any = await ir.json();
+        if (!ir.ok || !idata || !Array.isArray(idata.messages)) throw new Error("inbox_bad_payload");
+        inbox = idata;
+        messagesAvailable = true;
+      } catch { /* 消息读取失败时不要渲染成“暂无消息” */ }
       const msgs = (inbox.messages ?? []).filter((m: any) =>
         m.sender === id || (Array.isArray(m.to) ? m.to.includes(id) : m.to === id)).slice(-30);
 
       // 任务履历：owner（做过）、to（定向给它但还没 claim）、released_by（做完释放）、
       // reassigned_from/reclaimed_from（转派/取回前的负责人）并集；按更新时间倒序保留 60 条。
       let allTasks: any[] = [];
+      let tasksKnown = false;
       try {
         const tr = await stub.fetch(new Request("https://do/tasks/list"));
         const td: any = await tr.json();
-        allTasks = Array.isArray(td.tasks) ? td.tasks : [];
-      } catch { /* 名册/任务列表读不到时，详情仍应显示曲线与提交 */ }
+        if (!tr.ok || !td || !Array.isArray(td.tasks)) throw new Error("task_list_bad_payload");
+        allTasks = td.tasks;
+        tasksKnown = true;
+      } catch { /* 任务列表读不到时，详情仍应显示曲线与提交，但任务统计必须标未知 */ }
       const touches = (t: any) => {
         const to = Array.isArray(t.to) ? t.to : t.to ? [t.to] : [];
         return t.owner === id || to.includes(id) || t.released_by === id
@@ -1593,7 +1656,7 @@ async function admin(req: Request, env: Env, url: URL) {
         `SELECT COUNT(*) total,
                 SUM(CASE WHEN review_state='approved' THEN 1 ELSE 0 END) approved,
                 SUM(CASE WHEN review_state='rejected' THEN 1 ELSE 0 END) rejected,
-                SUM(CASE WHEN review_state='pending' THEN 1 ELSE 0 END) pending
+                SUM(CASE WHEN review_state IN ('pending','accepted') THEN 1 ELSE 0 END) pending
            FROM submissions WHERE project=? AND agent_id=?`
       ).bind(project, id).first().catch(() => null);
       const issueStats: any = await env.DB.prepare(
@@ -1611,35 +1674,43 @@ async function admin(req: Request, env: Env, url: URL) {
         `SELECT last_active_ms,idle_since_ms,reminded_at,flagged_at FROM agent_idle
           WHERE project=? AND agent_id=?`
       ).bind(project, id).first().catch(() => null);
-      const num = (x: any) => Number(x ?? 0);
+      const num = (x: any) => x === null || x === undefined ? null : Number(x);
+      const num0 = (x: any) => Number(x ?? 0);
       return json({
         agent: ag,
         hb: hb.results ?? [],
         submissions: subs.results ?? [],
         messages: msgs,
-        tasks: tasks.slice(0, 60),
+        messages_available: messagesAvailable,
+        tasks: tasksKnown ? tasks.slice(0, 60) : [],
         issues: issues.results ?? [],
+        stats_available: {
+          tasks: tasksKnown,
+          submissions: !!subStats,
+          issues: !!issueStats,
+        },
         idle: idle ? {
-          last_active_ms: num(idle.last_active_ms),
-          idle_since_ms: num(idle.idle_since_ms),
-          reminded_at: num(idle.reminded_at),
-          flagged_at: num(idle.flagged_at),
+          last_active_ms: num0(idle.last_active_ms),
+          idle_since_ms: num0(idle.idle_since_ms),
+          reminded_at: num0(idle.reminded_at),
+          flagged_at: num0(idle.flagged_at),
         } : null,
         stats: {
-          tasks_total: tasks.length,
-          tasks_open: taskState.open,
-          tasks_claimed: taskState.claimed,
-          tasks_released: taskState.released,
-          tasks_blocked: taskState.blocked,
-          tasks_done: taskState.done,
+          tasks_total: tasksKnown ? tasks.length : null,
+          tasks_open: tasksKnown ? taskState.open : null,
+          tasks_claimed: tasksKnown ? taskState.claimed : null,
+          tasks_released: tasksKnown ? taskState.released : null,
+          tasks_blocked: tasksKnown ? taskState.blocked : null,
+          tasks_done: tasksKnown ? taskState.done : null,
+          tasks_failed: tasksKnown ? (taskState.failed ?? 0) : null,
           submissions_total: num(subStats?.total),
-          submissions_approved: num(subStats?.approved),
-          submissions_rejected: num(subStats?.rejected),
-          submissions_pending: num(subStats?.pending),
-          issues_total: num(issueStats?.total),
-          issues_open: num(issueStats?.open),
-          issues_closed: num(issueStats?.closed),
-          issues_merged: num(issueStats?.merged),
+          submissions_approved: subStats ? Number(subStats.approved ?? 0) : null,
+          submissions_rejected: subStats ? Number(subStats.rejected ?? 0) : null,
+          submissions_pending: subStats ? Number(subStats.pending ?? 0) : null,
+          issues_total: issueStats ? Number(issueStats.total ?? 0) : null,
+          issues_open: issueStats ? Number(issueStats.open ?? 0) : null,
+          issues_closed: issueStats ? Number(issueStats.closed ?? 0) : null,
+          issues_merged: issueStats ? Number(issueStats.merged ?? 0) : null,
           last_active_ms: idle?.last_active_ms ?? null,
           idle_since_ms: idle?.idle_since_ms ?? null,
         },
@@ -2181,6 +2252,7 @@ async function listSubmissions(env: Env, project: string, url: URL, full = false
   const state = url.searchParams.get("state") ?? "";
   const taskId = url.searchParams.get("task_id") ?? "";
   const review = url.searchParams.get("review_state") ?? "";
+  const withCounts = url.searchParams.get("counts") === "1";
   const valid = ["delivered", "collected", "archived"].includes(state);
   const validReview = ["pending", "accepted", "approved", "rejected"].includes(review);
   const cond = ["project = ?"];
@@ -2193,7 +2265,30 @@ async function listSubmissions(env: Env, project: string, url: URL, full = false
   const rows = await env.DB.prepare(
     `SELECT ${cols} FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
   ).bind(...vals).all();
-  return Response.json(rows.results);
+  if (!withCounts) return Response.json(rows.results);
+  // 交付箱的“共 N / 待取 / 待裁决”必须基于全量计数，不能拿 LIMIT 100 的行数冒充总数。
+  const all = await env.DB.prepare(
+    `SELECT state, review_state, COUNT(*) AS n FROM submissions WHERE ${cond.join(" AND ")} GROUP BY state, review_state`
+  ).bind(...vals).all<any>();
+  const byState: Record<string, number> = {};
+  const byReview: Record<string, number> = {};
+  let total = 0, delivered = 0, pendingReview = 0;
+  for (const r of all.results ?? []) {
+    const st = String(r.state ?? "");
+    const rv = String(r.review_state ?? "pending");
+    const n = Number(r.n ?? 0);
+    total += n;
+    byState[st] = (byState[st] ?? 0) + n;
+    if (st !== "archived") byReview[rv] = (byReview[rv] ?? 0) + n;
+    if (st === "delivered") delivered += n;
+    if (st !== "archived" && (rv === "pending" || rv === "accepted")) pendingReview += n;
+  }
+  return Response.json({
+    submissions: rows.results,
+    total, delivered, pending_review: pendingReview,
+    by_state: byState, by_review: byReview,
+    limit: 100, returned: rows.results.length, truncated: total > rows.results.length,
+  });
 }
 
 async function bundleSubmission(env: Env, project: string, id: string) {
@@ -2925,7 +3020,7 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
       : { ok: false, status: out.status, error: out.error };
   }
 
-  // 让管理台 WS 立即刷新 Issue tab；普通 agent 看不到这条广播（send 方不是 admin）。
+  // 让管理台 WS 立即刷新 Issue tab；这是无收件人的项目广播，普通 agent 不再可见。
   // 消息写入失败不影响已经落库的 issue。
   let seq: number | null = null;
   try {

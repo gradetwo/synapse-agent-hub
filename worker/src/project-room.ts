@@ -109,8 +109,18 @@ function utf8Bytes(text: string): number {
 
 export class ProjectRoom implements DurableObject {
   private st: DurableObjectStorage;
+  // DO 单线程不等于请求不会在 await 处交错：同一 agent 的“读在途计数→发下一条”
+  // 必须串行，否则两个 createTask 同时看到 0 在途，会把两条任务一起灌进同一个窗口。
+  private dispatchGate: Promise<unknown> = Promise.resolve();
   constructor(private state: DurableObjectState, private env: Env) {
     this.st = state.storage;
+  }
+
+  private serializeDispatch<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.dispatchGate;
+    let release!: () => void;
+    this.dispatchGate = new Promise<void>((resolve) => { release = resolve; });
+    return previous.then(fn).finally(release);
   }
 
   /** claim 租约：优先读 LEASE_TTL_S（秒），缺省/非法时 12 小时。 */
@@ -200,8 +210,13 @@ export class ProjectRoom implements DurableObject {
   }
 
   /** 把任务写入派发状态并发一条任务消息；没有槽位时只入队，不发消息。
-   *  这是“服务端单飞”的核心：窗口客户端不需要自己猜 TUI 是否在忙。 */
-  private async dispatchTaskOrQueue(project: string, t: any, extra: any = {}): Promise<any> {
+   *  这是“服务端单飞”的核心：窗口客户端不需要自己猜 TUI 是否在忙。
+   *  dispatchGate 保证“查在途→发任务”是原子的，避免并发创建时两条同时下发。 */
+  private dispatchTaskOrQueue(project: string, t: any, extra: any = {}): Promise<any> {
+    return this.serializeDispatch(() => this.dispatchTaskOrQueueUnlocked(project, t, extra));
+  }
+
+  private async dispatchTaskOrQueueUnlocked(project: string, t: any, extra: any = {}): Promise<any> {
     if (!t?.to) return { notified: false, max_parallel: 0 };
     const max = await this.agentMaxParallel(t.to);
     const inFlight = await this.directedInFlight(t.to);
@@ -244,8 +259,13 @@ export class ProjectRoom implements DurableObject {
     return { notified: true, dispatch_state: "notified", seq, max_parallel: max };
   }
 
-  /** 释放一个槽位后，按优先级/截止/老化补发队列里的任务，直到达到并发上限。 */
-  private async promoteQueue(project: string, agentId: string | null | undefined): Promise<any[]> {
+  /** 释放一个槽位后，按优先级/截止/老化补发队列里的任务，直到达到并发上限。
+   *  与 dispatchTaskOrQueue 共用同一把派单锁，保证补位和新建不会并发越过单飞上限。 */
+  private promoteQueue(project: string, agentId: string | null | undefined): Promise<any[]> {
+    return this.serializeDispatch(() => this.promoteQueueUnlocked(project, agentId));
+  }
+
+  private async promoteQueueUnlocked(project: string, agentId: string | null | undefined): Promise<any[]> {
     if (!agentId) return [];
     const max = await this.agentMaxParallel(agentId);
     let inFlight = await this.directedInFlight(agentId);
@@ -350,18 +370,16 @@ export class ProjectRoom implements DurableObject {
     return to === me;
   }
 
-  // 普通 agent 的收件箱只接：定向给它的消息、管理端广播，以及 agent 之间的
-  // status/alert 广播。ack/report、announce、artifact 和 task 生命周期属于项目事件，
-  // 只给管理台看；否则 win_bridge 逐行上报会把所有 agent 的 inbox 刷成噪音。
+  // 普通 agent 的收件箱只接收件人明确指向它的消息；另加管理端的 announce 广播。
+  // 普通 agent 自己发出的无收件人广播（issue/report/status 等）只进管理台；
+  // Issue 生命周期、artifact、task 生命周期和普通项目事件也不进普通 inbox。
+  // 这样既保留管理端“通知全员”的公告，又不让普通 agent 的 issue/汇报互相刷屏。
   private agentCanSee(m: Msg, me: string | null): boolean {
     if (!me || me === "*") return true;
     if (m.to) return this.isToMe(m.to, me);
-    const topic = m.topic ?? "";
-    // 管理端广播照常下发；但 task 生命周期（claimed/released/done/reclaimed）只进管理台。
-    if (m.sender === "admin") return !(topic === "task" && m.kind !== "task");
-    if (["ack", "report", "announce", "artifact", "dm"].includes(topic)) return false;
-    if (topic === "task" && m.kind !== "task") return false;
-    return true;
+    // 管理端公告仍可广播给全员；其它无收件人消息只给管理台/观察员事件流。
+    if (m.sender === "admin" && m.topic === "announce") return true;
+    return false;
   }
 
   /** 任务播报（topic=task, kind=task）在创建时冻结收件范围：无主任务先播报给
@@ -502,8 +520,9 @@ export class ProjectRoom implements DurableObject {
     };
   }
 
-  /** 事件可见性：管理端（role=admin）、观察员（role=observer）全量；普通 agent 只看自己相关的任务/交付，
-   *  以及项目级广播。永远由服务端判定，不把全量事件下发给普通连接再让客户端过滤。 */
+  /** 事件可见性：管理端（role=admin）、观察员（role=observer）全量；普通 agent 只看
+   *  to/actor 明确指向自己的任务、交付或自己发起的动作事件，以及管理端 announce 广播。
+   *  普通 agent 自己的无收件人广播（issue/report/status）和别人的项目事件只给管理端。 */
   private eventVisible(e: ClientEvent, att: any): boolean {
     if (!att || att.role === "admin" || att.role === "observer") return true;
     const me = String(att.me ?? "");
@@ -516,8 +535,8 @@ export class ProjectRoom implements DurableObject {
       if (typeof v === "string" && v === me) return true;
       if (Array.isArray(v) && v.includes(me)) return true;
     }
-    // 项目级公告无收件人时所有连接都该看到；管理提醒/系统提醒只在 to 命中时下发。
-    if (e.type === "announcement.created" && !e.to) return true;
+    // 管理端公告仍向全员广播；普通 agent 自己发的 issue/report 广播不再互相下发。
+    if (e.type === "announcement.created" && !e.to && e.actor === "admin") return true;
     return false;
   }
 
@@ -829,7 +848,7 @@ export class ProjectRoom implements DurableObject {
       try { att = ws.deserializeAttachment?.(); } catch { att = null; }
       const me = att?.me ?? "unknown";
       const isAdmin = att?.role === "admin";
-      // 与 HTTP inbox 使用同一套可见性：管理端看全量；普通 agent 只看定向消息和管理端广播。
+      // 与 HTTP inbox 使用同一套可见性：管理端看全量；普通 agent 只看定向消息和管理端 announce。
       if (isAdmin || this.agentCanSee(msg, me)) {
         try { ws.send(payload); } catch { /* 单条连接坏了就跳过 */ }
       }
@@ -885,7 +904,7 @@ export class ProjectRoom implements DurableObject {
       const t = topics.split(",").map((x) => x.trim()).filter(Boolean);
       messages = messages.filter((m) => t.includes(m.topic));
     }
-    // 普通 agent 只看定向消息和管理端广播；项目事件（announce/artifact/task 生命周期）只进管理台。
+    // 普通 agent 只看定向消息和管理端 announce；普通 agent 自己发的项目广播/Issue/artifact/task 生命周期只进管理台。
     // me="*" 是管理员视角：不做过滤，看全量。
     const rawMessages = messages;
     let visible = messages.filter((m: any) => this.agentCanSee(m, me));
@@ -1873,6 +1892,7 @@ export class ProjectRoom implements DurableObject {
     const agents = await this.st.list<any>({ prefix: "agent:" });
     await this.st.put(`ack:${seq}`, {
       required: !!b.action_required?.ack_required,
+      // 管理端 announce 广播仍会到普通 agent；确认清单保持全员。
       pending: [...agents.values()].map((a) => a.agent_id),
       done: {}, deadline: b.action_required?.deadline ?? null,
     });
@@ -2122,7 +2142,7 @@ export class ProjectRoom implements DurableObject {
       rows = r.results ?? [];
     } catch (e) {
       console.warn("idle list read failed", project, e);
-      return json({ agents: [] });
+      return json({ agents: [], error: "idle_list_read_failed" });
     }
     const now = Date.now();
     const records = await this.st.list<any>({ prefix: "agent:" });
@@ -2318,7 +2338,7 @@ export class ProjectRoom implements DurableObject {
     // S5：排队超时/目标离线单独列成可操作清单，而不是只在 health 里给一句总账。
     const hbByAgent = new Map<string, number>();
     for (const a of agents) hbByAgent.set(String(a.agent_id ?? ""), Number(a.last_hb_ms ?? 0));
-    const queueAlerts = queued.map((t: any) => {
+    const queueAlertsAll = queued.map((t: any) => {
       const ageMs = Math.max(0, now - Number(t.created_at ?? now));
       const hb = hbByAgent.get(String(t.to ?? "")) ?? 0;
       const toAge = hb ? now - hb : Infinity;
@@ -2332,13 +2352,14 @@ export class ProjectRoom implements DurableObject {
         reason: stale && offline ? "排队超时且目标离线" : stale ? "排队超过 2 小时" : "目标离线超过 1 小时",
       };
     }).filter((x: any) => x.stale || x.target_offline)
-      .sort((a: any, b: any) => b.age_ms - a.age_ms).slice(0, 20);
+      .sort((a: any, b: any) => b.age_ms - a.age_ms);
+    const queueAlerts = queueAlertsAll.slice(0, 20);
     const failedCount = failedWindow.length;
     const denominator = doneWindow.length + failedCount;
     const healthReasons: string[] = [];
     if (deadLetters.length) healthReasons.push(`${deadLetters.length} 个死信待处理`);
     if (oldestQueueAge > 2 * 60 * 60_000) healthReasons.push(`最老排队已 ${Math.round(oldestQueueAge / 60_000)} 分钟`);
-    if (queueAlerts.length) healthReasons.push(`${queueAlerts.length} 个排队任务超时或目标离线`);
+    if (queueAlertsAll.length) healthReasons.push(`${queueAlertsAll.length} 个排队任务超时或目标离线`);
     if (queued.some((t: any) => {
       const age = now - Number(agents.find((a: any) => a.agent_id === t.to)?.last_hb_ms ?? 0);
       return age > 5 * 60_000;
@@ -2390,6 +2411,10 @@ export class ProjectRoom implements DurableObject {
       }));
     return json({
       generated_at: now, window_ms: windowMs,
+      dead_letters_total: deadLetters.length,
+      queue_alerts_total: queueAlertsAll.length,
+      recent_dead_returned: recentDead.length,
+      queue_alerts_returned: queueAlerts.length,
       summary: {
         tasks_total: tasks.length,
         active: tasks.filter((t: any) => !["done", "failed"].includes(String(t.state))).length,
@@ -2409,7 +2434,7 @@ export class ProjectRoom implements DurableObject {
         queue_wait_p95_ms: queueP95,
         cycle_p50_ms: percentile(cycleValues, 50),
         cycle_p95_ms: percentile(cycleValues, 95),
-        failure_rate: denominator ? Math.round((failedCount / denominator) * 1000) / 1000 : 0,
+        failure_rate: denominator ? Math.round((failedCount / denominator) * 1000) / 1000 : null,
         throughput_per_hour: Math.round((doneWindow.length / (windowMs / 3_600_000)) * 100) / 100,
       },
       public_pool: {
