@@ -87,7 +87,7 @@ if (location.search.includes("reset=1")) {
   .taskForm .row3{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:10px;align-items:center}
   .taskForm .row3 > .muted{grid-column:1/-1;font-size:11px;line-height:1.5}
   .taskForm .row3 button{min-height:38px}
-  body.view-all .taskForm,body.view-all .sndForm{display:none}
+  body.view-all .taskForm,body.view-all .sndForm,body.view-all #webhookCard{display:none}
   .taskRow select{max-width:118px;font-size:11px;padding:3px 6px;min-height:28px}
   @media(max-width:640px){.taskForm .row,.taskForm .row3{grid-template-columns:1fr}.taskRow select{max-width:100%}}
   /* 待取交付的全局提醒：不是普通提示条，必须一直可见直到取走 */
@@ -599,6 +599,30 @@ if (location.search.includes("reset=1")) {
       </tr></thead>
       <tbody id="tasks"><tr><td colspan="8" class="empty">选择具体项目查看任务</td></tr></tbody>
     </table>
+  </div>
+
+  <div class="card" id="webhookCard">
+    <h2>实时推送 <span class="muted" id="whStat">未配置</span></h2>
+    <div class="scopeHint" style="margin:-2px 0 8px">客户端 agent 统一走 WebSocket 事件流（task.* / submission.*）；这里额外配置外部 HTTP 端点。外部端点返回非 2xx 会自动重试。</div>
+    <div class="form">
+      <label>Webhook URL<input id="whUrl" placeholder="https://manager.example.com/synapse/events" autocomplete="off"></label>
+      <div class="row">
+        <label>签名密钥<input id="whSecret" type="password" placeholder="留空保持不变；至少 8 位" autocomplete="new-password"></label>
+        <label style="align-self:center;display:flex;align-items:center;gap:6px"><input id="whEnabled" type="checkbox"> 启用</label>
+      </div>
+      <div class="row" style="gap:16px;flex-wrap:wrap;align-items:center">
+        <span class="muted">订阅：</span>
+        <label style="display:flex;align-items:center;gap:6px"><input id="whSub" type="checkbox" checked> 交付到达</label>
+        <label style="display:flex;align-items:center;gap:6px"><input id="whTask" type="checkbox"> 任务变化</label>
+        <label style="display:flex;align-items:center;gap:6px"><input id="whAnnounce" type="checkbox"> 广播/提醒</label>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnWhSave">保存</button>
+        <button class="ghost" id="btnWhTest">发测试</button>
+        <span class="muted" id="whHint" style="align-self:center"></span>
+      </div>
+    </div>
+    <div class="scopeHint" id="whLast"></div>
   </div>
 
   <div class="card">
@@ -1191,7 +1215,7 @@ function taskRow(t, isAll) {
   const stateBadge = document.createElement("span");
   const known = ["open", "claimed", "released", "blocked", "done"];
   stateBadge.className = `badge ${known.includes(st) ? st : "open"}`;
-  stateBadge.textContent = taskStateLabel(st);
+  stateBadge.textContent = taskStateLabel(st, t);
   cells[1].append(stateBadge);
   if (t.dispatch_state === "queued") {
     const q = document.createElement("span");
@@ -1342,14 +1366,31 @@ function taskLease(t) {
     : { text: `${s}s`, cls: s <= 60 ? "warnv" : "" };
 }
 
-function taskStateLabel(s) {
+function taskStateLabel(s, t) {
+  if (s === "open") {
+    if (!t || !t.to) return "待领取";
+    if (t.dispatch_state === "queued") return "排队中";
+    if (t.dispatch_state === "notified") return "已下发";
+    if (t.dispatch_state === "closed") return "待处理";
+  }
   return { open: "待领取", claimed: "执行中", released: "已交付待取", blocked: "已阻塞", done: "已完成" }[s] || s;
 }
 
 // 滞留：派了没人领，或领了但节点离线/租约过期。和“回收滞留”按钮共用同一口径。
+// 单飞后，queued 是正常等待；notified 是已下发但还等在途任务释放/认领，
+// 不能一看到 open 就标滞留，否则“回收滞留”会把刚派出的任务批量退回。
 function taskIsStale(t) {
   if (!t) return false;
-  if (t.state === "open") return !!t.to && t.dispatch_state !== "queued";
+  if (t.state === "open") {
+    if (!t.to) return false;                       // 公共池不是滞留
+    if (t.dispatch_state === "queued") return false;
+    const at = Number(t.notified_at || t.updated_at || 0);
+    const age = at ? Date.now() - at : Infinity;
+    // 目标已离线给 2 分钟宽限；在线给 10 分钟认领窗口。
+    // 这能覆盖 headless 在途任务占用并发槽、下一条正当等待的情况。
+    if (t.to_alive === "offline") return age > 2 * 60 * 1000;
+    return age > 10 * 60 * 1000;
+  }
   if (t.state === "claimed") return t.owner_online === false || Number(t.lease_left_ms) <= 0;
   return false;
 }
@@ -1491,6 +1532,60 @@ async function sendAgentNotice(agentId) {
     showToast(`提醒已发送：${r.sent?.[0]?.seq ? "#" + r.sent[0].seq : "已入队"}`, 5000);
     if (detailAgent === agentId) await openAgent(agentId);
   } catch (e) { alert(`发送失败：${e.message || e}`); }
+}
+
+function webhookTopicsFromUI() {
+  const topics = [];
+  if ($("whSub")?.checked) topics.push("submission");
+  if ($("whTask")?.checked) topics.push("task");
+  if ($("whAnnounce")?.checked) topics.push("announce", "admin");
+  return topics.length ? topics : ["submission"];
+}
+
+async function loadWebhook() {
+  if (!current || current === "*" || !$("whUrl")) return;
+  const d = await api(`/admin/p/${current}/webhook`);
+  if (!current || current === "*") return;
+  $("whUrl").value = d.url || "";
+  $("whEnabled").checked = !!d.enabled;
+  const topics = Array.isArray(d.topics) ? d.topics : ["submission"];
+  $("whSub").checked = topics.includes("submission") || topics.includes("all");
+  $("whTask").checked = topics.includes("task") || topics.includes("all");
+  $("whAnnounce").checked = topics.includes("announce") || topics.includes("admin") || topics.includes("all");
+  $("whSecret").value = "";
+  $("whSecret").placeholder = d.has_secret ? "已设置，留空保持不变" : "至少 8 位";
+  $("whStat").textContent = d.enabled ? "已启用" : (d.url ? "已保存未启用" : "未配置");
+  const last = d.last;
+  $("whLast").textContent = last
+    ? `上次投递：${last.ok ? "成功" : "失败"} · HTTP ${last.status || "—"} · ${last.event_type || ""} · ${last.at ? new Date(last.at).toLocaleString() : "—"}${last.error ? ` · ${last.error}` : ""}`
+    : "尚未投递。保存后点“发测试”可立即验证端点。";
+}
+
+async function saveWebhook() {
+  if (!current || current === "*") return alert("先选择具体项目");
+  const url = $("whUrl").value.trim();
+  if ($("whEnabled").checked && !url) return alert("启用前先填 Webhook URL");
+  const body = { url, enabled: $("whEnabled").checked, topics: webhookTopicsFromUI() };
+  const secret = $("whSecret").value.trim();
+  if (secret) body.secret = secret;
+  $("btnWhSave").disabled = true;
+  try {
+    const r = await api(`/admin/p/${current}/webhook`, "PUT", body);
+    $("whHint").textContent = `已保存${r.enabled ? "并启用" : ""}`;
+    await loadWebhook();
+  } catch (e) { alert(`保存失败：${e.message || e}`); }
+  finally { $("btnWhSave").disabled = false; }
+}
+
+async function testWebhook() {
+  if (!current || current === "*") return alert("先选择具体项目");
+  $("btnWhTest").disabled = true;
+  try {
+    const r = await api(`/admin/p/${current}/webhook/test`, "POST", {});
+    $("whHint").textContent = r.ok ? `测试成功（HTTP ${r.status}）` : `测试失败：${r.error || ("HTTP " + r.status)}`;
+    await loadWebhook();
+  } catch (e) { alert(`测试失败：${e.message || e}`); }
+  finally { $("btnWhTest").disabled = false; }
 }
 
 async function saveAgentMaxParallel(agentId) {
@@ -2244,7 +2339,7 @@ function renderAgentWork(d, live) {
       : t.released_by === detailAgent ? "释放"
       : (t.reassigned_from === detailAgent || t.reclaimed_from === detailAgent) ? "曾负责" : "";
     const ts = Number(t.updated_at || t.created_at || 0);
-    return `<div class="workRow"><span class="badge ${esc(t.state || "open")}">${esc(taskStateLabel(t.state))}</span>
+    return `<div class="workRow"><span class="badge ${esc(t.state || "open")}">${esc(taskStateLabel(t.state, t))}</span>
       <span class="tid">${esc(id)}</span><span class="wtitle">${esc(t.title || "—")}</span>
       ${role ? `<span class="muted">${role}</span>` : ""}
       ${t.dispatch_state === "queued" ? `<span class="badge released">排队${Number(t.queue_position || 0) ? ` #${Number(t.queue_position)}` : ""}</span>` : ""}
@@ -3113,6 +3208,7 @@ async function refresh(forceFresh = false) {
   // 用 allSettled 并打印失败项，界面其余部分照常渲染。
   const parts = [loadAgents(), loadSec(), loadStats(forceFresh), loadEnr(), loadAnalytics(forceFresh)];
   if (current !== "*") parts.push(loadIdle());
+  if (current !== "*") parts.push(loadWebhook());
   const results = await Promise.allSettled(parts);
   if (current !== scope || epoch !== refreshEpoch) return;
   results.forEach((r, i) => {
@@ -3339,6 +3435,9 @@ $("btnIdleCheck").onclick = async () => {
     $("btnIdleCheck").disabled = false;
   }
 };
+
+$("btnWhSave").onclick = saveWebhook;
+$("btnWhTest").onclick = testWebhook;
 
 $("btnTaskCreate").onclick = async () => {
   if (current === "*") return alert("先选择具体项目再派单");

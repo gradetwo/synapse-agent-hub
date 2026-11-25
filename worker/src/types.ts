@@ -22,11 +22,29 @@ export interface Env {
   MAX_SUBMISSION_MB: string;
 }
 
+/** 客户端实时事件：与消息共用 seq，但语义稳定、可直接按 type 订阅。 */
+export interface ClientEvent {
+  id: string;
+  version: 1;
+  source: "synapse-agent-hub";
+  project: string;
+  type: string;
+  seq: number;
+  ts: string;
+  actor: string;
+  to: string | string[] | null;
+  task_id?: string;
+  submission_id?: string;
+  state?: string;
+  review_state?: string;
+  data: Record<string, unknown>;
+}
+
 export interface Msg {
   seq: number;
   project?: string;
   sender: string;
-  topic: "announce" | "task" | "artifact" | "report" | "ack" | "status" | "alert" | "admin" | "issue" | "system";
+  topic: "announce" | "task" | "artifact" | "submission" | "report" | "ack" | "status" | "alert" | "admin" | "issue" | "system";
   kind: string;
   payload: unknown;
   dedupe_key?: string;

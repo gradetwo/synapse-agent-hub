@@ -207,12 +207,13 @@ class WSPump(threading.Thread):
     """后台线程：维持连接、收消息、断线重连，把消息交给回调。"""
 
     def __init__(self, base: str, project: str, ticket_fn, on_msg, on_state=None,
-                 ping_s: float = 25.0):
+                 on_event=None, ping_s: float = 25.0):
         super().__init__(daemon=True, name="yanshi-ws")
         self.base = base.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
         self.project = project
         self.ticket_fn = ticket_fn
         self.on_msg = on_msg
+        self.on_event = on_event or (lambda e: None)
         self.on_state = on_state or (lambda s: None)
         self.ping_s = ping_s
         self.ws: WSClient | None = None
@@ -255,6 +256,13 @@ class WSPump(threading.Thread):
                         except Exception as e:     # noqa: BLE001
                             # 单条坏消息不能把整条连接打断
                             self.on_state(f"ws:on_msg_error:{type(e).__name__}")
+                    elif msg.get("type") == "event":
+                        try:
+                            event = msg.get("event") or {}
+                            if event:
+                                self.on_event(event)
+                        except Exception as e:     # noqa: BLE001
+                            self.on_state(f"ws:on_event_error:{type(e).__name__}")
                     if time.time() - last_ping > self.ping_s:
                         self.ws.send_json({"type": "ping"})
                         last_ping = time.time()

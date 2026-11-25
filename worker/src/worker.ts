@@ -321,7 +321,7 @@ export default {
     // 普通 agent 的主动调用记录：心跳/自动 ack/收件不算，其余接口都算“有动作”，
     // 避免把一直在 wait 的节点误判为空闲。写 D1 异步执行，不拖慢原请求。
     const idlePassive = action.startsWith("heartbeat") || action.startsWith("ack") ||
-      action === "inbox" || action === "ws-ticket";
+      action === "inbox" || action === "events" || action === "ws-ticket";
     if (auth.role !== "admin" && auth.agentId && !idlePassive) {
       const kind = taskPoolRead ? "task_list" : issuePoolRead ? "issue_list" : "activity";
       ctx.waitUntil(markIdleActivity(env, project, auth.agentId, kind));
@@ -371,10 +371,11 @@ export default {
     }
     const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
     let doSearch = url.search;
-    if (action === "inbox") {
-      // 必须“覆盖”而不是“追加”：append 会让 URLSearchParams.get 取到攻击者传来的第一个 agent
+    if (action === "inbox" || action === "events") {
+      // 必须“覆盖”而不是“追加”：append 会让 URLSearchParams.get 取到攻击者传来的第一个 agent。
+      // 管理角色（含管理 agent）使用 "*" 订阅全项目事件/消息；普通 agent 只能用自己的 id。
       const q = new URLSearchParams(url.search);
-      q.set("agent", auth.agentId ?? "");
+      q.set("agent", auth.role === "admin" ? "*" : (auth.agentId ?? ""));
       q.set("project", project);
       doSearch = "?" + q.toString();
     }
@@ -601,7 +602,7 @@ function need(action: string) {
   if (action.startsWith("heartbeat")) return "heartbeat";
   if (action.startsWith("ack")) return "ack";
   if (action.startsWith("report")) return "report";
-  if (action.startsWith("inbox")) return "poll";
+  if (action.startsWith("inbox") || action === "events") return "poll";
   if (action === "tasks/claim") return "tasks.claim";
   if (action === "tasks/release") return "tasks.release";
   if (action.startsWith("tasks/admin-")) return "admin";
@@ -614,6 +615,9 @@ function need(action: string) {
   return "publish";
 }
 const inScope = (s: string[], n: string) => {
+  // 管理端签发过的 token 可能用 "*" 表示全量 scope；不能只按具体名称匹配，
+  // 否则管理 agent 连 inbox/events 都会被 403（WS 又走 role，表现成“只有长连接能用”）。
+  if (s.includes("*")) return true;
   // 需求：上报 issue 默认对所有 agent 开放。不能只靠新 token 的 scope，
   // 存量 token 的 scopes 里没有 issues.report，也必须在数据面放行。
   if (n === "issues.report") return true;
@@ -1218,6 +1222,22 @@ async function admin(req: Request, env: Env, url: URL) {
       }));
       return Response.json(await r.json().catch(() => ({})), { status: r.status });
     }
+    // 外部管理端事件推送配置。webhook 配置和 secret 只存在该项目 DO；
+    // GET 只回 has_secret，绝不把 secret 回传给浏览器/管理端。
+    if (action === "webhook" && req.method === "GET")
+      return stub.fetch(new Request("https://do/webhook/get"));
+    if (action === "webhook" && (req.method === "PUT" || req.method === "POST")) {
+      const b: any = await req.json().catch(() => ({}));
+      const r = await stub.fetch(new Request("https://do/webhook/set", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...b, project }),
+      }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    if (action === "webhook/test" && req.method === "POST") {
+      const r = await stub.fetch(new Request("https://do/webhook/test", { method: "POST" }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
     if (action === "tasks" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
       const quota = await projectQuota(env, project);
@@ -1616,6 +1636,9 @@ async function admin(req: Request, env: Env, url: URL) {
         body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind,
                                payload: { submission_id: sid, task_id: taskId,
                                           task_assignee: bind.assigneeAtSubmit,
+                                          kind, title: b.title ?? "", base_sha: b.base_sha,
+                                          review_state: "pending",
+                                          refs: norm.refs,
                                           overtake: bind.overtake, overtake_reason: bind.overtake ? overtakeReason : null },
                                dedupe_key: `sub:${sid}` }),
       }));
@@ -1634,7 +1657,7 @@ async function admin(req: Request, env: Env, url: URL) {
     if (col && req.method === "POST") {
       const [, id, op] = col;
       const row = await env.DB.prepare(
-        "SELECT submission_id, task_id, kind, state, review_state FROM submissions WHERE project = ? AND submission_id = ?"
+        "SELECT submission_id, task_id, kind, state, review_state, agent_id FROM submissions WHERE project = ? AND submission_id = ?"
       ).bind(project, id).first<any>();
       if (!row) return err(404, "submission_not_found");
       if (op === "result") {
@@ -1655,6 +1678,10 @@ async function admin(req: Request, env: Env, url: URL) {
               SET review_state = ?, result = ?, reviewed_at = ?, reviewed_by = 'admin', updated_at = ?
             WHERE project = ? AND submission_id = ?`
         ).bind(verdict, note || raw, now, now, project, id).run();
+        // 裁决变化立即推给交付人；approved 还可能触发任务 done，两条事件各自独立。
+        await publishSubmissionEvent(env, project, row, verdict, {
+          review_state: verdict, note: note || raw, reviewed_at: now,
+        });
         // approved 可能在 collect 之后才到；这里立即按 D1 状态结算。
         let taskLink: any = null;
         if (verdict === "approved" && row.task_id) {
@@ -1677,6 +1704,10 @@ async function admin(req: Request, env: Env, url: URL) {
            updated_at = ?
           WHERE project = ? AND submission_id = ?`
       ).bind(state, review, review, now, review, now, project, id).run();
+      // 交付箱状态变化（收走/归档）也让交付人实时知道；任务结算事件随后单独发。
+      await publishSubmissionEvent(env, project, row, op === "collect" ? "collected" : "archived", {
+        review_state: review, state, reviewed_at: now,
+      });
       // 联动：这件交付挂在某个任务上时，由 Worker 按 D1 的待取/待批状态结算。
       // 结算失败不回滚已落库的取走状态，但必须在响应里响亮标出，不许静默脱钩。
       let taskLink: any = null;
@@ -2337,6 +2368,24 @@ async function settleTaskAfterSubmission(
   return { ...d, pending_review: pendingReview, unapproved_reports: unapproved };
 }
 
+/** 交付状态变化单独发一条 submission 事件：客户端只订阅事件流即可知道
+ *  管理侧已收走/已批准/已驳回，不必再轮询 submissions。best-effort，不阻断管理动作。 */
+async function publishSubmissionEvent(env: Env, project: string, row: any,
+                                     kind: string, extra: Record<string, unknown> = {}) {
+  const agentId = String(row?.agent_id ?? "").trim();
+  if (!agentId) return;
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  await stub.fetch(new Request("https://do/publish", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      project, sender: "admin", topic: "submission", kind, to: agentId,
+      payload: { submission_id: row.submission_id, task_id: row.task_id ?? null,
+                 kind: row.kind ?? null, ...extra },
+      dedupe_key: `sub-event:${row.submission_id}:${kind}:${Date.now()}`,
+    }),
+  })).catch((e: any) => console.warn("submission event publish failed", row?.submission_id, e?.message ?? e));
+}
+
 async function createSubmission(req: Request, env: Env, project: string, agentId: string, isAdmin = false) {
   const b: any = await req.json().catch(() => ({}));
   if (!b.base_sha) return err(422, "base_sha_required");
@@ -2384,7 +2433,8 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
     body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind,
                            payload: { submission_id: sid, task_id: taskId,
                                       task_assignee: bind.assigneeAtSubmit,
-                                      base_sha: b.base_sha, title: b.title ?? "", agent_id: agentId },
+                                      kind, base_sha: b.base_sha, title: b.title ?? "",
+                                      agent_id: agentId, refs: norm.refs },
                            dedupe_key: `sub:${sid}` }),
   }));
   const seq = await seqRes.json<any>().catch(() => ({}));

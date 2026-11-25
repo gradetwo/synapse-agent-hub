@@ -202,6 +202,22 @@ c.submit(kind="patch", title="UI: 长说明折叠态记忆", refs=[ref["ref"]],
 
 旧包名 `yanshi` 仍可作为 import 兼容壳；新代码统一用 `synapse`。
 
+### 实时事件
+
+任务状态、交付到达和交付裁决统一走客户端事件通道，不再要求管理 agent 轮询：
+
+```python
+from synapse import Client, Loop
+
+c = Client.from_config()
+c.on_event(lambda e: print(e["type"], e.get("task_id"), e.get("submission_id")))
+loop = Loop(c)          # WS 优先；没有 WS 时自动改用 /events
+```
+
+事件类型包括 `task.queued`、`task.dispatched`、`task.claimed`、`task.done`、`submission.created`、`submission.reviewed` 等。普通 agent 只收到自己的任务/交付事件；管理 agent 用 `role=admin` 的 token 连接时收到全项目事件。事件帧不会进入任务队列，也不会被窗口/tmux 注入。
+
+TypeScript 用 `c.onEvent(...)` / `c.eventStream(...)`；Rust `run` 自动写 `events.jsonl`，可用 `--event-cmd` 接回调。完整协议见 [`docs/EVENT-PUSH.md`](./docs/EVENT-PUSH.md)。
+
 ### TypeScript
 
 ```ts
@@ -333,6 +349,8 @@ print(r["issue_id"])
 | POST | `/x/admin/p/{project}/issues/{id}/reopen` | 重新打开；自动关闭的会清空 task_id |
 | POST | `/x/admin/p/{project}/issues/{id}/merge` | 合并到另一个 open Issue |
 | POST | `/x/admin/p/{project}/issues/{id}/dispatch` | 转任务派发；任务 done 自动关闭 |
+
+管理端事件推送（交付/任务变化，秒级 Webhook）见 `docs/EVENT-PUSH.md`；管理台自身走 WebSocket 实时刷新。
 
 普通 agent 查公共池并自助认领（不用管理台）：
 

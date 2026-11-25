@@ -1,6 +1,6 @@
 // ProjectRoom：每项目一个 Durable Object。
 // 单线程 ⇒ seq 单调递增、任务认领免锁 CAS、心跳覆盖写。
-import { Env, Msg, Task, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOWUP_DEFAULT_S, IDLE_ONLINE_MS } from "./types";
+import { Env, Msg, Task, ClientEvent, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOWUP_DEFAULT_S, IDLE_ONLINE_MS } from "./types";
 
 const LATEST_KEEP = 2000; // 热窗口：最近 2000 条；更早的查 D1（归档任务）
 const DEFAULT_TASK_LEASE_MS = 12 * 60 * 60_000; // 任务 claim 默认租约 12h；心跳会续，LEASE_TTL_S 可调
@@ -8,6 +8,20 @@ export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任
 const DEFAULT_SURFACE_PARALLEL = 1;              // window/tmux 一次只能跑一个任务
 const DEFAULT_HEADLESS_PARALLEL = 2;             // 无窗口/无 tmux 的循环默认允许两件在途任务
 const MAX_PARALLEL_TASKS = 8;
+
+/** 外部管理端 webhook。配置只存在 DO，secret 不回传管理端。 */
+type WebhookConfig = {
+  enabled?: boolean;
+  url?: string;
+  secret?: string;
+  topics?: string[];
+  updated_at?: number;
+};
+const WEBHOOK_TOPICS = new Set(["submission", "task", "announce", "admin", "system", "all"]);
+
+function hexBytes(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
@@ -130,7 +144,20 @@ export class ProjectRoom implements DurableObject {
       const pos = await this.queuePosition(t.to, taskId);
       const queued = { ...t, dispatch_state: "queued", updated_at: Date.now() };
       await this.st.put(`task:${taskId}`, queued);
-      return { notified: false, dispatch_state: "queued", queue_position: pos, max_parallel: max };
+      // 排队也是状态变化：没有这条事件，管理端和客户端只能等任务真正下发才知道它存在。
+      let seq: number | undefined;
+      try {
+        seq = await this.append({
+          project, sender: "admin", topic: "task", kind: "queued", to: t.to,
+          payload: { task_id: taskId, title: t.title ?? "", work_item: false,
+                     dispatch_state: "queued", queue_position: pos, max_parallel: max },
+          dedupe_key: `task-queued:${taskId}:${Number(t.dispatch_count ?? 0)}:${Date.now()}`,
+        });
+      } catch (e: any) {
+        console.warn("task queued event failed", taskId, e?.message ?? e);
+      }
+      return { notified: false, dispatch_state: "queued", queue_position: pos,
+               max_parallel: max, seq };
     }
     const count = Number(t.dispatch_count ?? 0) + 1;
     const next = { ...t, dispatch_state: "notified", notified_at: Date.now(),
@@ -195,6 +222,7 @@ export class ProjectRoom implements DurableObject {
                                              url.searchParams.get("agent"),
                                              url.searchParams.get("desc") === "1",
                                              url.searchParams.get("project"));
+      case "events":       return this.eventsFeed(url);
       case "heartbeat":    return this.heartbeat(body);
       case "ack":          return this.ack(body);
       case "report":       return this.report(body);
@@ -212,6 +240,9 @@ export class ProjectRoom implements DurableObject {
       case "agent/list":   return this.agents();
       case "agent/activity": return this.markActivity(body);
       case "agents/config": return this.setAgentConfig(body);
+      case "webhook/get":  return this.webhookGet();
+      case "webhook/set":  return this.webhookSet(body);
+      case "webhook/test": return this.webhookTest();
       case "agents/idle-list": return this.idleList(body);
       case "agents/idle-remind": return this.idleRemind(body);
       case "agent/remove": return this.removeAgent(body);
@@ -282,6 +313,11 @@ export class ProjectRoom implements DurableObject {
     try { return String((this.state.id as any).name ?? ""); } catch { return ""; }
   }
 
+  /** 对外展示的项目名：DO 名带 v9: 前缀，webhook 事件里不能带内部命名空间。 */
+  private projectSlug(): string {
+    return this.projectName().replace(/^v9:/, "");
+  }
+
   private async room(): Promise<string> {
     let ep = await this.st.get<string>("epoch");
     if (!ep) {
@@ -289,6 +325,290 @@ export class ProjectRoom implements DurableObject {
       await this.st.put("epoch", ep);
     }
     return ep;
+  }
+
+  // ── 客户端实时事件：与消息共用 seq，客户端只按 type 订阅，不解析 topic/kind ──
+  /** topic/kind → 稳定事件类型。返回 null 表示这条消息不值得进入事件流（ack 等噪音）。 */
+  private eventTypeOf(msg: Msg): string | null {
+    const p: any = msg.payload ?? {};
+    if (msg.topic === "artifact" && p.submission_id) return "submission.created";
+    if (msg.topic === "submission") {
+      if (msg.kind === "collected") return "submission.collected";
+      if (msg.kind === "archived") return "submission.archived";
+      return "submission.reviewed";
+    }
+    if (msg.topic === "task") {
+      if (msg.kind === "task") return "task.dispatched";
+      if (msg.kind === "created") return "task.created";
+      if (msg.kind === "queued") return "task.queued";
+      if (msg.kind === "claimed") return "task.claimed";
+      if (msg.kind === "released") return "task.released";
+      if (msg.kind === "blocked") return "task.blocked";
+      if (msg.kind === "done") return "task.done";
+      if (msg.kind === "open") return "task.reopened";
+      if (msg.kind === "reclaimed" || msg.kind === "reclaimed_away") return "task.reclaimed";
+      if (msg.kind === "reassigned" || msg.kind === "reassigned_away") return "task.reassigned";
+      return "task.updated";
+    }
+    if (msg.topic === "announce") return "announcement.created";
+    if (msg.topic === "admin") return "notice.created";
+    if (msg.topic === "system") return "system.notice";
+    if (msg.topic === "report") return "report.created";
+    if (msg.topic === "issue") return "issue.created";
+    if (msg.topic === "status") return "status.changed";
+    if (msg.topic === "alert") return "alert.created";
+    return null;
+  }
+
+  private taskStateOfEvent(kind: string): string | undefined {
+    if (["task", "created", "queued", "open", "reassigned", "reassigned_away"].includes(kind)) return "open";
+    if (kind === "claimed") return "claimed";
+    if (kind === "done") return "done";
+    if (kind === "released") return "released";
+    if (kind === "blocked") return "blocked";
+    if (kind === "reclaimed" || kind === "reclaimed_away") return "open";
+    return undefined;
+  }
+
+  /** 把一条已落库消息映射为客户端事件；不复制信封内部字段。 */
+  private clientEventOf(msg: Msg): ClientEvent | null {
+    const type = this.eventTypeOf(msg);
+    if (!type) return null;
+    const data: any = { ...(msg.payload as any ?? {}) };
+    const taskId = typeof data.task_id === "string" ? data.task_id : undefined;
+    const submissionId = typeof data.submission_id === "string" ? data.submission_id : undefined;
+    const project = String(msg.project ?? this.projectSlug() ?? "").replace(/^v9:/, "");
+    const state = msg.topic === "task" ? this.taskStateOfEvent(String(msg.kind))
+      : msg.topic === "submission" ? String(data.state ?? msg.kind) : undefined;
+    const reviewState = msg.topic === "submission" || (msg.topic === "artifact" && submissionId)
+      ? String(data.review_state ?? (msg.topic === "artifact" ? "pending" : msg.kind))
+      : undefined;
+    return {
+      id: `evt-${project || "p"}-${msg.seq}`,
+      version: 1,
+      source: "synapse-agent-hub",
+      project,
+      type,
+      seq: msg.seq,
+      ts: msg.ts || new Date().toISOString(),
+      actor: String(msg.sender ?? "unknown"),
+      to: msg.to ?? null,
+      ...(taskId ? { task_id: taskId } : {}),
+      ...(submissionId ? { submission_id: submissionId } : {}),
+      ...(state ? { state } : {}),
+      ...(reviewState ? { review_state: reviewState } : {}),
+      data,
+    };
+  }
+
+  /** 事件可见性：管理端（role=admin）全量；普通 agent 只看自己相关的任务/交付，
+   *  以及项目级广播。永远由服务端判定，不把全量事件下发给普通连接再让客户端过滤。 */
+  private eventVisible(e: ClientEvent, att: any): boolean {
+    if (!att || att.role === "admin") return true;
+    const me = String(att.me ?? "");
+    if (!me || me === "unknown" || me === "*") return false;
+    if (e.to && this.isToMe(e.to, me)) return true;
+    if (e.actor === me) return true;             // 自己发起的 claim/release/submit 也要收到
+    const d: any = e.data ?? {};
+    for (const key of ["agent_id", "task_assignee", "owner", "assignee"]) {
+      const v = d[key];
+      if (typeof v === "string" && v === me) return true;
+      if (Array.isArray(v) && v.includes(me)) return true;
+    }
+    // 项目级公告无收件人时所有连接都该看到；管理提醒/系统提醒只在 to 命中时下发。
+    if (e.type === "announcement.created" && !e.to) return true;
+    return false;
+  }
+
+  private pushEvent(msg: Msg, ws: any, att: any) {
+    const event = this.clientEventOf(msg);
+    if (!event || !this.eventVisible(event, att)) return false;
+    try {
+      ws.send(JSON.stringify({ type: "event", event }));
+      return true;
+    } catch { return false; }
+  }
+
+  // ── Webhook：管理侧事件推送 ──────────────────────────────────
+  private webhookTopicOf(msg: Msg): string | null {
+    if (msg.topic === "artifact" && (msg.payload as any)?.submission_id) return "submission";
+    if (msg.topic === "submission") return "submission";
+    if (msg.topic === "task") return "task";
+    if (msg.topic === "announce") return "announce";
+    if (msg.topic === "admin") return "admin";
+    if (msg.topic === "system") return "system";
+    return null;
+  }
+
+  private webhookEvent(msg: Msg): any {
+    const event = this.clientEventOf(msg);
+    if (event) return { ...event, sender: msg.sender };
+    const payload: any = msg.payload ?? {};
+    const project = String(msg.project ?? this.projectSlug() ?? "").replace(/^v9:/, "");
+    return {
+      id: `evt-${project || "p"}-${msg.seq}`,
+      version: 1,
+      source: "synapse-agent-hub",
+      project,
+      type: `${msg.topic}.${msg.kind}`,
+      seq: msg.seq,
+      ts: msg.ts || new Date().toISOString(),
+      actor: msg.sender,
+      to: msg.to ?? null,
+      data: payload,
+    };
+  }
+
+  private async postWebhook(cfg: WebhookConfig, event: any): Promise<{ ok: boolean; status: number; error?: string }> {
+    const body = JSON.stringify(event);
+    const ts = String(Date.now());
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "user-agent": "synapse-agent-hub/webhook",
+      "x-synapse-event": String(event.type ?? ""),
+      "x-synapse-timestamp": ts,
+    };
+    if (cfg.secret) {
+      const key = await crypto.subtle.importKey(
+        "raw", new TextEncoder().encode(cfg.secret),
+        { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${ts}.${body}`));
+      headers["x-synapse-signature"] = `sha256=${hexBytes(sig)}`;
+    }
+    try {
+      const res = await fetch(String(cfg.url), {
+        method: "POST", headers, body, signal: AbortSignal.timeout(5000),
+      });
+      let detail = "";
+      try { detail = (await res.text()).slice(0, 160); } catch { /* 2xx 无正文也正常 */ }
+      return res.ok
+        ? { ok: true, status: res.status }
+        : { ok: false, status: res.status, error: `http_${res.status}${detail ? `: ${detail}` : ""}` };
+    } catch (e: any) {
+      return { ok: false, status: 0, error: String(e?.message ?? e).slice(0, 200) };
+    }
+  }
+
+  private async recordWebhook(last: any) {
+    await this.st.put("webhook:last", { ...last, at: Date.now() }).catch(() => {});
+  }
+
+  private scheduleWebhook(msg: Msg) {
+    const promise = this.deliverWebhook(msg).catch((e: any) =>
+      console.warn("webhook deliver failed", msg.seq, e));
+    const state: any = this.state;
+    if (typeof state.waitUntil === "function") state.waitUntil(promise);
+  }
+
+  private async deliverWebhook(msg: Msg) {
+    const cfg: WebhookConfig | undefined = await this.st.get("webhook:config").catch(() => undefined);
+    if (!cfg?.enabled || !cfg.url) return;
+    const topic = this.webhookTopicOf(msg);
+    if (!topic) return;
+    const topics = Array.isArray(cfg.topics) && cfg.topics.length ? cfg.topics : ["submission"];
+    if (!(topics.includes("all") || topics.includes(topic))) return;
+    const event = this.webhookEvent(msg);
+    const result = await this.postWebhook(cfg, event);
+    await this.recordWebhook({ event_type: event.type, ok: result.ok,
+                               status: result.status, error: result.error ?? null, seq: msg.seq });
+    const qkey = `whq:${msg.seq}`;
+    if (result.ok) {
+      await this.st.delete(qkey).catch(() => {});
+      return;
+    }
+    // 失败重试：5s 起，指数退避，最多 8 次；同时用 DO alarm 触发，cron tick 兜底。
+    const prev: any = await this.st.get(qkey).catch(() => null);
+    const attempts = Number(prev?.attempts ?? 0) + 1;
+    if (attempts > 8) { await this.st.delete(qkey).catch(() => {}); return; }
+    const nextAt = Date.now() + Math.min(60_000, 5_000 * (2 ** (attempts - 1)));
+    await this.st.put(qkey, { event, attempts, next_at: nextAt }).catch(() => {});
+    const storage: any = this.st;
+    if (typeof storage.setAlarm === "function") {
+      await storage.setAlarm(nextAt).catch(() => {});
+    }
+  }
+
+  private async flushWebhooks(): Promise<{ sent: number; failed: number }> {
+    const cfg: WebhookConfig | undefined = await this.st.get("webhook:config").catch(() => undefined);
+    if (!cfg?.enabled || !cfg.url) return { sent: 0, failed: 0 };
+    const rows = await this.st.list<any>({ prefix: "whq:" }).catch(() => null);
+    if (!rows) return { sent: 0, failed: 0 };
+    let sent = 0, failed = 0, earliest = 0;
+    for (const [key, item] of rows) {
+      if (!item?.event) { await this.st.delete(key).catch(() => {}); continue; }
+      if (Number(item.next_at ?? 0) > Date.now()) {
+        earliest = Math.min(earliest || Number(item.next_at), Number(item.next_at));
+        continue;
+      }
+      const result = await this.postWebhook(cfg, item.event);
+      await this.recordWebhook({ event_type: item.event.type, ok: result.ok,
+                                 status: result.status, error: result.error ?? null, seq: item.event.seq });
+      if (result.ok) {
+        sent++;
+        await this.st.delete(key).catch(() => {});
+        continue;
+      }
+      failed++;
+      const attempts = Number(item.attempts ?? 0) + 1;
+      if (attempts > 8) { await this.st.delete(key).catch(() => {}); continue; }
+      const nextAt = Date.now() + Math.min(60_000, 5_000 * (2 ** (attempts - 1)));
+      await this.st.put(key, { ...item, attempts, next_at: nextAt }).catch(() => {});
+      earliest = Math.min(earliest || nextAt, nextAt);
+    }
+    const storage: any = this.st;
+    if (earliest && typeof storage.setAlarm === "function") await storage.setAlarm(earliest).catch(() => {});
+    return { sent, failed };
+  }
+
+  private async webhookGet() {
+    const cfg: WebhookConfig | undefined = await this.st.get("webhook:config").catch(() => undefined);
+    const last = await this.st.get("webhook:last").catch(() => null);
+    return json({
+      enabled: !!cfg?.enabled, url: cfg?.url ?? "",
+      topics: Array.isArray(cfg?.topics) ? cfg.topics : ["submission"],
+      has_secret: !!cfg?.secret, last: last ?? null,
+    });
+  }
+
+  private async webhookSet(b: any) {
+    const url = String(b?.url ?? "").trim();
+    if (url) {
+      if (url.length > 512) return json({ error: "webhook_url_too_long" }, 422);
+      try {
+        const u = new URL(url);
+        if (u.protocol !== "http:" && u.protocol !== "https:")
+          return json({ error: "webhook_url_bad_protocol" }, 422);
+      } catch { return json({ error: "webhook_url_invalid" }, 422); }
+    }
+    const enabled = b?.enabled === true;
+    if (enabled && !url) return json({ error: "webhook_url_required" }, 422);
+    const rawTopics = Array.isArray(b?.topics) ? b.topics : ["submission"];
+    const topics = [...new Set(rawTopics.map((x: any) => String(x).trim()).filter(Boolean))];
+    if (!topics.length || topics.some((x) => !WEBHOOK_TOPICS.has(x)))
+      return json({ error: "bad_webhook_topics", allowed: [...WEBHOOK_TOPICS] }, 422);
+    const prev: WebhookConfig | undefined = await this.st.get("webhook:config").catch(() => undefined);
+    const secret = String(b?.secret ?? "").trim();
+    if (secret && (secret.length < 8 || secret.length > 128))
+      return json({ error: "webhook_secret_length", min: 8, max: 128 }, 422);
+    if (enabled && !secret && !prev?.secret)
+      return json({ error: "webhook_secret_required", hint: "启用 webhook 必须设置签名密钥；至少 8 位" }, 422);
+    const next: WebhookConfig = { enabled, url, topics,
+      secret: secret || prev?.secret || "", updated_at: Date.now() };
+    await this.st.put("webhook:config", next);
+    return json({ ok: true, enabled, url, topics, has_secret: !!next.secret });
+  }
+
+  private async webhookTest() {
+    const cfg: WebhookConfig | undefined = await this.st.get("webhook:config").catch(() => undefined);
+    if (!cfg?.enabled || !cfg.url) return json({ error: "webhook_disabled" }, 409);
+    const event = { id: `test-${Date.now()}`, source: "synapse-agent-hub",
+      project: this.projectSlug(), type: "webhook.test", seq: 0,
+      ts: new Date().toISOString(), sender: "system", to: "admin",
+      data: { message: "Synapse webhook self-test" } };
+    const result = await this.postWebhook(cfg, event);
+    await this.recordWebhook({ event_type: event.type, ok: result.ok,
+                               status: result.status, error: result.error ?? null, seq: 0 });
+    return json({ ok: result.ok, status: result.status, error: result.error ?? null });
   }
 
   // ── 消息追加：seq 分配 + dedupe ─────────────────────────────
@@ -337,6 +657,9 @@ export class ProjectRoom implements DurableObject {
              (msg as any).to ?? null, JSON.stringify(msg.payload ?? {}), msg.ts).run();
     } catch { /* D1 抖动时保留 DO 热副本 */ }
     this.push(msg);
+    // 事件推送：先立即 POST webhook；失败进 whq 重试队列，不阻塞 append/主流程。
+    // artifact(submission) 是管理侧最关心的“交付到达”事件；task 等按订阅开关。
+    this.scheduleWebhook(msg);
     return seq;
   }
 
@@ -369,7 +692,15 @@ export class ProjectRoom implements DurableObject {
     }
     this.state.acceptWebSocket(server, [me]);
     try { server.serializeAttachment({ me, role, at: Date.now() }); } catch { /* 兼容旧运行时 */ }
-    server.send(JSON.stringify({ type: "hello", at: Date.now() }));
+    server.send(JSON.stringify({
+      type: "hello", at: Date.now(), role, agent_id: me,
+      events: true, event_version: 1,
+      event_types: ["submission.created", "submission.reviewed", "submission.collected",
+                    "submission.archived", "task.created", "task.queued", "task.dispatched",
+                    "task.claimed", "task.released", "task.blocked", "task.done",
+                    "task.reopened", "task.reclaimed", "task.reassigned", "task.updated",
+                    "announcement.created", "notice.created", "system.notice"],
+    }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -391,8 +722,12 @@ export class ProjectRoom implements DurableObject {
       const me = att?.me ?? "unknown";
       const isAdmin = att?.role === "admin";
       // 与 HTTP inbox 使用同一套可见性：管理端看全量；普通 agent 只看定向消息和管理端广播。
-      if (!isAdmin && !this.agentCanSee(msg, me)) continue;
-      try { ws.send(payload); } catch { /* 单条连接坏了就跳过 */ }
+      if (isAdmin || this.agentCanSee(msg, me)) {
+        try { ws.send(payload); } catch { /* 单条连接坏了就跳过 */ }
+      }
+      // 事件帧独立于原始消息：普通 agent 看不到别人的 artifact 原文，但能收到
+      // 与自己相关的 submission.created 事件。订阅方只解析 type，不解析 topic/kind。
+      this.pushEvent(msg, ws, att);
     }
   }
 
@@ -457,8 +792,47 @@ export class ProjectRoom implements DurableObject {
       : (page.length < limit ? lastRawSeq : page[page.length - 1].seq);
     // 房间被重建（换命名空间）时 seq 会从头开始，客户端靠 epoch 判断要重置游标
     const epoch = await this.room();
-    return json({ messages: page, next_cursor: next, epoch,
+    // 事件视图与消息视图共用游标，但可见范围独立：普通 agent 收不到别人的 artifact 原文，
+    // 仍应收到自己的 submission.created；管理端（me="*"）看全量。
+    const eventAtt = { me: me === "*" ? "*" : me, role: (me === "*" || me === null) ? "admin" : "agent" };
+    const eventRows = rawMessages
+      .map((m: any) => ({ m, e: this.clientEventOf(m) }))
+      .filter((x: any) => x.e && this.eventVisible(x.e, eventAtt))
+      .map((x: any) => x.e);
+    const events = desc ? eventRows.slice(-limit) : eventRows.slice(0, limit);
+    return json({ messages: page, events, next_cursor: next, epoch,
                   has_more: rawMessages.length > page.length });
+  }
+
+  /** 事件专用拉取：给没有 WebSocket 的客户端/降级通道用；游标与消息 seq 同源。 */
+  private async eventsFeed(url: URL) {
+    const since = Number(url.searchParams.get("since") ?? 0);
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 100)));
+    const me = url.searchParams.get("agent");
+    const topics = url.searchParams.get("topics");
+    const project = url.searchParams.get("project");
+    // 不能把 topics 交给 inbox：submission.created 的原始消息 topic 是 artifact，
+    // 用 submission 过滤会把它整条排掉。这里取全量事件，再按事件类别过滤。
+    const r = await this.inbox(since, null, limit, me, false, project);
+    const d: any = await r.json().catch(() => ({}));
+    let events: any[] = d.events ?? [];
+    if (topics) {
+      const wanted = new Set(topics.split(",").map((s) => s.trim()).filter(Boolean));
+      if (!wanted.has("all")) {
+        events = events.filter((e: any) => {
+          const type = String(e.type ?? "");
+          const category = type.startsWith("task.") ? "task"
+            : type.startsWith("submission.") ? "submission"
+            : type.startsWith("announcement.") ? "announce"
+            : type.startsWith("notice.") ? "admin"
+            : type.startsWith("system.") ? "system"
+            : type.split(".")[0] || "";
+          return wanted.has(category) || (category === "submission" && wanted.has("artifact"));
+        });
+      }
+    }
+    return json({ events, next_cursor: d.next_cursor ?? since,
+                  epoch: d.epoch ?? null });
   }
 
   // ── 心跳：覆盖写 + 顺带续租 + 每 5 分钟落一行历史 ──────────
@@ -597,7 +971,22 @@ export class ProjectRoom implements DurableObject {
     const dispatch = to
       ? await this.dispatchTaskOrQueue(projectName, t)
       : { notified: false, max_parallel: 0 };
-    const seq = dispatch.seq ?? null;
+    // 公共池任务没有定向消息，也必须让管理端知道“有一张新单”。只发管理端可见，
+    // 普通 agent 仍通过任务池发现，不把创建事件当工作指令。
+    let createdSeq: number | undefined;
+    if (!to) {
+      try {
+        createdSeq = await this.append({
+          project: projectName, sender: "admin", topic: "task", kind: "created", to: "admin",
+          payload: { task_id: id, title, body: String(b.body ?? ""), state: "open",
+                     issue_id: issueId, work_item: false },
+          dedupe_key: `task-created:${id}`,
+        });
+      } catch (e: any) {
+        console.warn("task created event failed", id, e?.message ?? e);
+      }
+    }
+    const seq = dispatch.seq ?? createdSeq ?? null;
     // S5：指派事件至少落一条定向消息（节点 wait/run 下一次拉取即被唤醒）。
     // 离线节点仍收不到，管理台账用 to_online 明确标出，避免“已派单”造成在线错觉。
     const hb: any = to ? await this.st.get(`agent:${to}`).catch(() => null) : null;
@@ -1056,12 +1445,14 @@ export class ProjectRoom implements DurableObject {
     const to = String(b.to ?? "").trim();
     if (!to) return json({ error: "assignee_required" }, 422);
     const now = Date.now();
-    // 同人转派是 no-op，不能把正在 claimed 的任务重置成 open，否则等于静默丢锁；
-    // 未 claim 但已经指向同一人时也必须 no-op，否则会走一遍 queued → promote
-    // → dispatch，可能把同一条任务重复下发。
-    if (t.state === "claimed" && t.owner === to)
-      return json({ ok: true, task: t, already: true, brief_embedded: true });
-    if (t.to === to)
+    // 同人转派是 no-op，不能把正在 claimed 的任务重置成 open，否则等于静默丢锁。
+    // 但只有任务确实已在目标队列/在途时才 no-op：blocked/released、以及 agent
+    // release(open) 后 dispatch_state=closed 的任务仍保留 to，必须允许重新派给同一人，
+    // 否则“阻塞/放弃 → 转派给原节点”会被误判成 already，任务永久卡住。
+    const ds = this.dispatchStateOf(t);
+    const sameLane = t.to === to
+      && (t.state === "claimed" ? t.owner === to : ["queued", "notified", "active"].includes(ds));
+    if (sameLane)
       return json({ ok: true, task: t, already: true, brief_embedded: true });
     const forced = b?.force === true;
     // 互斥/租约保护：有效 claim 期间默认拒绝转派，避免正在做工的人被中途换掉。
@@ -1469,6 +1860,10 @@ export class ProjectRoom implements DurableObject {
     return json({ ok: true, agent_id: agentId, reminded_at: now, idle_since_ms: idleSince });
   }
 
+  async alarm() {
+    try { await this.flushWebhooks(); } catch (e) { console.warn("webhook alarm failed", e); }
+  }
+
   private async snapshot() {
     const seq = (await this.st.get<number>("seq")) ?? 0;
     const now = Date.now();
@@ -1507,7 +1902,9 @@ export class ProjectRoom implements DurableObject {
     }
     const project = String(b?.project ?? "").trim();
     const idle = project ? await this.idleTick(project) : { reminded: 0, flagged: 0 };
-    return json({ ok: true, reclaimed, ...idle });
+    // 兜底：alarm 没触发时，每分钟 cron 也把 webhook 重试队列推一遍。
+    const webhook = await this.flushWebhooks();
+    return json({ ok: true, reclaimed, webhook, ...idle });
   }
 }
 

@@ -64,7 +64,8 @@ class Loop:
     def _probe_ws(self) -> None:
         try:
             self._ws = WSPump(self.c.endpoint, self.c.project, self.c.ws_ticket,
-                              on_msg=self._on_ws_msg, on_state=self._on_ws_state)
+                              on_msg=self._on_ws_msg, on_state=self._on_ws_state,
+                              on_event=self._on_ws_event)
             self._ws.start()
             if self._ws.connected_once.wait(timeout=self.ws_probe_s):
                 self._mode = "ws"
@@ -82,6 +83,17 @@ class Loop:
                 self._mode = "ws"
             # 重连后必须补拉断线期间的消息；不补就会永久停在旧游标。
             self._catch_up()
+
+    def _on_ws_event(self, event: dict) -> None:
+        # 事件只做通知，不进任务队列，不 ACK，不触发 exec/窗口注入。
+        self.c._dispatch_event(event)
+
+    def _poll_events(self) -> None:
+        try:
+            for e in self.c.poll_events():
+                self.c._dispatch_event(e)
+        except Exception:                 # noqa: BLE001
+            pass                          # 通知失败不能影响任务主循环
 
     def _on_ws_msg(self, m: dict) -> None:
         if not self.c.is_for_me(m):
@@ -109,6 +121,7 @@ class Loop:
                     self._q.put(m)
                     self._maybe_ack(m)
                 self._need_catchup = False
+                self._poll_events()          # 断线期间漏掉的事件也必须补通知
             except Exception:                 # noqa: BLE001
                 # 网络失败不阻塞 WSPump 收包；下次连接/空闲再补
                 pass
@@ -151,6 +164,7 @@ class Loop:
                     self._maybe_ack(m)
             except Exception:                          # noqa: BLE001
                 pass                                   # 网络抖动不该杀掉任务
+            self._poll_events()
             self._stop.wait(self.poll_s)
 
     def _maybe_ack(self, m: dict) -> None:
@@ -206,6 +220,7 @@ class Loop:
                 msgs = self.c.poll_inbox()
             except Exception:                          # noqa: BLE001
                 msgs = []
+            self._poll_events()
             if msgs:
                 self._enter_busy("接任务")
                 for m in msgs[1:]:

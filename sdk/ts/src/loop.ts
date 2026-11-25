@@ -60,6 +60,7 @@ export class Loop {
         this.q.push(m);
         await this.maybeAck(m);
       }
+      await this.pollEvents();
     } catch { /* 网络抖动不杀任务 */ }
     finally { this.inflight = false; }
   }
@@ -124,6 +125,11 @@ export class Loop {
   private onWsMessage(ev: any): void {
     try {
       const m = JSON.parse(String(ev.data));
+      if (m?.type === "event" && m.event) {
+        // 事件只做通知，不进入任务队列，不 ACK。
+        this.c.dispatchEvent(m.event);
+        return;
+      }
       if (m?.type === "msg" && this.c.isForMe(m)) {   // 回声/自广播不进队列
         const seq = Number(m.seq) || 0;
         if (!this.q.some((x) => x.seq === m.seq)) this.q.push(m);
@@ -139,6 +145,14 @@ export class Loop {
     void this.c.pollInbox()
       .then((msgs: any[]) => { for (const m of msgs) this.q.push(m); })
       .catch(() => {});
+    void this.pollEvents();
+  }
+
+  private async pollEvents(): Promise<void> {
+    try {
+      const events = await this.c.pollEvents();
+      for (const e of events) this.c.dispatchEvent(e);
+    } catch { /* 通知失败不影响任务主循环 */ }
   }
 
   private async maybeAck(m: Record<string, any>): Promise<void> {
@@ -189,6 +203,7 @@ export class Loop {
       if (this.mode === "ws") return null;
     }
     while (Date.now() < deadline) {
+      await this.pollEvents();
       try {
         const msgs = await this.c.pollInbox();
         if (msgs.length) {

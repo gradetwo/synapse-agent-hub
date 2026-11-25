@@ -35,6 +35,9 @@ struct Cfg {
     dir: PathBuf,
     heartbeat_s: u64,
     exec_cmd: Option<String>,
+    /// 实时事件回调命令（可选）。每条 task.* / submission.* 事件作为一行 JSON
+    /// 从 stdin 传入；不配置时只落 events.jsonl，不影响原有任务投递。
+    event_cmd: Option<String>,
     /// 默认窗口目标（应用名，如「豆包」），由 win-config 写入 config.json。
     window_app: String,
     /// 目标会话标题（特殊标记，如「◆dou-win-133」）。非空时窗口投递前先确保
@@ -88,6 +91,7 @@ impl Cfg {
             cmd: self.cmd.clone(), endpoint: self.endpoint.clone(), project: self.project.clone(),
             token: self.token.clone(), agent_id: self.agent_id.clone(), dir: self.dir.clone(),
             heartbeat_s: self.heartbeat_s, exec_cmd: self.exec_cmd.clone(),
+            event_cmd: self.event_cmd.clone(),
             window_app: self.window_app.clone(), window_conversation: self.window_conversation.clone(),
             window_forward: self.window_forward,
             tmux_target: self.tmux_target.clone(), tmux_forward: self.tmux_forward,
@@ -173,7 +177,15 @@ impl Cfg {
             .or_else(|| std::env::var("SYNAPSE_TMUX_VERIFY").ok().filter(|s| !s.is_empty()).map(|v| cfg_truthy(&v)))
             .or_else(|| saved["tmux_verify"].as_bool())
             .unwrap_or(true);
-        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(), heartbeat_s, dir, window_app, window_conversation, window_forward, tmux_target, tmux_forward, tmux_verify }
+        Cfg { cmd, endpoint, project, token, agent_id, exec_cmd: map.get("exec").cloned(),
+              event_cmd: map.get("event-cmd").cloned().filter(|s| !s.trim().is_empty())
+                .or_else(|| saved["event_cmd"].as_str().map(|s| s.to_string())
+                  .filter(|s| !s.trim().is_empty()))
+                .or_else(|| std::env::var("SYNAPSE_EVENT_CMD").ok()
+                  .filter(|s| !s.trim().is_empty()))
+                .or_else(|| std::env::var("YANSHI_EVENT_CMD").ok()
+                  .filter(|s| !s.trim().is_empty())),
+              heartbeat_s, dir, window_app, window_conversation, window_forward, tmux_target, tmux_forward, tmux_verify }
     }
 }
 
@@ -288,6 +300,78 @@ fn epoch_set(dir: &PathBuf, ep: &str) {
     let _ = fs::write(dir.join("epoch.tmp"), ep);
     let _ = fs::rename(dir.join("epoch.tmp"), dir.join("epoch.txt"));
 }
+
+// ── 客户端实时事件：task.* / submission.* / announce 等 ──────
+fn event_cursor_get(dir: &PathBuf) -> u64 {
+    fs::read_to_string(dir.join("event_cursor.txt")).ok()
+        .and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+fn event_cursor_set(dir: &PathBuf, seq: u64) {
+    let _ = fs::write(dir.join("event_cursor.tmp"), seq.to_string());
+    let _ = fs::rename(dir.join("event_cursor.tmp"), dir.join("event_cursor.txt"));
+}
+fn event_epoch_get(dir: &PathBuf) -> String {
+    fs::read_to_string(dir.join("event_epoch.txt")).unwrap_or_default()
+}
+fn event_epoch_set(dir: &PathBuf, ep: &str) {
+    let _ = fs::write(dir.join("event_epoch.tmp"), ep);
+    let _ = fs::rename(dir.join("event_epoch.tmp"), dir.join("event_epoch.txt"));
+}
+
+/// 事件只落本地日志/执行通知回调，绝不进入任务 WAL，也不会被 exec/窗口消费。
+fn deliver_client_event(cfg: &Cfg, event: &Value) {
+    if event.is_null() { return; }
+    let seq = event["seq"].as_u64().unwrap_or(0);
+    if seq > 0 && seq > event_cursor_get(&cfg.dir) { event_cursor_set(&cfg.dir, seq); }
+    let line = serde_json::to_string(event).unwrap_or_default();
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true)
+        .open(cfg.dir.join("events.jsonl")) {
+        let _ = writeln!(f, "{line}");
+    }
+    if let Some(cmd) = &cfg.event_cmd {
+        exec_task(cmd, &line);
+    } else {
+        println!("{line}");
+    }
+}
+
+/// 降级轮询：与消息 /inbox 分开拉事件；事件游标独立，不消费任务消息。
+fn fetch_events(cfg: &Cfg, agent: &Agent, base: &str) -> Option<Vec<Value>> {
+    let mut since = event_cursor_get(&cfg.dir);
+    let mut tries = 0;
+    loop {
+        let url = format!("{}/p/{}/events?since={}&limit=100", base, cfg.project, since);
+        let r = agent.get(&url)
+            .set("authorization", &format!("Bearer {}", cfg.token))
+            .set("connection", "close")
+            .call().ok()?;
+        let v: Value = r.into_json().ok()?;
+        let ep = v["epoch"].as_str().unwrap_or("").to_string();
+        if tries == 0 && !ep.is_empty() && event_epoch_get(&cfg.dir) != ep {
+            event_cursor_set(&cfg.dir, 0);
+            event_epoch_set(&cfg.dir, &ep);
+            since = 0;
+            tries = 1;
+            continue;
+        }
+        if !ep.is_empty() { event_epoch_set(&cfg.dir, &ep); }
+        let events = v["events"].as_array().cloned().unwrap_or_default();
+        let next = v["next_cursor"].as_u64().unwrap_or(since);
+        if let Some(last) = events.last().and_then(|e| e["seq"].as_u64()) {
+            event_cursor_set(&cfg.dir, last.max(next));
+        } else if next > since {
+            event_cursor_set(&cfg.dir, next);
+        }
+        return Some(events);
+    }
+}
+
+fn publish_events(cfg: &Cfg, agent: &Agent, base: &str) {
+    if let Some(events) = fetch_events(cfg, agent, base) {
+        for e in events { deliver_client_event(cfg, &e); }
+    }
+}
+
 
 fn cursor_get(dir: &PathBuf) -> u64 {
     fs::read_to_string(dir.join("cursor.json"))
@@ -667,6 +751,9 @@ fn reset_room_state(cfg: &Cfg, epoch: &str, journal: Option<&Arc<Mutex<Vec<Value
 /// 一条真实 Hub 消息，验证服务端 → WebSocket → 窗口这条链路；生产不要设置。
 fn is_noise(cfg: &Cfg, m: &Value) -> bool {
     if m["topic"].as_str() == Some("ack") { return true; }
+    // 事件通知（task.queued/task.created）和交付记录不是任务正文，不能交给 exec/窗口。
+    if m["payload"]["work_item"].as_bool() == Some(false) { return true; }
+    if matches!(m["topic"].as_str(), Some("submission") | Some("artifact")) { return true; }
     if m["sender"].as_str() == Some(cfg.agent_id.as_str())
         && std::env::var("SYNAPSE_INCLUDE_SELF").ok().as_deref() != Some("1")
     {
@@ -1159,7 +1246,7 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | subs | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
+        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--event-cmd \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | subs | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
   synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查\n\n单机多身份（同一用户同时跑两个 synapse-agent 身份）:\n  所有子命令都可用 --config-dir <路径> 指定状态目录（config.json / cursor.json / run.lock /\n  run.state.json / 本机总线套接字都在该目录下）；也可用环境变量 SYNAPSE_AGENT_DIR 指定。\n  优先级：--config-dir > SYNAPSE_AGENT_DIR > 缺省 ~/.synapse-agent。\n  例：synapse-agent init --config-dir ~/.synapse-agent-2 --endpoint <url> --project <p> --token <t> --agent <id2>\n      synapse-agent run  --config-dir ~/.synapse-agent-2\n  不传覆盖时行为与旧版完全一致；不同目录的实例互不影响，同目录仍只允许一个 run 常驻。\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -1280,6 +1367,8 @@ fn main() {
             println!("{}", json!({
                 "endpoint": cfg.endpoint, "project": cfg.project, "agent_id": cfg.agent_id,
                 "cursor": since,
+                "event_cursor": event_cursor_get(&cfg.dir),
+                "event_cmd": cfg.event_cmd,
                 "unacked": journal_load(&cfg.dir).len(),
                 "connected": st["connected"].clone(),
                 "transport": st["transport"].clone(),
@@ -1604,8 +1693,10 @@ fn main() {
             return;
         }
         "task-release" => {
-            let id = args_map.get("task").or_else(|| args_map.get("task-id")).cloned().unwrap_or_default();
-            if id.trim().is_empty() { eprintln!("task-release 需要 --task <id>"); std::process::exit(2); }
+            let id = args_map.get("task").or_else(|| args_map.get("task-id"))
+                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                .or_else(|| active_task_id(&cfg)).unwrap_or_default();
+            if id.trim().is_empty() { eprintln!("task-release 需要 --task <id>，或先 claim 写入 active_task.json"); std::process::exit(2); }
             let state = args_map.get("state").cloned().unwrap_or_else(|| "done".into());
             if !["done", "open", "blocked"].contains(&state.as_str()) {
                 eprintln!("task-release --state 只能是 done|open|blocked"); std::process::exit(2);
@@ -2896,6 +2987,8 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
             let retried = retry_pending_surfaces(cfg, agent, base, &journal, &last_msg);
             if retried > 0 { eprintln!("[poll] 重试补发 {retried} 条外部投递消息"); }
         }
+        // 事件与消息是两条独立流：即使当前没有任务消息，也要把 task/submission 通知推给回调。
+        publish_events(cfg, agent, base);
         if let Some(msgs) = fetch_inbox(&cfg, &agent, &base, cursor_get(&cfg.dir), 5, Some(&journal), true) {
             for m in msgs {
                 if is_noise(&cfg, &m) || !for_me(&cfg, &m) { continue; }
@@ -3040,6 +3133,8 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                                 _ => break,
                             }
                         }
+                        // 断线期间漏掉的事件也补一遍；事件游标独立，不受消息 cursor 影响。
+                        publish_events(&cfg2, &agent2, &base2);
                         let mut timeouts = 0u32;
                         loop {
                             match sock.read() {
@@ -3050,6 +3145,10 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                                         if v["type"] == "msg" {
                                             deliver_ws(&cfg2, &agent2, &base2, &journal2, &v,
                                                        &tx2, &queue2, &last2);
+                                        } else if v["type"] == "event" {
+                                            // 事件帧只做通知：落 events.jsonl / 执行 event-cmd，
+                                            // 不进入任务队列，不会被窗口 dispatcher 当成任务。
+                                            deliver_client_event(&cfg2, &v["event"]);
                                         }
                                     }
                                 }
@@ -3296,6 +3395,7 @@ mod tests {
             dir,
             heartbeat_s: 30,
             exec_cmd: None,
+            event_cmd: None,
             window_app: String::new(),
             window_conversation: String::new(),
             window_forward: false,
@@ -3399,6 +3499,31 @@ mod tests {
         assert_eq!(cursor_get(&dir), 9);
         let raw = fs::read_to_string(dir.join("cursor.json")).unwrap();
         assert!(serde_json::from_str::<Value>(&raw).is_ok(), "cursor must stay valid JSON");
+    }
+
+    #[test]
+    fn event_cursor_is_independent_from_task_cursor() {
+        let dir = scratch("event-cursor");
+        cursor_set(&dir, 41);
+        event_cursor_set(&dir, 7);
+        assert_eq!(cursor_get(&dir), 41, "消费消息不能推进事件游标");
+        assert_eq!(event_cursor_get(&dir), 7, "事件游标独立落盘");
+        event_epoch_set(&dir, "ep-a");
+        assert_eq!(event_epoch_get(&dir), "ep-a");
+    }
+
+    #[test]
+    fn client_event_is_logged_not_persisted_as_task() {
+        let dir = scratch("event-log");
+        let cfg = test_cfg(dir.clone());
+        let event = json!({"id": "evt-p-9", "type": "submission.created", "seq": 9,
+                           "task_id": "t1", "submission_id": "s1"});
+        deliver_client_event(&cfg, &event);
+        assert_eq!(event_cursor_get(&dir), 9);
+        let log = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "submission.created");
+        assert!(journal_load(&dir).is_empty(), "事件绝不能进入任务 WAL");
     }
 
     #[test]

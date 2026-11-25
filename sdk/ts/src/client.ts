@@ -38,6 +38,7 @@ export class Client {
   private timer?: any;
   private running = false;
   private hb = 0;
+  private eventListeners = new Set<(event: any) => void>();
 
   constructor(opts: ClientOptions) {
     if (opts.endpoint.startsWith("http://") && !/127\.0\.0\.1|localhost/.test(opts.endpoint))
@@ -153,6 +154,53 @@ export class Client {
     });
   }
 
+  /** 订阅客户端实时事件（task.* / submission.* / announce 等）。返回取消订阅函数。 */
+  onEvent(listener: (event: any) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
+  dispatchEvent(event: any): void {
+    if (!event) return;
+    const seq = Number(event.seq) || 0;
+    if (seq > 0 && seq > this.eventCursorLoad()) this.eventCursorSave(seq);
+    for (const fn of this.eventListeners) {
+      try { fn(event); } catch { /* 单个通知回调不能打断 WS 收包 */ }
+    }
+  }
+
+  /** 降级轮询事件流：与消息流使用独立游标，不会把任务消息消费掉。 */
+  async *eventStream(topics?: string, signal?: AbortSignal): AsyncGenerator<any> {
+    this.start();
+    while (!signal?.aborted) {
+      const events = await this.pollEvents(topics);
+      for (const e of events) yield e;
+      if (!events.length) await new Promise((s) => setTimeout(s, 1000));
+    }
+  }
+
+  async pollEvents(topics?: string, limit = 100): Promise<any[]> {
+    let since = this.eventCursorLoad();
+    const q = (cursor: number) => `/p/${this.opts.project}/events?since=${cursor}&limit=${limit}`
+      + (topics ? `&topics=${encodeURIComponent(topics)}` : "");
+    let r = await this.get(q(since));
+    const ep = String(r.epoch ?? "");
+    if (ep && ep !== this.eventEpochLoad()) {
+      // 房间重建：seq 归零，旧事件游标作废
+      this.eventCursorSave(0, ep);
+      since = 0;
+      r = await this.get(q(0));
+    }
+    const events: any[] = r.events ?? [];
+    const next = Number(r.next_cursor ?? since);
+    if (events.length) {
+      this.eventCursorSave(Math.max(next, Number(events[events.length - 1]?.seq) || 0));
+    } else if (Number.isFinite(next) && next > since) {
+      this.eventCursorSave(next);
+    }
+    return events;
+  }
+
   /** 换一次性 WS 票据（90 秒、用过即废），避免 token 进 URL */
   async wsTicket(): Promise<string> {
     const r = await this.get(`/p/${this.opts.project}/ws-ticket`);
@@ -161,7 +209,13 @@ export class Client {
 
   /** 从游标处拉新消息；不投递，只取数据（Loop 用） */
   /** 自己发出的广播不回收，否则自己回复自己会形成回声风暴 */
-  isForMe(m: any): boolean { return !(m?.sender === this.opts.agentId && !m?.to); }
+  isForMe(m: any): boolean {
+    // 事件通知不是任务正文：work_item=false 的排队/创建消息不能进入执行队列。
+    if (m?.payload?.work_item === false) return false;
+    if (m?.topic === "submission" || m?.topic === "artifact") return false;
+    if (m?.topic === "task" && m?.kind !== "task" && m?.kind !== "reassigned") return false;
+    return !(m?.sender === this.opts.agentId && !m?.to);
+  }
 
   /** WS 收到并确认要处理后推进游标；重连 catch-up 不会重复投递。 */
   advanceCursor(seq: number): void {
@@ -349,6 +403,19 @@ export class Client {
   asAdmin() { return new Admin(this); }
 
   private cursorPath() { return join(this.opts.stateDir, "cursor.json"); }
+  private eventCursorPath() { return join(this.opts.stateDir, "event_cursor.json"); }
+  private eventCursorLoad(): number {
+    try { return JSON.parse(readFileSync(this.eventCursorPath(), "utf8")).seq ?? 0; } catch { return 0; }
+  }
+  private eventEpochLoad(): string {
+    try { return JSON.parse(readFileSync(this.eventCursorPath(), "utf8")).epoch ?? ""; } catch { return ""; }
+  }
+  private eventCursorSave(seq: number, epoch?: string) {
+    const tmp = this.eventCursorPath() + ".tmp";
+    const ep = epoch ?? this.eventEpochLoad();
+    writeFileSync(tmp, JSON.stringify({ seq, at: Date.now(), ...(ep ? { epoch: ep } : {}) }));
+    renameSync(tmp, this.eventCursorPath());
+  }
   private cursorLoad(): number {
     try { return JSON.parse(readFileSync(this.cursorPath(), "utf8")).seq ?? 0; } catch { return 0; }
   }

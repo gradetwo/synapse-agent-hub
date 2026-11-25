@@ -92,6 +92,9 @@ class Client:
         self._cpu_prev = self._read_stat()
         self._stop = threading.Event()
         self._hb_thread: threading.Thread | None = None
+        # 事件订阅与消息订阅分离：事件只通知，不进入任务队列，不会误触 exec/窗口注入。
+        self._event_handlers: list = []
+        self._event_lock = threading.Lock()
         # 默认直连（NO_PROXY=* 这类环境里 requests 仍可能把 localhost 代理配置套上去）；
         # 需要走公司代理时显式设置 SYNAPSE_TRUST_ENV=1。
         self._sess = requests.Session()
@@ -206,6 +209,66 @@ class Client:
             elif next_cursor > since:
                 self._cursor_save(max(next_cursor, self._cursor_load()))
 
+    def event_stream(self, topics: str | None = None, timeout: int = 25) -> Iterator[dict]:
+        """客户端事件流（降级轮询也用这个）：只产出稳定事件，不产出任务正文消息。
+
+        有 WS 长连接时由 Loop 的 on_event 实时回调；没有 WS 时用本方法拉 /events。
+        事件游标独立于消息游标，避免通知和任务消费互相推进。
+        """
+        self.start_heartbeat()
+        while not self._stop.is_set():
+            events = self.poll_events(topics=topics)
+            for ev in events:
+                yield ev
+            if not events:
+                time.sleep(1)
+
+    def poll_events(self, topics: str | None = None, limit: int = 100) -> list[dict]:
+        """从独立事件游标拉一批事件；不阻塞、不 ACK。"""
+        since = self._event_cursor_load()
+        q = f"/p/{self.project}/events?since={since}&limit={limit}"
+        if topics:
+            q += f"&topics={quote(str(topics), safe='')}"
+        r = self._get(q)
+        ep = r.get("epoch")
+        if ep and ep != self._event_epoch_load():
+            # 房间重建：seq 归零，旧事件游标不能继续用
+            self._event_cursor_save(0, ep)
+            since = 0
+            q = f"/p/{self.project}/events?since=0&limit={limit}"
+            if topics:
+                q += f"&topics={quote(str(topics), safe='')}"
+            r = self._get(q)
+        events = list(r.get("events") or [])
+        next_cursor = int(r.get("next_cursor") or since)
+        if events:
+            self._event_cursor_save(max(next_cursor, int(events[-1].get("seq") or 0)))
+        elif next_cursor > since:
+            self._event_cursor_save(next_cursor)
+        return events
+
+    def on_event(self, handler):
+        """注册实时事件回调；返回 handler 本身，可直接当装饰器使用。
+        回调在 WS 收包线程执行，不能阻塞太久；异常只记录，不打断连接。
+        """
+        with self._event_lock:
+            self._event_handlers.append(handler)
+        return handler
+
+    def _dispatch_event(self, event: dict) -> None:
+        if not event:
+            return
+        seq = int(event.get("seq") or 0)
+        if seq > 0 and seq > self._event_cursor_load():
+            self._event_cursor_save(seq)
+        with self._event_lock:
+            handlers = list(self._event_handlers)
+        for h in handlers:
+            try:
+                h(event)
+            except Exception:
+                pass
+
     def publish(self, topic: str, kind: str, payload: Any, dedupe_key: str | None = None) -> dict:
         """发布消息。网络失败时落盘到 outbox，恢复后 drain() 重放（同 dedupe_key 幂等）。"""
         key = dedupe_key or f"{self.agent_id}:{uuid.uuid4().hex}"
@@ -251,6 +314,16 @@ class Client:
     # ── 指令投递（不依赖 agent 主动读）────────────────────────
     def is_for_me(self, m: dict) -> bool:
         """自己发出的广播不回收，否则会自己回复自己，形成回声风暴。"""
+        if (m.get("payload") or {}).get("work_item") is False:
+            # 事件通知（task.queued/task.created 等）不是任务正文，不能进入执行队列。
+            return False
+        if m.get("topic") in ("submission", "artifact"):
+            # 交付到达/裁决是通知事件；任务正文通过 task.* 事件和 msg 通道分开处理。
+            return False
+        if m.get("topic") == "task" and m.get("kind") not in ("task", "reassigned"):
+            # claimed/released/done/queued 等生命周期通知不进入执行队列；
+            # 真正的任务正文 kind=task 或带正文的 reassigned 才交给 handler。
+            return False
         if m.get("sender") == self.agent_id and not m.get("to"):
             return False
         return True
@@ -499,6 +572,27 @@ class Client:
     # ── 内部：本地状态 ───────────────────────────────────────
     def _cursor_path(self) -> Path:
         return self.state_dir / "cursor.json"
+
+    def _event_cursor_path(self) -> Path:
+        return self.state_dir / "event_cursor.json"
+
+    def _event_cursor_load(self) -> int:
+        try:
+            return int(json.loads(self._event_cursor_path().read_text())["seq"])
+        except Exception:
+            return 0
+
+    def _event_epoch_load(self) -> str | None:
+        try:
+            return json.loads(self._event_cursor_path().read_text()).get("epoch")
+        except Exception:
+            return None
+
+    def _event_cursor_save(self, seq: int, epoch: str | None = None) -> None:
+        tmp = self._event_cursor_path().with_suffix(".tmp")
+        ep = epoch if epoch is not None else self._event_epoch_load()
+        tmp.write_text(json.dumps({"seq": seq, "at": time.time(), **({"epoch": ep} if ep else {})}))
+        os.replace(tmp, self._event_cursor_path())
 
     def _cursor_load(self) -> int:
         try:
