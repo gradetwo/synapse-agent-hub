@@ -647,6 +647,10 @@ if (location.search.includes("reset=1")) {
         <div class="obsDead" id="obsDead"><div class="scopeHint">没有死信</div></div>
       </div>
     </div>
+    <div class="obsPanel" style="margin:0 14px 14px">
+      <div class="dashHead">最老排队 / 离线目标 <span id="obsQueueHint" class="muted"></span></div>
+      <div class="obsDead" id="obsQueue"><div class="scopeHint">没有超过阈值的排队任务</div></div>
+    </div>
   </div>
 
   <div class="card" id="webhookCard">
@@ -1289,6 +1293,14 @@ function taskRow(t, isAll) {
     at.textContent = `重试 ${Number(t.attempts)}/${Number(t.max_attempts ?? 3)}`;
     cells[1].append(at);
   }
+  if (t.merged_sha) {
+    const mg = document.createElement("span");
+    mg.className = "badge done";
+    mg.style.marginLeft = "4px";
+    mg.title = `已合入 ${String(t.merged_sha)}${t.merged_branch ? ` @ ${t.merged_branch}` : ""}`;
+    mg.textContent = `合入 ${String(t.merged_sha).slice(0, 8)}`;
+    cells[1].append(mg);
+  }
   if (t.dispatch_state === "queued" && Number(t.retry_in_ms ?? 0) > 0) {
     const rq = document.createElement("span");
     rq.className = "badge released";
@@ -1380,7 +1392,12 @@ function taskRow(t, isAll) {
     tl.className = "ghost mini";
     tl.dataset.taskTimeline = id;
     tl.textContent = "时间线";
-    cells[7].append(tl);
+    const mg = document.createElement("button");
+    mg.type = "button";
+    mg.className = "ghost mini";
+    mg.dataset.taskMerge = id;
+    mg.textContent = t.merged_sha ? "改合入" : "合入";
+    cells[7].append(tl, document.createTextNode(" "), mg);
   } else {
     const tl = document.createElement("button");
     tl.type = "button";
@@ -1415,6 +1432,14 @@ function taskRow(t, isAll) {
       retry.textContent = "重试";
       extra.push(retry);
     }
+    if (st === "released") {
+      const mg = document.createElement("button");
+      mg.type = "button";
+      mg.className = "ghost mini";
+      mg.dataset.taskMerge = id;
+      mg.textContent = t.merged_sha ? "改合入" : "合入";
+      extra.push(mg);
+    }
     cells[7].append(tl, document.createTextNode(" "), close, document.createTextNode(" "),
                     ...extra.flatMap((b) => [b, document.createTextNode(" ")]),
                     reclaim, document.createTextNode(" "), select, document.createTextNode(" "), reassign);
@@ -1437,7 +1462,8 @@ function fmtDur(ms) {
 
 function mergeObs(list) {
   if (!list.length) return null;
-  const out = { ...list[0], summary: { ...list[0].summary }, lanes: [], recent_dead: [], health: { status: "ok", reasons: [] } };
+  const out = { ...list[0], summary: { ...list[0].summary }, lanes: [], recent_dead: [],
+                queue_alerts: [], health: { status: "ok", reasons: [] } };
   for (const item of list.slice(1)) {
     const a = out.summary, b = item.summary || {};
     for (const k of ["tasks_total", "active", "wip", "claimed", "queued", "retry_wait", "public_pool",
@@ -1454,6 +1480,7 @@ function mergeObs(list) {
   for (const item of list) {
     out.lanes.push(...(item.lanes || []).map((l) => ({ ...l, project: item.project })));
     out.recent_dead.push(...(item.recent_dead || []).map((d) => ({ ...d, project: item.project })));
+    out.queue_alerts.push(...(item.queue_alerts || []).map((q) => ({ ...q, project: item.project })));
     if (item.health?.status === "bad") out.health.status = "bad";
     else if (item.health?.status === "warn" && out.health.status !== "bad") out.health.status = "warn";
     for (const r of item.health?.reasons || []) if (!out.health.reasons.includes(r)) out.health.reasons.push(r);
@@ -1497,13 +1524,16 @@ function renderObservability() {
     $("obsKpis").innerHTML = `<div class="stat"><div class="k">效率观测</div><div class="v">—</div><div class="sub">部署 0057 后自动出现</div></div>`;
     $("obsLanes").innerHTML = `<div class="scopeHint">暂无数据</div>`;
     $("obsDead").innerHTML = `<div class="scopeHint">没有死信</div>`;
+    if ($("obsQueue")) $("obsQueue").innerHTML = `<div class="scopeHint">暂无数据</div>`;
     return;
   }
   const s = OBS.summary || {};
   const health = OBS.health?.status || "ok";
   const healthText = health === "bad" ? "风险" : health === "warn" ? "注意" : "健康";
+  const sv = OBS.server_version || {};
   $("obsStat").textContent = `${healthText}${OBS.health?.reasons?.length ? " · " + OBS.health.reasons.join("；") : ""}`
-    + (current === "*" ? " · 全部项目" : ` · 近 ${Math.round((OBS.window_ms || 0) / 3_600_000)}h`);
+    + (current === "*" ? " · 全部项目" : ` · 近 ${Math.round((OBS.window_ms || 0) / 3_600_000)}h`)
+    + (sv.sdk ? ` · server ${sv.sdk}` : "");
   $("obsStat").className = `muted ${health === "bad" ? "badv" : health === "warn" ? "warnv" : ""}`;
   const kpis = [
     { k: "队列深度", v: Number(s.queued ?? 0), sub: `退避 ${Number(s.retry_wait ?? 0)} · 公共池 ${Number(s.public_pool ?? 0)}`, cls: Number(s.queued ?? 0) ? "warn" : "ok" },
@@ -1530,6 +1560,26 @@ function renderObservability() {
       <div class="muted">${Number(l.completed_window ?? 0)} / <span class="${Number(l.failed_window ?? 0) ? "badv" : ""}">${Number(l.failed_window ?? 0)}</span></div>
     </div>`;
   }).join("") : `<div class="scopeHint">没有接入节点</div>`;
+  const queues = OBS.queue_alerts || [];
+  if ($("obsQueue")) {
+    $("obsQueueHint").textContent = queues.length ? `${queues.length} 个需处理` : "没有超阈值排队";
+    $("obsQueue").innerHTML = queues.length ? queues.map((q) => {
+      const id = String(q.task_id || "");
+      const proj = q.project && current === "*" ? ` · ${esc(q.project)}` : "";
+      const canAct = current !== "*";
+      return `<div style="display:flex;gap:6px;align-items:stretch">
+        <button type="button" data-task-timeline="${esc(id)}" title="查看时间线"
+          style="flex:1;min-width:0">
+          <div class="tid">${esc(id)}${proj}</div>
+          <div class="muted" style="font-size:11px">${esc(String(q.title || ""))} → ${esc(String(q.to || "?"))}
+            · 等 ${fmtDur(q.age_ms)} · ${esc(String(q.reason || ""))}</div>
+        </button>
+        <button type="button" data-task-requeue="${esc(id)}" ${canAct ? "" : "disabled"}
+          title="退回公共池，原定向节点不再收到该任务"
+          style="white-space:nowrap">退回公共池</button>
+      </div>`;
+    }).join("") : `<div class="scopeHint">没有超过阈值的排队任务；超过 2h 或目标离线超过 1h 会出现在这里。</div>`;
+  }
   const dead = OBS.recent_dead || [];
   $("obsDeadHint").textContent = dead.length ? `${dead.length} 个待重试` : "没有死信";
   $("obsDead").innerHTML = dead.length ? dead.map((d) =>
@@ -1560,14 +1610,21 @@ async function showTaskTimeline(taskId) {
       "task.claimed": "领取", "task.retry_scheduled": "失败退避", "task.retried": "重新下发",
       "task.failed": "失败", "task.dead_lettered": "进入死信", "task.released": "交付待取",
       "task.done": "完成", "task.reopened": "重开", "task.reclaimed": "取回",
-      "task.reassigned": "转派", "submission.created": "交付到达", "submission.reviewed": "交付裁决",
+      "task.reassigned": "转派", "task.merged": "已合入", "task.requeued": "退回公共池",
+      "submission.created": "交付到达", "submission.reviewed": "交付裁决",
       "submission.collected": "交付取走", "submission.archived": "交付归档",
+      "issue.created": "Issue 创建", "issue.closed": "Issue 关闭",
+      "issue.reopened": "Issue 重开", "issue.merged": "Issue 合并",
+      "issue.dispatched": "Issue 派发", "issue.updated": "Issue 更新",
+      "ci.status": "CI 状态", "alert.created": "告警",
     };
     const ev = (d.events || []).map((e) => {
       const at = e.ts ? new Date(e.ts).toLocaleString() : "—";
       const actor = e.actor || "system";
       const extra = e.data?.message || e.data?.error || e.data?.reason
+        || (e.data?.merged_sha ? `merged ${String(e.data.merged_sha).slice(0, 12)}` : "")
         || (e.data?.submission_id ? `submission ${e.data.submission_id}` : "")
+        || (e.data?.issue_id ? `issue ${e.data.issue_id}` : "")
         || (e.data?.queue_position ? `队列 #${e.data.queue_position}` : "");
       return `<div class="row" style="align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid #1d2530">
         <div class="muted mono" style="min-width:132px;font-size:10px">${esc(at)}</div>
@@ -1693,6 +1750,7 @@ async function loadTasks() {
   const keepTo = $("taskTo").value;
   $("taskTo").innerHTML = taskAgentOptions(keepTo);
   if (keepTo) $("taskTo").value = keepTo;
+  window._tasks = rows;
   const emptyTaskText = isAll ? "全部项目还没有任务" : "当前项目还没有任务，先在上面派一件";
   $("tasks").replaceChildren(...(rows.length ? rows.map((t) => taskRow(t, isAll)) : [emptyTableRow(8, emptyTaskText)]));
   reapplyFilters();
@@ -3766,7 +3824,7 @@ document.addEventListener("click", async (e) => {
     const issueState = dash.getAttribute("data-dash-issue");
     if (issueState) return showCardFilter("Issue", "issue", issueState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-task-retry],[data-task-timeline],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-task-retry],[data-task-timeline],[data-task-merge],[data-task-requeue],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const iv = btn.getAttribute("data-issue-view");
@@ -3874,6 +3932,37 @@ document.addEventListener("click", async (e) => {
         showToast(`已重试 ${trt}${q}`, 6000);
         await refresh(true);
       } catch (e) { alert(`重试失败：${e.message || e}`); }
+      return;
+    }
+    const tm = btn.getAttribute("data-task-merge");
+    if (tm) {
+      if (current === "*") return alert("先选择具体项目再回写合入");
+      const row = (window._tasks || []).find((x) => (x.task_id || x.id) === tm);
+      const sha = prompt(`记录 ${tm} 的合入提交 SHA（7–64 位十六进制）`,
+                         row?.merged_sha || "");
+      if (sha === null) return;
+      if (!/^[a-f0-9]{7,64}$/i.test(sha.trim())) return alert("SHA 需为 7–64 位十六进制");
+      const branch = prompt("合入分支（写入任务审计）", row?.merged_branch || "main");
+      if (branch === null) return;
+      try {
+        const r = await api(`/admin/p/${current}/tasks/merge`, "POST",
+                            { task_id: tm, merged_sha: sha.trim(), branch: branch.trim(), note: "管理台回写合入" });
+        showToast(`已记录 ${tm} 合入 ${String(r.merged_sha || sha).slice(0, 12)}`, 6000);
+        await refresh(true);
+      } catch (e) { alert(`合入回写失败：${e.message || e}`); }
+      return;
+    }
+    const tq = btn.getAttribute("data-task-requeue");
+    if (tq) {
+      if (current === "*") return alert("先选择具体项目再退回公共池");
+      if (!confirm(`把排队任务 ${tq} 退回公共池？原定向节点不会再收到该任务，可由任意在线节点认领或再转派。`)) return;
+      const reason = prompt("退回原因（写入任务审计）", "排队超时/目标离线，退回公共池");
+      if (reason === null) return;
+      try {
+        const r = await api(`/admin/p/${current}/tasks/requeue`, "POST", { task_id: tq, reason });
+        showToast(`已退回公共池 ${tq}`, 6000);
+        await refresh(true);
+      } catch (e) { alert(`退回失败：${e.message || e}`); }
       return;
     }
     const tc = btn.getAttribute("data-task-close");

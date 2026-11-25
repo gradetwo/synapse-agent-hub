@@ -351,9 +351,12 @@ print(r["issue_id"])
 | POST | `/x/admin/p/{project}/issues/{id}/reopen` | 重新打开；自动关闭的会清空 task_id |
 | POST | `/x/admin/p/{project}/issues/{id}/merge` | 合并到另一个 open Issue |
 | POST | `/x/admin/p/{project}/issues/{id}/dispatch` | 转任务派发；任务 done 自动关闭 |
-| GET | `/x/admin/p/{project}/observability` | 队列健康度、等待/周期分位、失败率、死信与节点 lane |
-| GET | `/x/admin/p/{project}/tasks/timeline?task_id=...` | 单任务端到端时间线（热窗口 + D1 归档 + 记录里程碑） |
+| GET | `/x/admin/p/{project}/observability` | 队列健康度、等待/周期分位、失败率、死信、节点 lane 与 `queue_alerts` |
+| GET | `/x/admin/p/{project}/tasks/timeline?task_id=...` | 单任务端到端时间线（热窗口 + D1 归档 + 任务/issue 里程碑） |
 | POST | `/x/admin/p/{project}/tasks/retry` | 手动重试死信/阻塞任务 |
+| POST | `/x/admin/p/{project}/tasks/merge` | 回写 `merged_sha`/`merged_at`，发 `task.merged` |
+| POST | `/x/admin/p/{project}/tasks/requeue` | 把超时/目标离线的定向排队任务退回公共池 |
+| POST | `/x/admin/p/{project}/ci` | 回写 main CI 红/绿，发 `ci.status` |
 
 管理端事件推送（交付/任务变化，秒级 Webhook）见 `docs/EVENT-PUSH.md`；管理台自身走 WebSocket 实时刷新。
 

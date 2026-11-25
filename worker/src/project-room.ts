@@ -15,6 +15,8 @@ const DEFAULT_MAX_ATTEMPTS = 3;
 const MAX_ATTEMPTS = 10;
 const RETRY_BASE_MS = 15_000;                    // 15s 起指数退避，封顶 5 分钟
 const RETRY_MAX_MS = 5 * 60_000;
+const QUEUE_STALE_MS = 2 * 60 * 60_000;          // 排队超过 2h 进入管理告警
+const QUEUE_OFFLINE_STALE_MS = 60 * 60_000;      // 目标离线超过 1h 也进入告警
 
 function clampPriority(v: unknown): number {
   if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TASK_PRIORITY;
@@ -51,7 +53,7 @@ type WebhookConfig = {
   topics?: string[];
   updated_at?: number;
 };
-const WEBHOOK_TOPICS = new Set(["submission", "task", "announce", "admin", "system", "all"]);
+const WEBHOOK_TOPICS = new Set(["submission", "task", "issue", "ci", "alert", "announce", "admin", "system", "all"]);
 
 function hexBytes(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -305,6 +307,8 @@ export class ProjectRoom implements DurableObject {
       case "tasks/release":return this.release(body);
       case "tasks/fail":   return this.failTask(body);
       case "tasks/admin-retry": return this.adminRetry(body);
+      case "tasks/admin-merge": return this.adminMerge(body);
+      case "tasks/admin-requeue": return this.adminRequeue(body);
       case "tasks/timeline": return this.taskTimeline(body);
       case "observability": return this.observability(body);
       case "tasks/submission-settled": return this.submissionSettled(body);
@@ -425,6 +429,8 @@ export class ProjectRoom implements DurableObject {
       if (msg.kind === "dead_lettered") return "task.dead_lettered";
       if (msg.kind === "retry_scheduled") return "task.retry_scheduled";
       if (msg.kind === "retried") return "task.retried";
+      if (msg.kind === "merged") return "task.merged";
+      if (msg.kind === "requeued") return "task.requeued";
       if (msg.kind === "released") return "task.released";
       if (msg.kind === "blocked") return "task.blocked";
       if (msg.kind === "done") return "task.done";
@@ -437,7 +443,15 @@ export class ProjectRoom implements DurableObject {
     if (msg.topic === "admin") return "notice.created";
     if (msg.topic === "system") return "system.notice";
     if (msg.topic === "report") return "report.created";
-    if (msg.topic === "issue") return "issue.created";
+    if (msg.topic === "issue") {
+      if (msg.kind === "closed") return "issue.closed";
+      if (msg.kind === "reopened") return "issue.reopened";
+      if (msg.kind === "merged") return "issue.merged";
+      if (msg.kind === "dispatched") return "issue.dispatched";
+      if (msg.kind === "updated") return "issue.updated";
+      return "issue.created";
+    }
+    if (msg.topic === "ci") return "ci.status";
     if (msg.topic === "status") return "status.changed";
     if (msg.topic === "alert") return "alert.created";
     return null;
@@ -520,6 +534,9 @@ export class ProjectRoom implements DurableObject {
     if (msg.topic === "artifact" && (msg.payload as any)?.submission_id) return "submission";
     if (msg.topic === "submission") return "submission";
     if (msg.topic === "task") return "task";
+    if (msg.topic === "issue") return "issue";
+    if (msg.topic === "ci") return "ci";
+    if (msg.topic === "alert") return "alert";
     if (msg.topic === "announce") return "announce";
     if (msg.topic === "admin") return "admin";
     if (msg.topic === "system") return "system";
@@ -785,6 +802,10 @@ export class ProjectRoom implements DurableObject {
                     "submission.archived", "task.created", "task.queued", "task.dispatched",
                     "task.claimed", "task.released", "task.blocked", "task.done",
                     "task.reopened", "task.reclaimed", "task.reassigned", "task.updated",
+                    "task.failed", "task.retry_scheduled", "task.retried", "task.dead_lettered",
+                    "task.merged", "task.requeued",
+                    "issue.created", "issue.closed", "issue.reopened", "issue.merged",
+                    "issue.dispatched", "issue.updated", "ci.status",
                     "announcement.created", "notice.created", "system.notice"],
     }));
     return new Response(null, { status: 101, webSocket: client });
@@ -1231,32 +1252,71 @@ export class ProjectRoom implements DurableObject {
    * 只关闭仍为 open 的 issue，不覆盖人工关闭/合并；D1 失败不能影响任务结算。
    */
   private async closeIssueForTask(t: any) {
-    const issueId = t?.issue_id;
-    if (!issueId) return;
     const project = String(t?.project ?? this.projectName());
     const taskId = String(t?.task_id ?? t?.id ?? "");
+    if (!taskId) return;
+    const issueId = t?.issue_id;
     const now = Date.now();
-    await this.env.DB.prepare(
+    // S3：先按任务记录里的 issue_id 关；再按 issues.task_id 兜底补关。
+    // release 后交付/旧数据缺 issue_id 时，不能漏关同一任务派出的 issue。
+    let changed = 0;
+    if (issueId) {
+      const r: any = await this.env.DB.prepare(
+        `UPDATE issues SET status = 'closed', closed_at = ?, closed_by = 'task',
+           close_reason = ?, updated_at = ?
+         WHERE project = ? AND issue_id = ? AND status = 'open'`
+      ).bind(now, `task_done:${taskId}`, now, project, issueId).run()
+        .catch((e: any) => { console.warn("issue auto-close failed", issueId, e); return { meta: { changes: 0 } }; });
+      changed += Number(r?.meta?.changes ?? 0);
+    }
+    const fallback: any = await this.env.DB.prepare(
       `UPDATE issues SET status = 'closed', closed_at = ?, closed_by = 'task',
          close_reason = ?, updated_at = ?
-       WHERE project = ? AND issue_id = ? AND status = 'open' AND task_id = ?`
-    ).bind(now, `task_done:${taskId}`, now, project, issueId, taskId).run()
-      .catch((e: any) => console.warn("issue auto-close failed", issueId, e));
+       WHERE project = ? AND task_id = ? AND status = 'open'`
+    ).bind(now, `task_done:${taskId}`, now, project, taskId).run()
+      .catch((e: any) => { console.warn("issue fallback auto-close failed", taskId, e); return { meta: { changes: 0 } }; });
+    changed += Number(fallback?.meta?.changes ?? 0);
+    if (!changed) return;
+    const rows = await this.env.DB.prepare(
+      `SELECT issue_id FROM issues WHERE project = ? AND (task_id = ? OR issue_id = ?)
+         AND status = 'closed' AND closed_by = 'task' AND closed_at = ?`
+    ).bind(project, taskId, String(issueId ?? ""), now).all<any>().catch(() => ({ results: [] }));
+    for (const row of (rows.results ?? [])) {
+      await this.append({
+        project, sender: "system", topic: "issue", kind: "closed",
+        payload: { issue_id: String(row.issue_id), task_id: taskId, status: "closed",
+                   closed_by: "task", closed_at: now, message: `任务 ${taskId} 完成，issue 自动关闭` },
+        dedupe_key: `issue-close:${row.issue_id}:${taskId}`,
+      }).catch(() => {});
+    }
   }
 
   /** 任务因交付被拒而重新打开时，把同一任务自动关闭的 issue 也恢复为 open。 */
   private async reopenIssueForTask(t: any) {
-    const issueId = t?.issue_id;
-    if (!issueId) return;
     const project = String(t?.project ?? this.projectName());
+    const taskId = String(t?.task_id ?? t?.id ?? "");
+    if (!taskId) return;
     const now = Date.now();
-    await this.env.DB.prepare(
+    const issueId = String(t?.issue_id ?? "");
+    const r: any = await this.env.DB.prepare(
       `UPDATE issues SET status = 'open', closed_at = NULL, closed_by = NULL,
          close_reason = NULL, updated_at = ?
-       WHERE project = ? AND issue_id = ? AND status = 'closed' AND closed_by = 'task'
-         AND task_id = ?`
-    ).bind(now, project, issueId, taskId).run()
-      .catch((e: any) => console.warn("issue auto-reopen failed", issueId, e));
+       WHERE project = ? AND (task_id = ? OR issue_id = ?) AND status = 'closed' AND closed_by = 'task'`
+    ).bind(now, project, taskId, issueId).run()
+      .catch((e: any) => { console.warn("issue auto-reopen failed", taskId, e); return { meta: { changes: 0 } }; });
+    if (!Number(r?.meta?.changes ?? 0)) return;
+    const rows = await this.env.DB.prepare(
+      `SELECT issue_id FROM issues WHERE project = ? AND (task_id = ? OR issue_id = ?)
+         AND status = 'open' AND updated_at = ?`
+    ).bind(project, taskId, issueId, now).all<any>().catch(() => ({ results: [] }));
+    for (const row of (rows.results ?? [])) {
+      await this.append({
+        project, sender: "system", topic: "issue", kind: "reopened",
+        payload: { issue_id: String(row.issue_id), task_id: taskId, status: "open",
+                   reopened_by: "review", message: `任务 ${taskId} 重新打开，issue 恢复` },
+        dedupe_key: `issue-reopen:${row.issue_id}:${taskId}:${now}`,
+      }).catch(() => {});
+    }
   }
 
   private async release(b: any) {
@@ -1462,6 +1522,68 @@ export class ProjectRoom implements DurableObject {
     return json({ ok: true, task_id: t.task_id ?? t.id, state: "open",
                   dispatch_state: task.dispatch_state, promoted,
                   manual_retries: task.manual_retries });
+  }
+
+
+  /** S1：合入回写。任务进入 READY/done 后由管理端或 CI 记录最终合入提交。 */
+  private async adminMerge(b: any) {
+    const got = await this.loadTaskForAdmin(b);
+    if (got instanceof Response) return got;
+    const { t, project } = got;
+    const sha = String(b.merged_sha ?? b.sha ?? "").trim().toLowerCase();
+    if (!/^[a-f0-9]{7,64}$/.test(sha))
+      return json({ error: "bad_merged_sha", hint: "merged_sha 需要 7–64 位十六进制提交号" }, 422);
+    if (t.state === "failed" || t.dead_letter === true)
+      return json({ error: "task_not_mergeable", state: t.state,
+                    hint: "死信任务先重试成功，再回写合入" }, 409);
+    const now = Date.now();
+    const task = {
+      ...t, merged_sha: sha, merged_at: now, merged_by: "admin",
+      merged_branch: String(b.branch ?? b.merged_branch ?? "").trim().slice(0, 120) || null,
+      merge_note: String(b.note ?? "").trim().slice(0, 500) || null,
+      updated_at: now,
+    };
+    await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    await this.append({
+      project, sender: "admin", topic: "task", kind: "merged",
+      to: t.owner ?? t.to ?? "admin",
+      payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
+                 work_item: false, merged_sha: sha, merged_at: now,
+                 merged_branch: task.merged_branch, note: task.merge_note,
+                 message: `已合入 ${sha.slice(0, 12)}` },
+      dedupe_key: `task-merged:${t.task_id ?? t.id}:${sha}`,
+    });
+    return json({ ok: true, task_id: t.task_id ?? t.id, state: t.state,
+                  merged_sha: sha, merged_at: now, merged_branch: task.merged_branch });
+  }
+
+  /** S5：把长期排队/目标离线的定向任务退回公共池，管理台可人工改派。 */
+  private async adminRequeue(b: any) {
+    const got = await this.loadTaskForAdmin(b);
+    if (got instanceof Response) return got;
+    const { t, project } = got;
+    if (t.state !== "open" || !t.to)
+      return json({ error: "task_not_requeueable", state: t.state,
+                    hint: "只有定向且仍处于 open 的排队任务可以退回公共池" }, 409);
+    const now = Date.now();
+    const from = String(t.to);
+    const task = {
+      ...t, to: null, owner: null, lease_until: 0,
+      dispatch_state: "closed", requeued_at: now, requeued_from: from,
+      reassigned_from: from, reassigned_at: now, updated_at: now,
+    };
+    await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    await this.append({
+      project, sender: "admin", topic: "task", kind: "requeued",
+      to: from,
+      payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
+                 work_item: false, from, requeued_to: "public",
+                 reason: this.adminReason(b) || "排队超时/目标离线，退回公共池",
+                 message: "任务已退回公共池，原定向节点不再收到该任务；请重新认领或由管理端改派。" },
+      dedupe_key: `task-requeued:${t.task_id ?? t.id}:${now}`,
+    });
+    return json({ ok: true, task_id: t.task_id ?? t.id, state: "open",
+                  dispatch_state: "closed", requeued_from: from, requeued_to: "public" });
   }
 
 
@@ -2182,15 +2304,34 @@ export class ProjectRoom implements DurableObject {
     });
     const queueP95 = percentile(waitValues, 95);
     const oldestQueueAge = queueAges.length ? Math.max(...queueAges) : 0;
+    // S5：排队超时/目标离线单独列成可操作清单，而不是只在 health 里给一句总账。
+    const hbByAgent = new Map<string, number>();
+    for (const a of agents) hbByAgent.set(String(a.agent_id ?? ""), Number(a.last_hb_ms ?? 0));
+    const queueAlerts = queued.map((t: any) => {
+      const ageMs = Math.max(0, now - Number(t.created_at ?? now));
+      const hb = hbByAgent.get(String(t.to ?? "")) ?? 0;
+      const toAge = hb ? now - hb : Infinity;
+      const toAlive = toAge <= 120_000 ? "alive" : toAge <= 300_000 ? "late" : "offline";
+      const stale = ageMs >= QUEUE_STALE_MS;
+      const offline = toAge >= QUEUE_OFFLINE_STALE_MS;
+      return {
+        task_id: t.task_id ?? t.id, title: t.title ?? "", to: t.to ?? null,
+        age_ms: ageMs, to_online: toAge <= 300_000, to_alive: toAlive,
+        created_at: Number(t.created_at ?? 0), stale, target_offline: offline,
+        reason: stale && offline ? "排队超时且目标离线" : stale ? "排队超过 2 小时" : "目标离线超过 1 小时",
+      };
+    }).filter((x: any) => x.stale || x.target_offline)
+      .sort((a: any, b: any) => b.age_ms - a.age_ms).slice(0, 20);
     const failedCount = failedWindow.length;
     const denominator = doneWindow.length + failedCount;
     const healthReasons: string[] = [];
     if (deadLetters.length) healthReasons.push(`${deadLetters.length} 个死信待处理`);
     if (oldestQueueAge > 2 * 60 * 60_000) healthReasons.push(`最老排队已 ${Math.round(oldestQueueAge / 60_000)} 分钟`);
+    if (queueAlerts.length) healthReasons.push(`${queueAlerts.length} 个排队任务超时或目标离线`);
     if (queued.some((t: any) => {
       const age = now - Number(agents.find((a: any) => a.agent_id === t.to)?.last_hb_ms ?? 0);
       return age > 5 * 60_000;
-    })) healthReasons.push("有排队任务的目标节点离线");
+    }) && !queueAlerts.length) healthReasons.push("有排队任务的目标节点离线");
     if (queueP95 !== null && queueP95 > 30 * 60_000) healthReasons.push(`等待 P95 ${Math.round(queueP95 / 60_000)} 分钟`);
     const health = healthReasons.length ? (deadLetters.length || oldestQueueAge > 2 * 60 * 60_000 ? "bad" : "warn") : "ok";
 
@@ -2266,7 +2407,7 @@ export class ProjectRoom implements DurableObject {
         oldest_age_ms: publicPool.length
           ? Math.max(0, ...publicPool.map((t: any) => Math.max(0, now - Number(t.created_at ?? now)))) : 0,
       },
-      lanes, recent_dead: recentDead,
+      lanes, recent_dead: recentDead, queue_alerts: queueAlerts,
       health: { status: health, reasons: healthReasons },
     });
   }
@@ -2279,11 +2420,19 @@ export class ProjectRoom implements DurableObject {
     if (!t) return json({ error: "not_found", task_id: id }, 404);
     const project = String(b?.project ?? t.project ?? this.projectName());
     const room = await this.room();
+    // S7：把关联 issue 的事件并入任务时间线；任务记录缺 issue_id 时按 issues.task_id 反查。
+    const linkedIssueRows = await this.env.DB.prepare(
+      `SELECT issue_id, title, status, task_id, reporter, priority, merged_into,
+              closed_by, close_reason, created_at, closed_at, updated_at
+         FROM issues WHERE project = ? AND (task_id = ? OR issue_id = ?)
+       ORDER BY created_at ASC LIMIT 50`
+    ).bind(project, id, String(t.issue_id ?? "")).all<any>().catch(() => ({ results: [] }));
+    const linkedIssueIds = new Set<string>((linkedIssueRows.results ?? []).map((r: any) => String(r.issue_id)));
     const events: any[] = [];
     const seen = new Set<string>();
     const addRaw = (m: any) => {
       const p: any = safeJson(m?.payload);
-      if (String(p?.task_id ?? "") !== id) return;
+      if (String(p?.task_id ?? "") !== id && !linkedIssueIds.has(String(p?.issue_id ?? ""))) return;
       const e = this.clientEventOf(m as Msg);
       if (e) {
         const key = `msg:${e.seq}`;
@@ -2314,6 +2463,12 @@ export class ProjectRoom implements DurableObject {
     derived("task.claimed", Number(t.claimed_at ?? 0), { owner: t.owner ?? null }, "claimed", t.owner ?? "system");
     derived("task.failed", Number(t.last_failed_at ?? 0), { attempts: t.attempts ?? 0, error: t.last_error ?? null }, t.dead_letter ? "failed" : "open", t.owner ?? "system");
     derived("task.done", Number(t.closed_at ?? 0), { closed_by: t.closed_by ?? null }, "done", t.closed_by ?? "system");
+    derived("task.merged", Number(t.merged_at ?? 0), { merged_sha: t.merged_sha ?? null,
+                                                       merged_branch: t.merged_branch ?? null,
+                                                       note: t.merge_note ?? null },
+            t.state, t.merged_by ?? "admin");
+    derived("task.requeued", Number(t.requeued_at ?? 0), { from: t.requeued_from ?? null,
+                                                           to: "public" }, "open", "admin");
     const rows = await this.env.DB.prepare(
       `SELECT submission_id, state, review_state, created_at FROM submissions
         WHERE project = ? AND task_id = ? ORDER BY created_at ASC LIMIT 100`
@@ -2323,12 +2478,27 @@ export class ProjectRoom implements DurableObject {
       derived("submission.created", at, { submission_id: s.submission_id, state: s.state,
                                            review_state: s.review_state });
     }
+    // S7：D1 里的 issue 生命周期也生成里程碑；老 issue 没有事件时时间线同样可读。
+    for (const i of linkedIssueRows.results ?? []) {
+      derived("issue.created", Number(i.created_at ?? 0), { issue_id: i.issue_id, title: i.title,
+                                                             status: "open", reporter: i.reporter ?? null },
+              "open", i.reporter ?? "system");
+      if (i.status === "merged") {
+        derived("issue.merged", Number(i.closed_at ?? i.updated_at ?? 0),
+                { issue_id: i.issue_id, merged_into: i.merged_into ?? null }, undefined, "admin");
+      } else if (i.status === "closed") {
+        derived("issue.closed", Number(i.closed_at ?? i.updated_at ?? 0),
+                { issue_id: i.issue_id, closed_by: i.closed_by ?? null,
+                  close_reason: i.close_reason ?? null }, undefined, i.closed_by ?? "system");
+      }
+    }
     events.sort((a: any, b: any) => String(a.ts).localeCompare(String(b.ts)) || Number(a.seq) - Number(b.seq));
     const limited = events.slice(-200);
     return json({
       task_id: id, task: { ...t, dispatch_state: this.dispatchStateOf(t),
                            effective_priority: this.effectivePriority(t),
                            retry_in_ms: t.next_retry_at ? Math.max(0, Number(t.next_retry_at) - Date.now()) : null },
+      issue: (linkedIssueRows.results ?? [])[0] ?? null,
       events: limited, count: limited.length, truncated: events.length > 200,
     });
   }
@@ -2352,6 +2522,34 @@ export class ProjectRoom implements DurableObject {
     const now = Date.now();
     let reclaimed = 0;
     const r = await this.st.list<Task>({ prefix: "task:" });
+    // S5：cron 主动扫长期排队/离线目标；同一任务 6 小时内只提醒一次，管理侧不必一直开着观测页。
+    const hbBy = new Map<string, number>();
+    for (const a of (await this.st.list<any>({ prefix: "agent:" })).values())
+      hbBy.set(String(a.agent_id ?? ""), Number(a.last_hb_ms ?? 0));
+    for (const t of r.values()) {
+      if (!t.to || t.state !== "open" || this.dispatchStateOf(t) !== "queued") continue;
+      const age = Math.max(0, now - Number(t.created_at ?? now));
+      const hb = hbBy.get(String(t.to)) ?? 0;
+      const offlineAge = hb ? now - hb : Infinity;
+      if (age < QUEUE_STALE_MS && offlineAge < QUEUE_OFFLINE_STALE_MS) continue;
+      const key = `queue-alert:${String(t.task_id ?? t.id ?? "")}`;
+      const last = await this.st.get<number>(key).catch(() => 0);
+      if (last && now - Number(last) < 6 * 3600_000) continue;
+      await this.st.put(key, now).catch(() => {});
+      await this.append({
+        project: String((t as any).project ?? this.projectName()),
+        sender: "system", topic: "alert", kind: "queue_stale", to: "admin",
+        payload: {
+          task_id: t.task_id ?? t.id, title: t.title ?? "", to: t.to,
+          age_ms: age, target_offline: offlineAge >= QUEUE_OFFLINE_STALE_MS,
+          reason: age >= QUEUE_STALE_MS && offlineAge >= QUEUE_OFFLINE_STALE_MS
+            ? "排队超时且目标离线" : age >= QUEUE_STALE_MS
+            ? "排队超过 2 小时" : "目标离线超过 1 小时",
+          message: "排队任务长期未消化；可在观测页退回公共池或改派在线节点。",
+        },
+        dedupe_key: `queue-stale:${String(t.task_id ?? t.id ?? "")}:${now}`,
+      }).catch(() => {});
+    }
     for (const [k, t] of r) {
       if (t.state === "claimed" && t.lease_until < now) {
         const prevOwner = t.owner;

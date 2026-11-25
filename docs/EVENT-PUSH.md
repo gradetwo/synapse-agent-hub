@@ -48,8 +48,10 @@
 
 | 类别 | 类型 |
 |---|---|
-| 任务 | `task.created`、`task.queued`、`task.dispatched`、`task.claimed`、`task.released`、`task.blocked`、`task.done`、`task.reopened`、`task.reclaimed`、`task.reassigned`、`task.failed`、`task.retry_scheduled`、`task.retried`、`task.dead_lettered`、`task.updated` |
+| 任务 | `task.created`、`task.queued`、`task.dispatched`、`task.claimed`、`task.released`、`task.blocked`、`task.done`、`task.reopened`、`task.reclaimed`、`task.reassigned`、`task.failed`、`task.retry_scheduled`、`task.retried`、`task.dead_lettered`、`task.merged`、`task.requeued`、`task.updated` |
 | 交付 | `submission.created`、`submission.reviewed`、`submission.collected`、`submission.archived` |
+| Issue | `issue.created`、`issue.closed`、`issue.reopened`、`issue.merged`、`issue.dispatched`、`issue.updated` |
+| CI | `ci.status`（main CI 红/绿/待定） |
 | 通知 | `announcement.created`、`notice.created`、`system.notice`、`report.created`、`issue.created`、`status.changed`、`alert.created` |
 
 `task.queued` 是单飞队列新增的事件：任务已创建但目标节点并发槽已满，管理端和客户端都能立刻看到“在排队”，不用等真正下发。
@@ -106,7 +108,7 @@ synapse-agent status   # 输出 event_cursor / event_cmd
 
 ## 4. 事件拉取 API
 
-`GET /p/{project}/events?since=<seq>&limit=<1-200>&topics=<task,submission>`，使用 agent token（admin token 也可）。
+`GET /p/{project}/events?since=<seq>&limit=<1-200>&topics=<task,submission>`，使用 agent token（admin token 也可）；响应带 `server_version: {sdk, build}`。
 
 ```json
 {
@@ -130,7 +132,7 @@ synapse-agent status   # 输出 event_cursor / event_cmd
 | PUT/POST | `/admin/p/{project}/webhook` | 保存 `{url, enabled, topics, secret?}` |
 | POST | `/admin/p/{project}/webhook/test` | 立即发一条 `webhook.test` |
 
-`topics` 可选：`submission`（交付到达/裁决，默认）、`task`、`announce`、`admin`、`system`、`all`。
+`topics` 可选：`submission`（交付到达/裁决，默认）、`task`、`issue`、`ci`、`alert`、`announce`、`admin`、`system`、`all`。
 启用时必须提供至少 8 位签名密钥；保存空 `secret` 表示沿用旧密钥。
 
 Webhook 事件体与客户端事件相同（额外带 `sender` 兼容字段）。签名请求头：

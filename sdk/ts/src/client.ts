@@ -365,6 +365,7 @@ export class Client {
         return await res.json();
       } catch (e: any) {
         last = e;
+        // S6：fetch/JSON 读取中途断开（chunked 中断）也走这里的重试；4xx 不重试。
         if (/^4\d\d:/.test(String(e?.message))) throw e;
         if (i < 2) await new Promise((r) => setTimeout(r, 300 * (i + 1)));
       }

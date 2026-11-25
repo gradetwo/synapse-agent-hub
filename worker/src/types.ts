@@ -20,6 +20,9 @@ export interface Env {
   /** claim 租约秒数；缺省/非法时 12h；旧部署遗留值 120 按 12h 处理。 */
   LEASE_TTL_S: string;
   MAX_SUBMISSION_MB: string;
+  /** S2：校验 base/merged 提交是否真实存在；留空则跳过远端存在性检查。 */
+  GITHUB_REPO?: string;
+  GITHUB_TOKEN?: string;
 }
 
 /** 客户端实时事件：与消息共用 seq，但语义稳定、可直接按 type 订阅。 */
@@ -108,6 +111,15 @@ export interface Task {
   reassigned_at?: number;
   reassigned_from?: string | null;
   blocked_at?: number;
+  /** 合入回写：READY 补丁落到 main 后的提交与时间；只由管理端/CI 回写。 */
+  merged_sha?: string | null;
+  merged_at?: number;
+  merged_by?: string | null;
+  merged_branch?: string | null;
+  merge_note?: string | null;
+  /** 退回公共池审计：从哪个定向节点退回、何时。 */
+  requeued_at?: number;
+  requeued_from?: string | null;
   base_sha?: string;
   paths?: string[];
 }

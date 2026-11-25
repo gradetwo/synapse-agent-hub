@@ -79,7 +79,9 @@ GET /x/admin/p/{project}/observability?window_ms=86400000
 - `summary`：活跃/WIP、队列深度、退避中、公共池、窗口完成数、失败数、死信数、SLA 违约数、等待 P50/P95、周期 P50/P95、失败率、每小时吞吐；
 - `lanes`：每个节点的在线状态、并发上限、在途数、队列数、退避数、最老等待、等待 P95、利用率、窗口完成/失败/死信；
 - `recent_dead`：最近的死信任务、失败原因和尝试次数；
-- `health`：`ok` / `warn` / `bad` 及原因（死信、最老排队超过 2 小时、排队目标离线、等待 P95 超过 30 分钟）。
+- `queue_alerts`：排队超过 2 小时或目标离线超过 1 小时的任务，带 `reason` / `age_ms` / `to_alive`，最多 20 条；
+- `server_version`：`{sdk, build}`，用于区分 manifest 版本与实际 worker；
+- `health`：`ok` / `warn` / `bad` 及原因（死信、最老排队超过 2 小时、排队任务超时/目标离线、等待 P95 超过 30 分钟）。
 
 单任务时间线：
 
@@ -87,7 +89,7 @@ GET /x/admin/p/{project}/observability?window_ms=86400000
 GET /x/admin/p/{project}/tasks/timeline?task_id=T-0057
 ```
 
-合并热窗口消息、D1 归档消息、交付记录和任务字段里程碑，返回 `task.created → task.queued → task.dispatched → task.claimed → task.failed/task.retry_scheduled → task.retried → task.done` 的完整链路；实际消息和字段记录会自动去重。
+合并热窗口消息、D1 归档消息、交付记录、任务字段里程碑和关联 issue 生命周期，返回 `task.created → task.queued → task.dispatched → task.claimed → task.failed/task.retry_scheduled → task.retried → task.merged → task.done`，以及 `issue.created/issue.dispatched/issue.closed` 的完整链路；实际消息和字段记录会自动去重。
 
 ### 管理台
 
@@ -96,7 +98,9 @@ GET /x/admin/p/{project}/tasks/timeline?task_id=T-0057
 - 六项 KPI：队列深度、最老等待、周期 P95、吞吐、失败率、死信/SLA；
 - 节点队列 lane：并发、排队、退避、最老等待、等待 P95、窗口完成/失败；
 - 死信列表：点击直接打开任务时间线并重试；
-- 任务行新增“时间线”按钮；死信/失败任务额外显示“重试”。
+- “最老排队 / 离线目标”面板：超过 2 小时或目标离线超过 1 小时的排队任务，可打开时间线或“退回公共池”；
+- 任务行新增“时间线”按钮；死信/失败任务额外显示“重试”；已 done/released 任务可回写“合入”；
+- 时间线合并关联 issue 的创建/关闭/重开/合并事件，查一单不用再翻 Issue 页。
 
 ### 指标口径
 
@@ -112,3 +116,8 @@ GET /x/admin/p/{project}/tasks/timeline?task_id=T-0057
 - 旧版客户端仍可 claim/release；只有调用 `tasks/fail` 才进入新重试状态；
 - 交付被拒后的 `reopen_on_reject` 与自动重试是两条独立路径：前者是验收驳回，后者是执行失败，不会互相覆盖；
 - 手动重试会保留 `last_error` 作为审计记录，但清零 `attempts`，避免死信永远无法恢复。
+
+
+## 5. 0.5.7 S1–S7 补充
+
+合入/CI 回写、交付内容门、release 后 issue 补关、版本可观测、排队告警/退回公共池、SDK 断流重试与 issue 时间线联动，详见 `docs/IMPROVE-20261125.md`。

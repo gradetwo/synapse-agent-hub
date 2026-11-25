@@ -12,7 +12,7 @@ const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "agent-pool-read-idle-sdk-upgrade-20261124";
+const BUILD_TAG = "efficiency-s1-s7-20261125";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
 const SDK_VERSION = "0.5.7";
 
@@ -388,6 +388,12 @@ export default {
                                    sender: auth.agentId, role: auth.role,
                                    ...(action.startsWith("heartbeat") ? { latest_sdk_version: SDK_VERSION } : {}),
                                    ...(pubMaxPerMin ? { max_per_min: pubMaxPerMin } : {}) });
+    }
+    // S4：事件流响应带服务端版本，客户端/管理侧不用再逐个接口探版本。
+    if (action === "events" && req.method === "GET") {
+      const er = await stub.fetch(new Request(doUrl, init));
+      const ed: any = await er.json().catch(() => ({}));
+      return json({ ...ed, server_version: { sdk: SDK_VERSION, build: BUILD_TAG } }, er.status);
     }
     // DO 的响应统一在边界处补安全头（DO 内部不感知 HTTP 语义）
     const dr = await stub.fetch(new Request(doUrl, init));
@@ -1144,7 +1150,7 @@ async function admin(req: Request, env: Env, url: URL) {
       max_msgs_per_min: maxMsgs, retention_days: retention } });
   }
 
-  if (p === "/ver") return json({ build: BUILD_TAG, tabs: true, at: Date.now() });
+  if (p === "/ver") return json({ build: BUILD_TAG, sdk: SDK_VERSION, tabs: true, at: Date.now() });
 
   // /admin/p/{project}/…
   const m = p.match(/^\/admin\/p\/([a-z0-9-]+)\/(.+)$/);
@@ -1245,7 +1251,10 @@ async function admin(req: Request, env: Env, url: URL) {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ project, window_ms: windowMs }),
       }));
-      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+      const d: any = await r.json().catch(() => ({}));
+      // S4：管理侧一眼分清 manifest 标版与实际 worker；旧 DO 也由 Worker 统一补齐。
+      return json({ ...d, server_version: { sdk: SDK_VERSION, build: BUILD_TAG,
+                                            at: new Date().toISOString() } }, r.status);
     }
     // 单任务时间线：management-only，返回热窗口 + D1 归档 + 记录里程碑。
     if (action === "tasks/timeline" && req.method === "GET") {
@@ -1256,6 +1265,52 @@ async function admin(req: Request, env: Env, url: URL) {
         body: JSON.stringify({ project, task_id: taskId, sender: "admin" }),
       }));
       return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    // S1：合入回写。任务时间线与任务台账据此显示最终合入提交；不重开任务，只补审计字段。
+    if (action === "tasks/merge" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      if (!String(b.task_id ?? "").trim()) return err(422, "task_id_required");
+      const r = await stub.fetch(new Request("https://do/tasks/admin-merge", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...b, project, sender: "admin" }),
+      }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    // S5：把长期排队/目标离线的定向任务退回公共池；管理台可再转派给在线节点。
+    if (action === "tasks/requeue" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      if (!String(b.task_id ?? "").trim()) return err(422, "task_id_required");
+      const r = await stub.fetch(new Request("https://do/tasks/admin-requeue", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...b, project, sender: "admin" }),
+      }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    // S1：main CI 状态回写。红/绿都进事件流，管理侧或 Webhook 可即时收到。
+    if (action === "ci" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      const status = String(b.status ?? b.state ?? "").trim().toLowerCase();
+      if (!["ok", "red", "green", "failed", "passed", "pending"].includes(status))
+        return err(422, "bad_ci_status");
+      const normalized = ["red", "failed"].includes(status) ? "red"
+        : ["ok", "green", "passed"].includes(status) ? "green" : "pending";
+      const sha = String(b.sha ?? b.commit ?? "").trim().toLowerCase().slice(0, 64);
+      if (sha && !/^[a-f0-9]{7,64}$/.test(sha)) return err(422, "bad_commit_sha");
+      const now = Date.now();
+      const r = await stub.fetch(new Request("https://do/publish", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          project, sender: "admin", topic: "ci", kind: "status",
+          payload: { status: normalized, sha: sha || null,
+                     branch: String(b.branch ?? "main").trim().slice(0, 120) || "main",
+                     url: String(b.url ?? "").trim().slice(0, 500) || null,
+                     summary: String(b.summary ?? "").trim().slice(0, 500) || null,
+                     message: normalized === "red" ? "main CI 变红" : `CI ${normalized}` },
+          dedupe_key: `ci:${normalized}:${sha}:${now}`,
+        }),
+      }));
+      return Response.json({ ok: r.ok, ci: normalized, sha: sha || null,
+                             branch: String(b.branch ?? "main") }, { status: r.ok ? 200 : r.status });
     }
     // 手动重试死信/阻塞任务；与任务四个出口一样由 admin sender 走 DO 审计。
     if (action === "tasks/retry" && req.method === "POST") {
@@ -1388,6 +1443,8 @@ async function admin(req: Request, env: Env, url: URL) {
              close_reason = ?, updated_at = ? WHERE project = ? AND issue_id = ? AND status != 'merged'`
         ).bind(now, reason, now, project, issueId).run();
         if (upd.meta.changes === 0) return err(409, "issue_merged");
+        await publishIssueEvent(env, project, { ...row, status: "closed" }, "closed",
+                                { close_reason: reason });
         return json({ ok: true, issue_id: issueId, status: "closed", close_reason: reason });
       }
 
@@ -1402,6 +1459,9 @@ async function admin(req: Request, env: Env, url: URL) {
            WHERE project = ? AND issue_id = ? AND status IN ('closed', 'merged')`
         ).bind(now, project, issueId).run();
         if (upd.meta.changes === 0) return err(409, "issue_not_reopenable");
+        await publishIssueEvent(env, project, { ...row, status: "open",
+                                                task_id: clearTask ? null : row.task_id }, "reopened",
+                                { task_id_cleared: clearTask });
         return json({ ok: true, issue_id: issueId, status: "open", task_id_cleared: clearTask });
       }
 
@@ -1422,6 +1482,8 @@ async function admin(req: Request, env: Env, url: URL) {
              AND status = 'open' AND task_id IS NULL`
         ).bind(into, now, now, project, issueId).run();
         if (upd.meta.changes === 0) return err(409, "issue_changed");
+        await publishIssueEvent(env, project, { ...row, status: "merged" }, "merged",
+                                { merged_into: into });
         return json({ ok: true, issue_id: issueId, status: "merged", merged_into: into });
       }
 
@@ -1438,6 +1500,8 @@ async function admin(req: Request, env: Env, url: URL) {
       const target = b.to === undefined || b.to === null || String(b.to).trim() === ""
         ? "" : String(b.to).trim();
       const warning = target ? await taskLoadWarning(stub, target) : null;
+      await publishIssueEvent(env, project, { ...row, status: "open", task_id: out.task_id }, "dispatched",
+                              { target: target || "public", warning: warning ? warning.warning ?? null : null });
       return json({ ok: true, issue_id: issueId, status: "open", task_id: out.task_id,
                     dispatched: true, task_link: out.task, ...(warning ? { warning } : {}) });
     }
@@ -1640,6 +1704,8 @@ async function admin(req: Request, env: Env, url: URL) {
       if (bind.error) return bind.error;
       const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
       if (missing.length) return deliveryFormatError(kind, missing);
+      const contentMissing = await deliveryFormatContentMissing(env, project, kind, norm.refs, String(b.base_sha));
+      if (contentMissing.length) return deliveryFormatError(kind, contentMissing);
       const taskId = bind.taskId;
       const sid = String(b.submission_id).trim();
       const now = Date.now();
@@ -2307,6 +2373,175 @@ function deliveryFormatMissing(kindRaw: unknown, refs: NormalizedRef[]): string[
   return [];
 }
 
+/** S2：补丁/回执只读首 8MB，避免把 Worker 当大文件转码器。 */
+const PATCH_MAX_BYTES = 8 * 1024 * 1024;
+
+function refBaseName(r: NormalizedRef): string {
+  return String(r.name ?? "").replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+}
+
+/** 统一 diff 的结构校验：文件头、hunk 头、hunk 声明行数与实际 +/- 行必须自洽。
+ *  只做语法级校验，不执行 git apply；真正 apply 仍由 CI/管理侧在仓库里做。 */
+function validatePatchText(text: string): string | null {
+  if (text.length > PATCH_MAX_BYTES) return "patch_too_large";
+  if (!/^diff --git |^--- /m.test(text)) return "patch_header_missing";
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  let files = 0;
+  let hunks = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^diff --git /.test(line)) { files++; continue; }
+    if (/^--- /.test(line)) { files++; continue; }
+    const hm = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (!hm) continue;
+    hunks++;
+    const oldNeed = hm[2] === undefined ? 1 : Number(hm[2]);
+    const newNeed = hm[4] === undefined ? 1 : Number(hm[4]);
+    let oldGot = 0;
+    let newGot = 0;
+    let j = i + 1;
+    for (; j < lines.length; j++) {
+      const body = lines[j];
+      if (/^diff --git /.test(body) || /^@@ /.test(body)
+          || /^--- /.test(body) || /^\+\+\+ /.test(body)) break;
+      if (/^\\ No newline at end of file/.test(body)) continue;
+      if (body === "") {
+        if (j + 1 < lines.length && (/^diff --git /.test(lines[j + 1]) || /^@@ /.test(lines[j + 1]))) break;
+        continue;
+      }
+      const c = body[0];
+      if (c === " ") { oldGot++; newGot++; }
+      else if (c === "-") oldGot++;
+      else if (c === "+") newGot++;
+      else break;
+    }
+    if (oldGot !== oldNeed || newGot !== newNeed)
+      return `patch_hunk_mismatch:${oldGot}/${oldNeed},${newGot}/${newNeed}`;
+    i = j - 1;
+  }
+  if (files === 0) return "patch_file_header_missing";
+  if (hunks === 0) return "patch_hunk_missing";
+  return null;
+}
+
+/** 回执解析：支持 `key: value`、Markdown 列表 `- key: value` 和 `| key | value |` 表格。 */
+function parseReceiptFields(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const aliases: Record<string, string> = {
+    base_sha: "base", commit_sha: "commit", merged_sha: "commit",
+    logs_path: "logs", test: "tests", test_result: "tests", clippy_result: "clippy",
+  };
+  for (const raw of text.replace(/\r\n/g, "\n").split("\n")) {
+    const line = raw.trim();
+    if (!line || /^#[#\s]/.test(line)) continue;
+    let key = "";
+    let val = "";
+    const kv = line.match(/^(?:[-*]\s*)?([A-Za-z][A-Za-z0-9_-]*)\s*[:=：]\s*(.+)$/);
+    if (kv) { key = kv[1]; val = kv[2]; }
+    else {
+      const row = line.match(/^\|\s*([A-Za-z][A-Za-z0-9_-]*)\s*\|\s*(.+?)\s*\|/);
+      if (row) { key = row[1]; val = row[2]; }
+    }
+    if (!key) continue;
+    key = aliases[key.toLowerCase()] ?? key.toLowerCase().replace(/-/g, "_");
+    val = val.replace(/`/g, "").trim();
+    if (val && (!fields[key] || fields[key].length < val.length)) fields[key] = val;
+  }
+  return fields;
+}
+
+/** 回执必填字段：base/branch/commit/box/fmt/clippy/tests/logs。 */
+function validateReceiptText(text: string, baseSha: string): string[] {
+  const fields = parseReceiptFields(text);
+  const required = ["base", "branch", "commit", "box", "fmt", "clippy", "tests", "logs"];
+  const issues: string[] = [];
+  for (const key of required) if (!fields[key]) issues.push(`receipt_field_missing:${key}`);
+  if (fields.commit && !/^[a-f0-9]{7,64}$/i.test(fields.commit)) issues.push("receipt_commit_invalid");
+  if (fields.base && !/^[a-f0-9]{7,64}$/i.test(fields.base)) issues.push("receipt_base_invalid");
+  if (fields.base && /^[a-f0-9]{7,64}$/i.test(fields.base)) {
+    const rb = String(fields.base).toLowerCase();
+    const sb = String(baseSha).toLowerCase();
+    if (!(rb.startsWith(sb) || sb.startsWith(rb))) issues.push("receipt_base_mismatch");
+  }
+  return issues;
+}
+
+/** S2：base 提交在远端仓库是否存在。配置 GITHUB_REPO 时启用；限流/网络不明时不误杀交付。 */
+async function baseCommitExists(env: Env, sha: string): Promise<boolean | null> {
+  const repo = String(env.GITHUB_REPO ?? "").trim();
+  if (!repo || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo)) return null;
+  const key = `basecheck:${repo}:${String(sha).toLowerCase()}`;
+  try {
+    const cached = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
+      .bind(key).first<any>();
+    if (cached && Date.now() - Number(cached.updated_at ?? 0) < 7 * 24 * 3600_000)
+      return String(cached.value) === "1" ? true : String(cached.value) === "0" ? false : null;
+  } catch { /* settings 未迁移时继续走远端 */ }
+  try {
+    // 无 token 时走 GitHub 提交页 HEAD：避免 API 60 次/小时的匿名限流；
+    // 有 token 时走 API，能区分 403/429（不明时不误杀）。
+    const url = env.GITHUB_TOKEN
+      ? `https://api.github.com/repos/${repo}/commits/${encodeURIComponent(sha)}`
+      : `https://github.com/${repo}/commit/${encodeURIComponent(sha)}`;
+    const res = await fetch(url, {
+      method: env.GITHUB_TOKEN ? "GET" : "HEAD",
+      headers: {
+        accept: env.GITHUB_TOKEN ? "application/vnd.github+json" : "text/html",
+        "user-agent": "synapse-agent-hub",
+        ...(env.GITHUB_TOKEN ? { authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}),
+      },
+    });
+    if (res.status !== 200 && res.status !== 404) return null;
+    const ok = res.status === 200;
+    try {
+      await env.DB.prepare(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+      ).bind(key, ok ? "1" : "0", Date.now()).run();
+    } catch { /* 缓存失败不影响本次判定 */ }
+    return ok;
+  } catch {
+    return null;
+  }
+}
+
+/** S2：读补丁/回执正文做交付门；不合格直接 422，不先收下再由管理侧拒。 */
+async function deliveryFormatContentMissing(
+  env: Env, project: string, kindRaw: unknown, refs: NormalizedRef[], baseSha: string
+): Promise<string[]> {
+  const kind = String(kindRaw ?? "patch").trim().toLowerCase();
+  if (kind !== "patch" && kind !== "bundle") return [];
+  const pick = (re: RegExp, fallback?: (n: string) => boolean) =>
+    refs.find((r) => re.test(refBaseName(r)) || (fallback ? fallback(refBaseName(r)) : false));
+  const patchRef = pick(/\.(patch|diff)$/i, (n) => /patch|diff/.test(n));
+  const receiptRef = pick(/(^|[-_.])(receipt|回执)([-_.]|$)/i,
+                          (n) => n.startsWith("receipt") || n.startsWith("回执"));
+  const issues: string[] = [];
+  const read = async (ref: NormalizedRef, label: string): Promise<string | null> => {
+    try {
+      const obj = await env.BLOBS.get(`p/${project}/artifacts/${ref.sha256}`);
+      if (!obj) { issues.push(`${label}_blob_missing`); return null; }
+      if (Number(obj.size ?? 0) > PATCH_MAX_BYTES) { issues.push("patch_too_large"); return null; }
+      return await obj.text();
+    } catch {
+      issues.push(`${label}_read_failed`);
+      return null;
+    }
+  };
+  if (!patchRef) issues.push("patch_file");
+  if (!receiptRef) issues.push("receipt_file");
+  const patchText = patchRef ? await read(patchRef, "patch") : null;
+  if (patchText) {
+    const bad = validatePatchText(patchText);
+    if (bad) issues.push(bad);
+    const exists = await baseCommitExists(env, baseSha);
+    if (exists === false) issues.push("base_sha_not_remote");
+  }
+  const receiptText = receiptRef ? await read(receiptRef, "receipt") : null;
+  if (receiptText) issues.push(...validateReceiptText(receiptText, baseSha));
+  return [...new Set(issues)];
+}
+
 /** R2：代码类交付的自测计数必须结构化，不能只写 built=true。 */
 function deliveryChecksMissing(kindRaw: unknown, checksRaw: unknown): string[] {
   const kind = String(kindRaw ?? "patch").trim().toLowerCase();
@@ -2327,10 +2562,25 @@ function deliveryFormatError(kind: string, missing: string[]) {
     receipt_file: "RECEIPT.md 或 *-receipt.*（执行回执）",
     report_body: "*.md / *.txt / *.pdf（报告正文）",
     checks_tests: 'checks 里带 {"tests":{"passed":N,"failed":M}} 或 suites[]',
+    patch_content_invalid: "合法 unified diff：文件头、@@ hunk 头、hunk 行数完整",
+    patch_header_missing: "补丁需含 diff --git 或 ---/+++ 文件头",
+    patch_file_header_missing: "补丁需至少一个文件头",
+    patch_hunk_missing: "补丁需至少一个 @@ hunk",
+    patch_hunk_mismatch: "@@ 声明的旧/新行数必须与实际的 -/+/空格行数一致",
+    patch_too_large: "补丁不超过 8MB",
+    patch_blob_missing: "补丁 blob 在 R2 中可读",
+    patch_read_failed: "补丁 blob 可读取",
+    receipt_blob_missing: "回执 blob 在 R2 中可读",
+    receipt_read_failed: "回执 blob 可读取",
+    receipt_commit_invalid: "receipt.commit 需为 7–64 位十六进制",
+    receipt_base_invalid: "receipt.base 需为 7–64 位十六进制",
+    receipt_base_mismatch: "receipt.base 必须与提交的 base_sha 一致",
+    base_sha_not_remote: "base_sha 必须存在于配置的远端仓库（可通过 GITHUB_REPO 配置）",
   };
+  const codeOf = (m: string) => m.split(":")[0];
   return json({ error: "delivery_format_incomplete", kind,
-                missing, required: missing.map((m) => expected[m] ?? m),
-                hint: "代码类交付必须含补丁、回执与结构化自测计数；报告类必须含正文。补齐后重新提交。" }, 422);
+                missing, required: missing.map((m) => expected[codeOf(m)] ?? m),
+                hint: "代码类交付必须含可解析补丁、完整回执（base/branch/commit/box/fmt/clippy/tests/logs）与结构化自测计数；不合格直接拒收，请按 required 修正后重新提交。" }, 422);
 }
 
 /** 读一个任务的元数据；只走 DO 的内部接口，不把任务正文暴露给普通 agent。 */
@@ -2433,6 +2683,28 @@ async function publishSubmissionEvent(env: Env, project: string, row: any,
   })).catch((e: any) => console.warn("submission event publish failed", row?.submission_id, e?.message ?? e));
 }
 
+/** S7：issue 生命周期事件。任务时间线按 task_id / issue_id 合并，不再只靠 issue.created。 */
+async function publishIssueEvent(
+  env: Env, project: string, row: any, kind: string, extra: Record<string, unknown> = {}
+) {
+  const issueId = String(row?.issue_id ?? "").trim();
+  if (!issueId) return;
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  await stub.fetch(new Request("https://do/publish", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      project, sender: "admin", topic: "issue", kind,
+      payload: {
+        issue_id: issueId, title: String(row?.title ?? "").slice(0, 200),
+        task_id: row?.task_id ?? null, status: String(row?.status ?? ""),
+        reporter: row?.reporter ?? null, priority: row?.priority ?? null,
+        ...extra,
+      },
+      dedupe_key: `issue-event:${issueId}:${kind}:${Date.now()}`,
+    }),
+  })).catch((e: any) => console.warn("issue event publish failed", issueId, e?.message ?? e));
+}
+
 async function createSubmission(req: Request, env: Env, project: string, agentId: string, isAdmin = false) {
   const b: any = await req.json().catch(() => ({}));
   if (!b.base_sha) return err(422, "base_sha_required");
@@ -2454,6 +2726,8 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
   if (bind.error) return bind.error;
   const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
   if (missing.length) return deliveryFormatError(kind, missing);
+  const contentMissing = await deliveryFormatContentMissing(env, project, kind, norm.refs, String(b.base_sha));
+  if (contentMissing.length) return deliveryFormatError(kind, contentMissing);
   const taskId = bind.taskId;
   const now = Date.now();
   const res = await env.DB.prepare(
@@ -2618,7 +2892,8 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
     const r = await stub.fetch(new Request("https://do/publish", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ project, sender: agentId, topic: "issue", kind: "issue",
-                             payload: { issue_id: issueId, title, priority },
+                             payload: { issue_id: issueId, title, priority, status: "open",
+                                        reporter: agentId, task_id: selfTask?.task_id ?? null },
                              dedupe_key: `issue:${issueId}` }),
     }));
     const d: any = await r.json().catch(() => ({}));

@@ -339,13 +339,28 @@ fn deliver_client_event(cfg: &Cfg, event: &Value) {
 fn fetch_events(cfg: &Cfg, agent: &Agent, base: &str) -> Option<Vec<Value>> {
     let mut since = event_cursor_get(&cfg.dir);
     let mut tries = 0;
-    loop {
+    // S6：GET 幂等；chunked 中断/连接重置/5xx 时退避重试，避免一次抖动漏拉事件。
+    for attempt in 0..4 {
         let url = format!("{}/p/{}/events?since={}&limit=100", base, cfg.project, since);
-        let r = agent.get(&url)
+        let r = match agent.get(&url)
             .set("authorization", &format!("Bearer {}", cfg.token))
             .set("connection", "close")
-            .call().ok()?;
-        let v: Value = r.into_json().ok()?;
+            .call() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[events] fetch failed (attempt {}): {e}", attempt + 1);
+                if attempt < 3 { thread::sleep(Duration::from_millis(600 * (attempt + 1))); }
+                continue;
+            }
+        };
+        let v: Value = match r.into_json() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[events] decode failed (attempt {}): {e}", attempt + 1);
+                if attempt < 3 { thread::sleep(Duration::from_millis(600 * (attempt + 1))); }
+                continue;
+            }
+        };
         let ep = v["epoch"].as_str().unwrap_or("").to_string();
         if tries == 0 && !ep.is_empty() && event_epoch_get(&cfg.dir) != ep {
             event_cursor_set(&cfg.dir, 0);
@@ -364,6 +379,7 @@ fn fetch_events(cfg: &Cfg, agent: &Agent, base: &str) -> Option<Vec<Value>> {
         }
         return Some(events);
     }
+    None
 }
 
 fn publish_events(cfg: &Cfg, agent: &Agent, base: &str) {

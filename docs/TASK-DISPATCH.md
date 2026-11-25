@@ -181,7 +181,7 @@ S1–S6 来自 `docs/REQUIREMENTS-20261122.md` 的当日实证补充，已在本
 
 - **S1 交付绑定**：数据平面缺省 `task_id` 时，若 agent 名下恰好一件 claimed 任务则自动绑定；多件要求显式 `task_id`。响应回显 `task_id` / `task_assignee` / `auto_bound`。`collect` 后由 DO 重算，claimed/released 且待取归零、无待批报告即 `done`。
 - **S2 越单拦截**：数据平面要求 `state=claimed && owner=agent`；管理侧代建默认校验 owner/被指派者，确需越单时显式 `allow_overtake=true` 且必须写 `overtake_reason`，落库 `overtake=1` 并进交付台账。
-- **S3 格式门**：`patch`/`bundle` 必须有补丁与回执，`report` 必须有正文；代码类还必须带结构化 `checks.tests{passed,failed}` 或 `suites[]`。缺项返回 422 `delivery_format_incomplete` 并列出 `missing`，不写库、不推进任务。
+- **S3 格式门**：`patch`/`bundle` 必须有补丁与回执，`report` 必须有正文；代码类还必须带结构化 `checks.tests{passed,failed}` 或 `suites[]`。0.5.7-S1–S7 起再加内容门：补丁 hunk 行数/文件头可解析、`base_sha` 远端存在、回执含 `base/branch/commit/box/fmt/clippy/tests/logs`、`base_sha` 在 `GITHUB_REPO` 远端存在。缺项返回 422 `delivery_format_incomplete` 并列出 `missing`，不写库、不推进任务。
 - **S4 裁决中间态**：`submissions.review_state` 取 `pending/accepted/approved/rejected`；`collect` 置 `accepted`，管理台“批准/拒收”走 `submissions/{id}/result`。`report` 未 approved 不关单；`rejected` 会把已 done 任务重新打开。
 - **S5 派单唤醒**：定向任务创建时已写入定向 inbox 消息，节点 `wait`/`run` 下一次拉取即唤醒；`tasks/create` 返回 `wake{channel,target,online,alive}`，任务台账对 open 定向任务显示 `to_online` / `to_alive`，离线目标显式标红。
 - **S6 定向消息**：`POST /admin/p/{project}/messages` 作为 `/send` 的同义入口，消息进节点收件箱，上线即达；管理台原有“定向指令”卡继续可用。
@@ -193,7 +193,7 @@ Muse 管理侧提交的 `docs/REQUIREMENTS-20261122.md` 按 ROI 列了 R1–R10�
 | 需求 | 状态 | 说明 |
 |---|---|---|
 | R1 交付与任务绑定 | **已实现** | 客户端可带 `task_id`；缺省自动绑定唯一 claimed 任务；collect 联动任务终态 |
-| R2 交付格式门 | **已实现（文件+checks）** | 补丁/回执/报告正文 + 结构化自测计数；缺项 422 并写 `missing` |
+| R2 交付格式门 | **已实现（文件+checks+内容）** | 补丁/回执/报告正文 + 结构化自测计数 + patch 结构/base/回执必填字段；缺项 422 并写 `missing` |
 | R3 管理员关单与状态纠错 | **已实现** | `tasks/close`、`tasks/reclaim`、`tasks/reassign`，写任务事件审计 |
 | R4 队列顺序/优先级/按节点视图 | 未开始 | 需要 `priority`、`after`、`repo` 字段与领取约束 |
 | R5 租约与在岗状态 | **部分实现** | 租约默认 12 小时 + heartbeat 续租；台账显示剩余租约与 owner/定向目标在线状态 |

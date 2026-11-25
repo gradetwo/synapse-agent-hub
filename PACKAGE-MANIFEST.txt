@@ -1,7 +1,7 @@
 Synapse agent-hub 完整源码 / 提示词模板 / 文档包
 =================================================
 
-build:        functional-multiproject2-20261120
+build:        efficiency-s1-s7-20261125
 sdk_version:  0.5.7
 snapshot:     2026-11-20
 

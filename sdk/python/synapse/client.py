@@ -572,7 +572,11 @@ class Client:
                 r = self._sess.get(f"{self.endpoint}{path}", headers=self._headers(), timeout=40)
                 r.raise_for_status()
                 return r.json()
-            except (requests.ConnectionError, requests.Timeout, requests.exceptions.SSLError) as e:
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.SSLError,
+                    requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.ContentDecodingError) as e:
+                # S6：服务端重启/连接中途断开时，chunked 传输会抛 ChunkedEncodingError；
+                # GET 幂等，按退避重试，避免管理侧首拉直接失败。
                 last = e
                 if i < 3:
                     time.sleep(0.6 * (i + 1))
