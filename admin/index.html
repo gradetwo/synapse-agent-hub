@@ -266,6 +266,25 @@ if (location.search.includes("reset=1")) {
   .agentStat .v{font-size:19px;font-weight:700;color:#e6edf5;line-height:1.2;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .agentStat .s{font-size:10.5px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .agentStat.ok .v{color:#7ee787}.agentStat.warn .v{color:#ffa657}.agentStat.accent .v{color:#79c0ff}
+  /* Client 详情：最后一次启动现场。auto=false 时用橙色，避免被当成普通元信息。 */
+  .launchCard{background:#11161d;border:1px solid #202936;border-radius:9px;padding:9px 10px;margin:0 0 10px;min-width:0}
+  .launchTop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .launchTop .cap{margin:0;flex:1;min-width:120px}
+  .launchBadge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid #2a333f;color:#9aa4b2;white-space:nowrap}
+  .launchBadge.off{color:#ffbd6b;border-color:#674b18;background:#241b0e}
+  .launchBadge.on{color:#86d99e;border-color:#1d3a25;background:#101b13}
+  .launchBadge.unknown{color:#9aa4b2;border-color:#2a333f}
+  .launchMeta{font-size:11px;color:#7d8798;margin:4px 0 7px;overflow-wrap:anywhere}
+  .launchGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px 12px}
+  .launchKv{min-width:0}
+  .launchKv span{display:block;font-size:10.5px;color:#7d8798;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .launchKv b{display:block;font-size:11.5px;font-weight:500;color:#d7e0ea;overflow-wrap:anywhere;margin-top:1px}
+  .launchKv b.warnv{color:#ffbd6b}
+  .launchDetails{margin-top:8px;background:#0b0f14}
+  .launchDetails .launchSection{margin-top:7px}
+  .launchPre{margin:3px 0 0;padding:7px 8px;border:1px solid #1d2530;border-radius:6px;background:#0b0f14;
+    color:#b7c4d2;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
+    overflow-wrap:anywhere;max-height:180px;overflow:auto}
   .agentViz{display:grid;grid-template-columns:1.02fr 1fr;gap:10px}
   .vizBox{background:#11161d;border:1px solid #202936;border-radius:9px;padding:9px 10px;min-width:0}
   .vizBox .cap{margin-bottom:5px}
@@ -295,6 +314,7 @@ if (location.search.includes("reset=1")) {
     .scopeGrid label{min-width:0;flex-wrap:wrap}
     .agentStats{grid-template-columns:repeat(2,minmax(0,1fr))}
     .agentStat .v{font-size:17px}
+    .launchGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
     .agentViz{grid-template-columns:1fr}
     .donut{height:96px}
     .workList .when{margin-left:0}
@@ -882,6 +902,7 @@ if (location.search.includes("reset=1")) {
       <button class="ghost iconBtn" id="dClose" aria-label="关闭" title="关闭">×</button></div>
     <div class="sheetBody">
     <div class="agentStats" id="dStats"></div>
+    <div class="launchCard" id="dLaunch"><div class="scopeHint">客户端启动参数加载中…</div></div>
     <div class="activityHead">
       <div class="cap">活动趋势 <span class="scopeHint" id="dActivityMeta"></span></div>
       <div class="trendSeg trendSegSmall" id="dActivityRange" aria-label="agent 活动范围">
@@ -1359,6 +1380,13 @@ function agentRow(a) {
     badge.className = "badge released";
     badge.textContent = "旧版";
     badge.title = `当前 SDK ${decEsc(a.sdk_version || "未上报")}，最新 ${decEsc(a.sdk_latest || "未知")}`;
+    cells[0].append(" ", badge);
+  }
+  if (a.launch_summary && a.launch_summary.auto === false) {
+    const badge = document.createElement("span");
+    badge.className = "badge released";
+    badge.textContent = "投送关";
+    badge.title = "最近一次启动未开启窗口/tmux 消息自动投送";
     cells[0].append(" ", badge);
   }
   cells[1].textContent = decEsc(projectName);
@@ -3567,6 +3595,74 @@ async function refreshAgentActivity(days) {
   }
 }
 
+const LAUNCH_KIND_LABELS = {
+  window: "窗口注入", tmux: "tmux 注入", notify_cmd: "notify 命令", none: "无外部投送",
+};
+function renderClientLaunch(client, available, fallbackSummary) {
+  const box = $("dLaunch");
+  if (!box) return;
+  const txt = (v) => esc(decEsc(v == null ? "" : v));
+  if (available === false) {
+    box.innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
+      <span class="launchBadge unknown">启动参数读取失败</span></div>
+      <div class="scopeHint">客户端状态暂时读不到；稍后刷新详情重试，其它详情不受影响。</div>`;
+    return;
+  }
+  const launch = client && client.launch && typeof client.launch === "object" ? client.launch : null;
+  const summary = fallbackSummary || (client && client.launch_summary) || null;
+  if (!launch) {
+    const auto = summary ? summary.auto === true : null;
+    const badge = auto === true ? `<span class="launchBadge on">消息自动投送：开启</span>`
+      : auto === false ? `<span class="launchBadge off">消息自动投送：关闭</span>`
+      : `<span class="launchBadge unknown">启动参数未上报</span>`;
+    const kind = summary && summary.kind && summary.kind !== "none" ? ` · ${txt(LAUNCH_KIND_LABELS[summary.kind] || summary.kind)}` : "";
+    box.innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>${badge}</div>
+      <div class="scopeHint">${summary
+        ? `名册摘要${kind}；完整启动参数未上报，升级并重启客户端后自动采集。`
+        : "客户端尚未上报启动参数；旧版客户端升级并重启后自动采集。"}</div>`;
+    return;
+  }
+  const delivery = launch.delivery && typeof launch.delivery === "object" ? launch.delivery : {};
+  const effective = launch.effective && typeof launch.effective === "object" ? launch.effective : {};
+  const auto = delivery.auto === true;
+  const kind = String(delivery.kind || "none");
+  const target = delivery.target || effective.window_app || effective.tmux_target || "";
+  const deliveryLabel = LAUNCH_KIND_LABELS[kind] || kind;
+  const autoText = auto ? `开启 · ${deliveryLabel}` : "关闭";
+  const targetText = auto ? (target || "—")
+    : target ? `未启用（配置：${target}）` : "未启用";
+  const started = hasNum(launch.started_at) ? new Date(Number(launch.started_at)).toLocaleString() : "—";
+  const lastAt = hasNum(launch.received_at) ? Number(launch.received_at)
+    : hasNum(client.last_hb_ms) ? Number(client.last_hb_ms) : null;
+  const platform = [launch.platform, launch.arch].filter(Boolean).join(" / ") || "—";
+  const proc = `${platform}${hasNum(launch.pid) ? ` · pid ${Number(launch.pid)}` : ""}`;
+  const argv = Array.isArray(launch.argv) ? launch.argv.map(String) : [];
+  const argvText = argv.length ? argv.join(" ") : "—";
+  const effectiveJson = Object.keys(effective).length ? JSON.stringify(effective, null, 2) : "—";
+  const kv = (k, v, warn = false) => `<div class="launchKv"><span>${txt(k)}</span><b class="${warn ? "warnv" : ""}">${txt(v || "—")}</b></div>`;
+  box.innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
+      <span class="launchBadge ${auto ? "on" : "off"}">消息自动投送：${txt(autoText)}</span></div>
+    <div class="launchMeta">启动 ${txt(started)} · 最后上报 ${lastAt !== null ? txt(fmtLast(lastAt)) : "—"}</div>
+    <div class="launchGrid">
+      ${kv("投送面", deliveryLabel, !auto)}
+      ${kv("投送目标", targetText, !auto && !!target)}
+      ${kv("执行器", effective.exec || "—")}
+      ${kv("事件回调", effective.event_cmd || "—")}
+      ${kv("通知命令", effective.notify_cmd || "—")}
+      ${kv("心跳", hasNum(effective.heartbeat_s) ? `${Number(effective.heartbeat_s)}s` : "—")}
+      ${kv("配置目录", effective.config_dir || launch.config_dir || "—")}
+      ${kv("进程", proc)}
+      ${kv("客户端", `${launch.kind || "unknown"} ${launch.version || ""}`.trim())}
+      ${kv("工作目录", launch.cwd || "—")}
+    </div>
+    <details class="permDetails launchDetails">
+      <summary><span>完整启动参数</span><span class="lead">argv · 生效配置</span></summary>
+      <div class="launchSection"><div class="cap">命令行</div><pre class="launchPre">${txt(argvText)}</pre></div>
+      <div class="launchSection"><div class="cap">生效配置</div><pre class="launchPre">${txt(effectiveJson)}</pre></div>
+    </details>
+    <div class="scopeHint" style="margin-top:6px">由客户端心跳随连接上报；token、代理密码等敏感值已脱敏。</div>`;
+}
+
 let detailAgent = null;
 let detailRole = "agent";
 let detailReady = false;
@@ -3640,6 +3736,7 @@ function openAgent(id, project, days = detailDays) {
   document.querySelectorAll("#detail [data-dq]").forEach((b) => { b.dataset.da = id; });
   $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
   $("dStats").innerHTML = $("dTasks").innerHTML = $("dIssues").innerHTML = "";
+  $("dLaunch").innerHTML = `<div class="scopeHint">客户端启动参数加载中…</div>`;
   $("dWorkBars").innerHTML = ""; $("dTaskLegend").innerHTML = "";
   $("dTaskTotal").textContent = ""; $("dIssueSummary").textContent = "";
   $("dPermSummary").textContent = "加载中…";
@@ -3667,6 +3764,7 @@ function openAgent(id, project, days = detailDays) {
     const live = (window._agents || []).find((a) => a.agent_id === id && (current === "*" || (a.project || current) === current));
     const sdkNote = live?.sdk_version
       ? ` · SDK ${live.sdk_version}${live.sdk_outdated ? "（旧版）" : ""}` : "";
+    renderClientLaunch(d.client, d.client_available !== false, live && live.launch_summary);
     $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样${sdkNote}`;
     const maxInput = $("dMaxParallel");
     if (maxInput) {
@@ -3733,6 +3831,8 @@ function openAgent(id, project, days = detailDays) {
     (d.submissions || []).forEach((x) => SUB_STATE.set(x.submission_id, x.state));
   }).catch((e) => {
     $("dMeta").textContent = "加载失败：" + e.message;
+    $("dLaunch").innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
+      <span class="launchBadge unknown">详情读取失败</span></div>`;
     $("dStats").innerHTML = `<div class="muted">详情读取失败，无法显示统计</div>`;
     $("dTaskTotal").textContent = "统计不可用";
     $("dIssueSummary").textContent = "统计不可用";

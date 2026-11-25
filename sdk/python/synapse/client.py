@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -26,6 +28,30 @@ def _state_dir() -> Path:
     return base
 
 CONFIG_DIR = _state_dir()
+
+_LAUNCH_SECRET_FLAGS = {"--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy"}
+
+
+def _redacted_argv(argv: list[str], limit: int = 64) -> list[str]:
+    """管理台只展示启动现场；token/代理密码等敏感参数在客户端先脱敏。"""
+    out: list[str] = []
+    hide_next = False
+    for raw in argv[:limit]:
+        s = str(raw)[:512]
+        if hide_next:
+            out.append("***")
+            hide_next = False
+            continue
+        lower = s.lower()
+        if lower in _LAUNCH_SECRET_FLAGS:
+            out.append(s)
+            hide_next = True
+        elif any(lower.startswith(k + "=") for k in
+                 ("--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy")):
+            out.append(s.split("=", 1)[0] + "=***")
+        else:
+            out.append(s)
+    return out
 
 
 @dataclass
@@ -87,6 +113,7 @@ class Client:
         self.state_dir = Path(state_dir or CONFIG_DIR)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.heartbeat_s = heartbeat_s
+        self._started_at_ms = int(time.time() * 1000)
         self._work = Work()
         self._hb_seq = 0
         self._cpu_prev = self._read_stat()
@@ -161,12 +188,50 @@ class Client:
         }
 
     # ── 心跳 ─────────────────────────────────────────────────
+    def _launch_snapshot(self) -> dict:
+        """SDK 进程的启动现场；Python SDK 没有窗口/tmux 注入，notify_cmd 是关键外部投递配置。"""
+        notify = self._notify_cmd()
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            cwd = ""
+        return {
+            "schema": "synapse.launch.v1",
+            "kind": "python",
+            "version": __version__,
+            "started_at": self._started_at_ms,
+            "argv": _redacted_argv(sys.argv),
+            "cwd": cwd,
+            "config_dir": str(self.state_dir),
+            "platform": platform.system().lower(),
+            "arch": platform.machine(),
+            "pid": os.getpid(),
+            "delivery": {
+                "auto": bool(notify),
+                "kind": "notify_cmd" if notify else "none",
+                "target": "",
+                "window_forward": False,
+                "tmux_forward": False,
+                "tmux_verify": True,
+            },
+            "effective": {
+                "cmd": "sdk",
+                "role": "agent",
+                "agent_id": self.agent_id,
+                "project": self.project,
+                "heartbeat_s": self.heartbeat_s,
+                "config_dir": str(self.state_dir),
+                "notify_cmd": "configured" if notify else None,
+            },
+        }
+
     def heartbeat_once(self) -> dict:
         self._hb_seq += 1
         payload = {"hb": self._hb_seq, "agent_id": self.agent_id, "work": asdict(self._work),
-                   "surface": {"kind": "none"},
+                   "surface": {"kind": "none", "forward": False},
                    "max_parallel_tasks": 2,
-                   "load": self._collect_load(), "env": self._collect_env(), "sdk_version": __version__}
+                   "load": self._collect_load(), "env": self._collect_env(),
+                   "sdk_version": __version__, "launch": self._launch_snapshot()}
         try:
             return self._post(f"/p/{self.project}/heartbeat", payload)
         except requests.RequestException as e:

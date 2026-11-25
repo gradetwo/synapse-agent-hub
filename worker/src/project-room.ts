@@ -62,6 +62,113 @@ function hexBytes(buf: ArrayBuffer): string {
 
 function safeJson(x: any) { try { return typeof x === "string" ? JSON.parse(x) : x; } catch { return {}; } }
 
+/** 启动参数快照：客户端自报，管理端只读；服务端再做一次白名单/长度/密钥清洗。 */
+const LAUNCH_ARG_LIMIT = 64;
+const LAUNCH_ARG_CHARS = 512;
+const LAUNCH_VALUE_CHARS = 1200;
+const LAUNCH_EFFECTIVE_KEYS = [
+  "cmd", "role", "agent_id", "project", "heartbeat_s", "config_dir",
+  "exec", "event_cmd", "notify_cmd", "proxy",
+  "window_forward", "window_app", "window_conversation",
+  "tmux_forward", "tmux_target", "tmux_verify",
+];
+const LAUNCH_SECRET_FLAGS = new Set([
+  "--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy",
+]);
+
+function launchText(v: any, max = LAUNCH_VALUE_CHARS): string | null {
+  if (v === undefined || v === null) return null;
+  const s = String(v).replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  if (!s) return null;
+  return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function launchBool(v: any): boolean | null {
+  if (typeof v === "boolean") return v;
+  if (v === 1 || v === "1" || v === "true" || v === "on") return true;
+  if (v === 0 || v === "0" || v === "false" || v === "off") return false;
+  return null;
+}
+
+function launchNumber(v: any): number | null {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+function launchArgv(raw: any): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  let hideNext = false;
+  for (const item of raw.slice(0, LAUNCH_ARG_LIMIT)) {
+    const s = launchText(item, LAUNCH_ARG_CHARS);
+    if (!s) continue;
+    if (hideNext) { out.push("***"); hideNext = false; continue; }
+    const lower = s.toLowerCase();
+    if (LAUNCH_SECRET_FLAGS.has(lower)) {
+      out.push(s);
+      hideNext = true;
+    } else if (lower.startsWith("--token=") || lower.startsWith("--admin-token=")
+      || lower.startsWith("--api-key=") || lower.startsWith("--secret=")
+      || lower.startsWith("--password=") || lower.startsWith("--proxy=")) {
+      out.push(s.split("=")[0] + "=***");
+    } else {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** 让旧客户端或恶意客户端都不能把任意大对象塞进 DO。 */
+function normalizeLaunch(raw: any, now: number, fallbackVersion: string): any | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const effective: Record<string, string | number | boolean | null> = {};
+  if (raw.effective && typeof raw.effective === "object" && !Array.isArray(raw.effective)) {
+    for (const k of LAUNCH_EFFECTIVE_KEYS) {
+      if (!(k in raw.effective)) continue;
+      const v = raw.effective[k];
+      if (typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) effective[k] = v;
+      else effective[k] = launchText(v);
+    }
+  }
+  const deliveryRaw = raw.delivery && typeof raw.delivery === "object" && !Array.isArray(raw.delivery)
+    ? raw.delivery : {};
+  const windowForward = launchBool(deliveryRaw.window_forward) ?? launchBool(effective.window_forward);
+  const tmuxForward = launchBool(deliveryRaw.tmux_forward) ?? launchBool(effective.tmux_forward);
+  const auto = launchBool(deliveryRaw.auto) ?? launchBool(raw.auto_delivery)
+    ?? (windowForward === true || tmuxForward === true);
+  const kindCandidate = launchText(deliveryRaw.kind, 24) ?? launchText(raw.surface?.kind, 24);
+  const kindRaw = kindCandidate && kindCandidate !== "none"
+    ? kindCandidate
+    : (windowForward === true ? "window" : tmuxForward === true ? "tmux" : "none");
+  const target = launchText(deliveryRaw.target, 200)
+    ?? (windowForward === true ? launchText(effective.window_app, 200)
+      : tmuxForward === true ? launchText(effective.tmux_target, 200) : null);
+  return {
+    schema: launchText(raw.schema, 40) ?? "synapse.launch.v1",
+    kind: launchText(raw.kind, 24) ?? "unknown",
+    version: launchText(raw.version, 40) ?? fallbackVersion,
+    started_at: launchNumber(raw.started_at),
+    received_at: now,
+    pid: launchNumber(raw.pid),
+    cwd: launchText(raw.cwd, 500),
+    config_dir: launchText(raw.config_dir, 500),
+    platform: launchText(raw.platform, 32),
+    arch: launchText(raw.arch, 32),
+    argv: launchArgv(raw.argv),
+    effective,
+    delivery: {
+      auto: auto === true,
+      kind: auto === true ? kindRaw : "none",
+      target: auto === true ? target : null,
+      window_forward: windowForward === true,
+      tmux_forward: tmuxForward === true,
+      tmux_verify: launchBool(deliveryRaw.tmux_verify) ?? launchBool(effective.tmux_verify ?? true),
+    },
+  };
+}
+
+
 /** 取 SDK 版本的核心数字段；无法解析时返回 null（按旧客户端处理）。 */
 function sdkVersionCore(v: unknown): number[] | null {
   const raw = String(v ?? "").trim().replace(/^v/i, "").split(/[+-]/)[0];
@@ -342,6 +449,7 @@ export class ProjectRoom implements DurableObject {
       case "tasks/admin-reassign": return this.adminReassign(body);
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
+      case "agent/get":    return this.getAgent(new URL(req.url));
       case "agent/activity": return this.markActivity(body);
       case "agents/config": return this.setAgentConfig(body);
       case "webhook/get":  return this.webhookGet();
@@ -980,6 +1088,7 @@ export class ProjectRoom implements DurableObject {
     const now = Date.now();
     const clientVersion = String(b.sdk_version ?? "").trim().slice(0, 40);
     const latestVersion = String(b.latest_sdk_version ?? "").trim().slice(0, 40);
+    const incomingLaunch = normalizeLaunch(b.launch, now, clientVersion);
     // 管理员身份不催升级；普通 agent 未上报版本也按旧客户端处理。
     const outdated = b.role !== "admin" && !!latestVersion && isSdkOutdated(clientVersion, latestVersion);
     const rec = {
@@ -990,6 +1099,9 @@ export class ProjectRoom implements DurableObject {
       env: b.env ?? {},
       // 外观/运行形态由客户端上报，用于计算默认并发；管理端覆盖值不能被心跳冲掉。
       surface: b.surface ?? prev.surface ?? null,
+      // 最后一次启动现场：新客户端每次心跳都带同一份快照；旧客户端没有时保留上次已知值。
+      launch: incomingLaunch ?? prev.launch ?? null,
+      launch_received_ms: incomingLaunch ? now : prev.launch_received_ms ?? null,
       client_max_parallel_tasks: Number.isFinite(Number(b.max_parallel_tasks))
         ? Math.max(0, Math.min(MAX_PARALLEL_TASKS, Math.floor(Number(b.max_parallel_tasks)))) : null,
       max_parallel_tasks: prev.max_parallel_tasks ?? null,
@@ -1929,15 +2041,39 @@ export class ProjectRoom implements DurableObject {
                   effective: await this.agentMaxParallel(id), promoted });
   }
 
+  private agentView(a: any, now = Date.now()) {
+    const age = now - Number(a.last_hb_ms ?? 0);
+    const alive = age <= 120_000 ? "alive" : age <= 300_000 ? "late" : "offline";
+    return { ...a, alive, age_s: Math.round(age / 1000) };
+  }
+
   private async agents() {
     const now = Date.now();
     const r = await this.st.list<any>({ prefix: "agent:" });
     const list = [...r.values()].map((a) => {
-      const age = now - a.last_hb_ms;
-      const alive = age <= 120_000 ? "alive" : age <= 300_000 ? "late" : "offline";
-      return { ...a, alive, age_s: Math.round(age / 1000) };
+      const view = this.agentView(a, now);
+      // 名册不携带完整 argv 快照（31–200 个节点会放大每次列表流量）；详情用 agent/get 取全量。
+      const { launch, ...rest } = view;
+      return {
+        ...rest,
+        launch_summary: launch ? {
+          auto: launch.delivery?.auto === true,
+          kind: launch.delivery?.kind ?? "none",
+          target: launch.delivery?.target ?? null,
+          started_at: launch.started_at ?? null,
+          received_at: launch.received_at ?? null,
+        } : null,
+      };
     });
     return json({ agents: list });
+  }
+
+  private async getAgent(url: URL) {
+    const id = String(url.searchParams.get("id") ?? "").trim();
+    if (!id) return json({ error: "agent_id_required" }, 422);
+    const rec: any = await this.st.get<any>(`agent:${id}`);
+    if (!rec) return json({ error: "agent_not_found", agent_id: id }, 404);
+    return json({ agent: this.agentView(rec) });
   }
 
   // ── 空闲提醒：活动记录、配置和 cron 扫描 ──────────────────

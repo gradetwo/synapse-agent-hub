@@ -20,6 +20,29 @@ export interface ClientOptions {
 
 const VERSION = "0.5.10";
 
+const LAUNCH_SECRET_FLAGS = new Set(["--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy"]);
+
+/** 启动参数进管理台前先脱敏；代理/token 只留参数名。 */
+function redactedArgv(argv: string[], limit = 64): string[] {
+  const out: string[] = [];
+  let hideNext = false;
+  for (const raw of argv.slice(0, limit)) {
+    const s = String(raw).slice(0, 512);
+    if (hideNext) { out.push("***"); hideNext = false; continue; }
+    const lower = s.toLowerCase();
+    if (LAUNCH_SECRET_FLAGS.has(lower)) {
+      out.push(s);
+      hideNext = true;
+    } else if (["--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy"]
+      .some((k) => lower.startsWith(k + "="))) {
+      out.push(s.split("=")[0] + "=***");
+    } else {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
 function fetchT(url: string, init: any = {}) {
   // 无超时的 fetch 会把心跳链一起拖死（实测可挂 300s）
   return fetch(url, { ...init, signal: AbortSignal.timeout(init.timeoutMs ?? 30_000) });
@@ -38,6 +61,7 @@ export class Client {
   private timer?: any;
   private running = false;
   private hb = 0;
+  private readonly startedAt = Date.now();
   private eventListeners = new Set<(event: any) => void>();
 
   constructor(opts: ClientOptions) {
@@ -100,12 +124,37 @@ export class Client {
   setWork(w: Partial<Work>) { this.work = { ...this.work, ...w }; }
 
   // ── 心跳 ──────────────────────────────────────────────
+  private launchSnapshot() {
+    return {
+      schema: "synapse.launch.v1",
+      kind: "ts",
+      version: VERSION,
+      started_at: this.startedAt,
+      argv: redactedArgv(process.argv),
+      cwd: process.cwd(),
+      config_dir: this.opts.stateDir,
+      platform: process.platform,
+      arch: process.arch,
+      pid: process.pid,
+      delivery: {
+        auto: false, kind: "none", target: "",
+        window_forward: false, tmux_forward: false, tmux_verify: true,
+      },
+      effective: {
+        cmd: "sdk", role: "agent", agent_id: this.opts.agentId,
+        project: this.opts.project, heartbeat_s: this.opts.heartbeatS,
+        config_dir: this.opts.stateDir,
+      },
+    };
+  }
+
   async heartbeatOnce(): Promise<any> {
     this.hb++;
     return this.post(`/p/${this.opts.project}/heartbeat`, {
       hb: this.hb, agent_id: this.opts.agentId, work: this.work,
-      surface: { kind: "none" }, max_parallel_tasks: 2,
+      surface: { kind: "none", forward: false }, max_parallel_tasks: 2,
       load: await this.collectLoad(), env: this.collectEnv(), sdk_version: VERSION,
+      launch: this.launchSnapshot(),
     }).catch((e) => ({ ok: false, error: String(e) }));
   }
 

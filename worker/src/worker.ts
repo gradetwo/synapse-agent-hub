@@ -636,7 +636,7 @@ function need(action: string) {
   if (action === "tasks/list" || action === "tasks/get" || action === "tasks/active-load") return "admin";
   // 台账/单任务元数据/内部 active-load 不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
-  if (action === "agent/activity" || action === "agents/idle-list") return "admin";
+  if (action === "agent/activity" || action === "agent/get" || action === "agents/idle-list") return "admin";
   if (action === "issues" || action.startsWith("issues/")) return "issues.report";
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
@@ -1626,6 +1626,16 @@ async function admin(req: Request, env: Env, url: URL) {
       const id = decodeURIComponent(action.slice(6));
       const days = analyticsDays(url.searchParams.get("days"), 7);
       const activity = await loadAgentActivity(env, project, id, days);
+      // 启动参数只存在 DO 热记录里；详情单独取一次，名册只回摘要，避免轮询把 argv 反复拉大。
+      let client: any = null;
+      let clientAvailable = false;
+      try {
+        const cr = await stub.fetch(new Request(`https://do/agent/get?id=${encodeURIComponent(id)}`));
+        const cd: any = await cr.json().catch(() => null);
+        if (!cr.ok || !cd || !cd.agent) throw new Error(`agent_get_${cr.status}`);
+        client = cd.agent;
+        clientAvailable = true;
+      } catch { /* DO 抖动时详情其余部分仍可用，前端明确显示启动参数读取失败 */ }
       const hb = await env.DB.prepare(
         `SELECT bucket,cpu_pct,mem_used_mb,disk_used_pct,work_state FROM hb_hist
          WHERE project=? AND agent_id=? ORDER BY bucket DESC LIMIT 120`
@@ -1699,6 +1709,8 @@ async function admin(req: Request, env: Env, url: URL) {
       const num0 = (x: any) => Number(x ?? 0);
       return json({
         agent: ag,
+        client,
+        client_available: clientAvailable,
         activity,
         hb: hb.results ?? [],
         submissions: subs.results ?? [],

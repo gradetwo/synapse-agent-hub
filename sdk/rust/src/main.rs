@@ -3103,6 +3103,108 @@ fn surface_target(cfg: &Cfg) -> String {
     else { String::new() }
 }
 
+/// 启动现场只采集一次：参数不会在进程生命周期里变化，重复取 argv 没有意义。
+fn startup_argv() -> &'static [String] {
+    static ARGV: OnceLock<Vec<String>> = OnceLock::new();
+    ARGV.get_or_init(|| std::env::args().collect()).as_slice()
+}
+
+fn startup_started_ms() -> u64 {
+    static STARTED: OnceLock<u64> = OnceLock::new();
+    *STARTED.get_or_init(|| now_ms() as u64)
+}
+
+/// 管理台展示的是启动参数，不是密钥仓库：--token 等敏感值必须脱敏。
+fn redacted_argv(argv: &[String]) -> Vec<String> {
+    const MAX_ARGS: usize = 64;
+    const MAX_ARG_CHARS: usize = 512;
+    fn secret_flag(s: &str) -> bool {
+        matches!(s.to_ascii_lowercase().as_str(),
+            "--token" | "--admin-token" | "--api-key" | "--secret" | "--password" | "--proxy")
+    }
+    let mut out = Vec::new();
+    let mut hide_next = false;
+    for raw in argv.iter().take(MAX_ARGS) {
+        let arg: String = raw.chars().take(MAX_ARG_CHARS).collect();
+        if hide_next {
+            out.push("***".to_string());
+            hide_next = false;
+            continue;
+        }
+        if secret_flag(&arg) {
+            out.push(arg);
+            hide_next = true;
+        } else if arg.to_ascii_lowercase().starts_with("--token=")
+            || arg.to_ascii_lowercase().starts_with("--admin-token=")
+            || arg.to_ascii_lowercase().starts_with("--api-key=")
+            || arg.to_ascii_lowercase().starts_with("--secret=")
+            || arg.to_ascii_lowercase().starts_with("--password=")
+            || arg.to_ascii_lowercase().starts_with("--proxy=")
+        {
+            out.push(arg.split('=').next().unwrap_or("--token").to_string() + "=***");
+        } else {
+            out.push(arg);
+        }
+    }
+    out
+}
+
+/// 心跳里带一份“最后一次启动现场”：原始命令行 + 解析后的生效开关。
+/// 其中 delivery.auto=false 表示没有开启窗口/tmux 外部投送，管理台直接可见。
+fn launch_snapshot(cfg: &Cfg) -> Value {
+    let argv = redacted_argv(startup_argv());
+    // 代理地址可能带 user:pass，命令行里已脱敏；这里只保留可判断的模式。
+    let mut proxy = "auto".to_string();
+    let raw_argv = startup_argv();
+    if let Some(i) = raw_argv.iter().position(|a| a == "--proxy") {
+        if let Some(v) = raw_argv.get(i + 1) {
+            proxy = if cfg_falsey(v) { "off".to_string() } else { "custom".to_string() };
+        }
+    } else if let Some(v) = raw_argv.iter().find_map(|a| a.strip_prefix("--proxy=")) {
+        proxy = if cfg_falsey(v) { "off".to_string() } else { "custom".to_string() };
+    }
+    json!({
+        "schema": "synapse.launch.v1",
+        "kind": "rust",
+        "version": env!("CARGO_PKG_VERSION"),
+        "started_at": startup_started_ms(),
+        "argv": argv,
+        "cwd": std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()),
+        "config_dir": cfg.dir.to_string_lossy(),
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "pid": std::process::id(),
+        "delivery": {
+            "auto": cfg.surface_forward(),
+            "kind": surface_kind(cfg),
+            "target": surface_target(cfg),
+            "window_forward": cfg.window_forward,
+            "window_app": cfg.window_app,
+            "window_conversation": cfg.window_conversation,
+            "tmux_forward": cfg.tmux_forward,
+            "tmux_target": cfg.tmux_target,
+            "tmux_verify": cfg.tmux_verify,
+        },
+        "effective": {
+            "cmd": cfg.cmd,
+            "role": cfg.role,
+            "agent_id": cfg.agent_id,
+            "project": cfg.project,
+            "heartbeat_s": cfg.heartbeat_s,
+            "config_dir": cfg.dir.to_string_lossy(),
+            "exec": cfg.exec_cmd,
+            "event_cmd": cfg.event_cmd,
+            "window_forward": cfg.window_forward,
+            "window_app": cfg.window_app,
+            "window_conversation": cfg.window_conversation,
+            "tmux_forward": cfg.tmux_forward,
+            "tmux_target": cfg.tmux_target,
+            "tmux_verify": cfg.tmux_verify,
+            "proxy": proxy,
+        },
+    })
+}
+
 fn heartbeat_payload(cfg: &Cfg, hb: u64, queue: usize, journal: &Arc<Mutex<Vec<Value>>>,
                      surface: &Arc<Mutex<SurfaceStatus>>) -> Value {
     let mut load = json!({});
@@ -3116,10 +3218,12 @@ fn heartbeat_payload(cfg: &Cfg, hb: u64, queue: usize, journal: &Arc<Mutex<Vec<V
                      "phase": if active.is_some() { "task" } else { "idle" },
                      "task_id": active},
            "surface": {"kind": surface_kind(cfg), "target": surface_target(cfg),
+                        "forward": cfg.surface_forward(),
                         "state": st.state, "active_task_id": st.active_task,
                         "queue": st.queue_len},
            "max_parallel_tasks": if surface_kind(cfg) == "none" { 2 } else { 1 },
            "load": load, "env": {"git_head": git_head()}, "sdk_version": env!("CARGO_PKG_VERSION"),
+           "launch": launch_snapshot(cfg),
            "queue": queue, "unacked": journal.lock().unwrap().len()})
 }
 
@@ -3540,10 +3644,12 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                 let body = json!({"hb": hb, "agent_id": aid,
                                   "work": {"state": ws, "phase": ph, "task_id": surf.active_task.clone()},
                                   "surface": {"kind": surface_kind(&cfg4), "target": surface_target(&cfg4),
+                                               "forward": cfg4.surface_forward(),
                                                "state": surf.state, "active_task_id": surf.active_task.clone(),
                                                "queue": surf.queue_len},
                                   "max_parallel_tasks": if surface_kind(&cfg4) == "none" { 2 } else { 1 },
                                   "load": {"disk": disk()}, "sdk_version": env!("CARGO_PKG_VERSION"),
+                                  "launch": launch_snapshot(&cfg4),
                                   "queue": queue_now, "unacked": unacked});
                 let ok = agent2.post(&format!("{}/p/{}/heartbeat", base2, proj))
                     .set("authorization", &format!("Bearer {}", tok))
@@ -3650,6 +3756,41 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_argv_redacts_token_and_proxy_values() {
+        let argv = vec![
+            "synapse-agent".to_string(), "run".to_string(),
+            "--token".to_string(), "secret-token".to_string(),
+            "--proxy".to_string(), "http://user:pass@proxy".to_string(),
+            "--token=abc".to_string(), "--window".to_string(), "0".to_string(),
+            "--admin-token=xyz".to_string(), "--secret".to_string(), "s".to_string(),
+        ];
+        let got = redacted_argv(&argv);
+        assert_eq!(got, vec![
+            "synapse-agent".to_string(), "run".to_string(),
+            "--token".to_string(), "***".to_string(),
+            "--proxy".to_string(), "***".to_string(),
+            "--token=***".to_string(), "--window".to_string(), "0".to_string(),
+            "--admin-token=***".to_string(), "--secret".to_string(), "***".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn launch_snapshot_reports_delivery_switches() {
+        let dir = scratch("launch-snapshot");
+        let mut cfg = test_cfg(dir);
+        let off = launch_snapshot(&cfg);
+        assert_eq!(off["kind"], "rust");
+        assert_eq!(off["delivery"]["auto"], false);
+        assert_eq!(off["delivery"]["kind"], "none");
+        cfg.window_forward = true;
+        cfg.window_app = "豆包".into();
+        let on = launch_snapshot(&cfg);
+        assert_eq!(on["delivery"]["auto"], true);
+        assert_eq!(on["delivery"]["kind"], "window");
+        assert_eq!(on["delivery"]["target"], "豆包");
+    }
 
     #[test]
     fn state_dir_cli_override_wins_over_env_and_default() {
