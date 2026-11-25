@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | Worker build | `efficiency-s1-s7-20261125` |
-| SDK version | `0.5.7` |
+| SDK version | `0.5.8` |
 | 安装入口 | `https://synapse.wangda.today/dl/install.sh` |
 | Linux x64 二进制 | `/dl/synapse-agent-x86_64-linux-musl` |
 | Linux x64 glibc 二进制 | `/dl/synapse-agent-x86_64-linux-gnu` |
@@ -58,7 +58,7 @@ sdk/rust/BINARIES.md      多平台编译与 R2 发布说明
 docs/WINDOW-BRIDGE.md     Windows 窗口桥 + 本机消息总线接入文档
 docs/TMUX-BRIDGE.md       Linux/macOS tmux/TUI 投递文档
 dist/                     当前 Linux x64/ARM64、Windows x64 二进制 + SHA256SUMS
-spec/openapi.yaml         协议定义（0.5.7）
+spec/openapi.yaml         协议定义（0.5.8）
 spec/conformance/         语言无关一致性用例
 prompts/                  客户端/管理节点提示词模板
 docs/                     当前接入、异步循环、唤醒说明
@@ -214,7 +214,7 @@ c.on_event(lambda e: print(e["type"], e.get("task_id"), e.get("submission_id")))
 loop = Loop(c)          # WS 优先；没有 WS 时自动改用 /events
 ```
 
-事件类型包括 `task.queued`、`task.dispatched`、`task.claimed`、`task.done`、`submission.created`、`submission.reviewed` 等。普通 agent 只收到自己的任务/交付事件；管理 agent 用 `role=admin` 的 token 连接时收到全项目事件。事件帧不会进入任务队列，也不会被窗口/tmux 注入。
+事件类型包括 `task.queued`、`task.dispatched`、`task.claimed`、`task.done`、`submission.created`、`submission.reviewed` 等。普通 agent 只收到自己的任务/交付事件；管理 agent 用 `role=admin` 的 token 连接时收到全项目事件。历史管理 token 即使 `role=agent`，只要 scopes 含 `admin`/`*` 也按管理视角看全量；只需要全量事件、不需要管理写权限时，用 `role=observer` 的只读 token。事件帧不会进入任务队列，也不会被窗口/tmux 注入。
 
 TypeScript 用 `c.onEvent(...)` / `c.eventStream(...)`；Rust `run` 自动写 `events.jsonl`，可用 `--event-cmd` 接回调。完整协议见 [`docs/EVENT-PUSH.md`](./docs/EVENT-PUSH.md)。
 

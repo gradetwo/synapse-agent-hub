@@ -528,6 +528,7 @@ if (location.search.includes("reset=1")) {
         <label>身份
           <select id="issueRole">
             <option value="agent">普通 agent</option>
+            <option value="observer">观察员（只读全量事件）</option>
             <option value="admin">管理员</option>
           </select>
         </label>
@@ -2699,6 +2700,13 @@ const ADMIN_SCOPES = ["admin","poll","ack","report","heartbeat","publish",...TAS
                       "tasks.read","issues.read","artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
 const AGENT_BASE_SCOPES = ["poll","ack","report","heartbeat","publish",...TASK_SCOPES,
                            "tasks.read","issues.read","artifact.read","artifact.write","submissions.read","submissions.create","issues.report"];
+// 观察员：只读全量事件，不参与 claim/report/写 artifact。
+const OBSERVER_BASE_SCOPES = ["poll","heartbeat","tasks.read","issues.read","submissions.read"];
+const baseScopesForRole = (role) => role === "admin" ? ADMIN_SCOPES
+  : role === "observer" ? OBSERVER_BASE_SCOPES : AGENT_BASE_SCOPES;
+const roleLabel = (role) => role === "admin" ? "管理身份 · 可下发/广播/下载"
+  : role === "observer" ? "观察员 · 全量事件，只读"
+  : "普通 agent · 收件 / 接任务 / 上报";
 // 详情页可编辑的权限：管理员身份本身用“授予/收回管理”切换，不混进这里。
 const SCOPE_OPTIONS = [...TASK_SCOPES, "heartbeat", "poll", "report", "ack", "publish",
                        "tasks.read", "issues.read", "submissions.read", "submissions.create",
@@ -2789,8 +2797,8 @@ function openAgent(id, project) {
     detailRole = role;
     $("dPermSummary").textContent = `${role} · ${scopes.length} 项权限`;
     renderAgentWork(d, live);
-    $("dRole").textContent = role === "admin" ? "管理身份 · 可下发/广播/下载" : "普通 agent · 收件 / 接任务 / 上报";
-    $("dRole").classList.toggle("admin", role === "admin");
+    $("dRole").textContent = roleLabel(role);
+    $("dRole").classList.toggle("admin", role === "admin" || role === "observer");
     const idle = d.idle || {};
     const remindBtn = $("dIdleRemind");
     if (remindBtn) {
@@ -2878,7 +2886,7 @@ function showToken(tok, note) {
 }
 
 async function signToken(agentId, role, ttl, boxId, label) {
-  const scopes = role === "admin" ? ADMIN_SCOPES : AGENT_BASE_SCOPES;
+  const scopes = baseScopesForRole(role);
   const r = await api("/admin/agents", "POST", {
     project: current, agent_id: agentId, role, scopes, ttl_days: ttl, rotate: true,
   });
@@ -2889,16 +2897,14 @@ async function signToken(agentId, role, ttl, boxId, label) {
 async function issueFor(role, reissue = false) {
   if (!detailAgent || !current || !detailReady) return;
   const ttl = Number($("dTtl").value || 30);
-  const scopes = role === "admin" ? ADMIN_SCOPES : AGENT_BASE_SCOPES;
+  const scopes = baseScopesForRole(role);
   const label = reissue ? "生成新 token" : (role === "admin" ? "授予管理权限" : "收回管理权限");
   if (!confirm(`${label}：${detailAgent} 会拿到新 token，旧 token 立即失效。继续？`)) return;
   try {
     await signToken(detailAgent, role, ttl, "dToken", label);
     $("dMeta").textContent = `${role} · ${scopes.length} 项权限`;
-    $("dRole").textContent = role === "admin"
-      ? "管理身份 · 可下发/广播/下载"
-      : "普通 agent · 收件 / 接任务 / 上报";
-    $("dRole").classList.toggle("admin", role === "admin");
+    $("dRole").textContent = roleLabel(role);
+    $("dRole").classList.toggle("admin", role === "admin" || role === "observer");
     detailRole = role;
     renderScopeEditor(scopeList(scopes));
     await loadAgents().catch(() => {});
@@ -2977,10 +2983,8 @@ async function changeAgentProject(keepSource) {
         ? "只显示这一次；源项目 token 仍有效，需要用另一个实例接入目标项目。"
         : "只显示这一次；源项目 token 已吊销，客户端需要切换到目标项目。");
     $("dMeta").textContent = `${r.role} · ${String(r.scopes || "").split(",").filter(Boolean).length} 项权限`;
-    $("dRole").textContent = r.role === "admin"
-      ? "管理身份 · 可下发/广播/下载"
-      : "普通 agent · 只能收件与上报";
-    $("dRole").classList.toggle("admin", r.role === "admin");
+    $("dRole").textContent = roleLabel(r.role);
+    $("dRole").classList.toggle("admin", r.role === "admin" || r.role === "observer");
     detailRole = r.role;
     await loadAgents().catch(() => {});
   } catch (e) {

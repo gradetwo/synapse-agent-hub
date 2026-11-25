@@ -18,7 +18,7 @@ export interface ClientOptions {
   stateDir?: string; heartbeatS?: number;
 }
 
-const VERSION = "0.5.7";
+const VERSION = "0.5.8";
 
 function fetchT(url: string, init: any = {}) {
   // 无超时的 fetch 会把心跳链一起拖死（实测可挂 300s）

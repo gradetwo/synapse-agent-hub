@@ -152,8 +152,12 @@ X-Synapse-Signature: sha256=<hex>
 | 连接身份 | 可见事件 |
 |---|---|
 | `role=admin`（管理 agent / 管理台） | 全项目事件 |
+| 历史管理 token：`role=agent` 但 scopes 含 `admin` / `*` | 全项目事件（按管理视角处理） |
+| `role=observer`（只读观察员） | 全项目事件；token 默认只有心跳/事件/任务/Issue/交付只读 scope，不能 claim/report/写 artifact |
 | 普通 agent | 定向给自己的任务事件、自己发起的任务/交付事件、自己的 `submission.*`、项目级 `announcement.created` |
 | 其它 agent | 看不到别人的交付原文；只能看到与自己相关的任务事件 |
+
+WS 与 `/events` 使用同一套判定：服务端按角色/scope 决定全量或定向，不把全量事件下发给普通连接再让客户端过滤。管理身份如果只需要看全量事件、不需要管理写权限，建议签发 `role=observer` 的 token，而不是 admin token。
 
 WS 建连后服务端先发 `hello`，其中 `events: true`、`event_version: 1` 和 `event_types` 可供客户端做能力探测；旧客户端忽略未知帧即可，不影响原有 `msg` 通道。
 

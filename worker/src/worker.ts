@@ -11,11 +11,14 @@ const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "tasks.cl
                       "artifact.write", "submissions.read", "submissions.create"];
 const ADMIN_SCOPES = ["admin", ...AGENT_SCOPES, "artifact.read"];
 const ALL_SCOPES = new Set([...ADMIN_SCOPES, ...AGENT_SCOPES]);
+// 观察员只读：能心跳、拉事件/任务/Issue/交付，但不能 claim、report、写 artifact。
+// 管理身份只需要全量事件时用它，避免为了看事件签发 admin 全写 token。
+const OBSERVER_SCOPES = ["poll", "heartbeat", "tasks.read", "issues.read", "submissions.read"];
 
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
-const BUILD_TAG = "efficiency-s1-s7-20261125";
+const BUILD_TAG = "events-visibility-20261125";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
-const SDK_VERSION = "0.5.7";
+const SDK_VERSION = "0.5.8";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -305,6 +308,9 @@ export default {
 
     const auth = await authenticate(req, env, project);
     if (!auth.ok) return err(auth.status, auth.reason!);
+    // 观察员是只读身份：可心跳、可 GET 事件/任务/Issue/交付，但不能 claim/report/写 artifact。
+    if (auth.role === "observer" && req.method !== "GET" && !action.startsWith("heartbeat"))
+      return err(403, "observer_read_only");
     // 交付只读（仅精确的 list / bundle 两个 GET）走 submissions.read：
     // 返工节点要按真实补丁开工，不能要求 admin token（ISS-MWSZPB49-B96120）；
     // 写路径仍按 submissions.create 查，其它 submissions GET 不在这里放行。
@@ -380,8 +386,12 @@ export default {
     if (action === "inbox" || action === "events") {
       // 必须“覆盖”而不是“追加”：append 会让 URLSearchParams.get 取到攻击者传来的第一个 agent。
       // 管理角色（含管理 agent）使用 "*" 订阅全项目事件/消息；普通 agent 只能用自己的 id。
+      // 兼容历史管理 token：role=agent 但 scopes 里带 admin/* 的，也按管理视角处理。
+      const scopes = auth.scopes ?? [];
+      const adminView = auth.role === "admin" || scopes.includes("admin") || scopes.includes("*");
       const q = new URLSearchParams(url.search);
-      q.set("agent", auth.role === "admin" ? "*" : (auth.agentId ?? ""));
+      q.set("agent", adminView ? "*" : (auth.agentId ?? ""));
+      q.set("event_role", auth.role === "observer" ? "observer" : adminView ? "admin" : "agent");
       q.set("project", project);
       doSearch = "?" + q.toString();
     }
@@ -537,10 +547,15 @@ async function wsTicket(req: Request, env: Env, project: string) {
   if (!auth.ok) return err(auth.status, auth.reason!);
   const ticket = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
   const exp = Date.now() + 90_000;
+  // 兼容历史管理 token：role=agent 但带 admin/* scope，WS 也要有全量事件视角。
+  // 普通 agent/observer 仍按自身角色；observer 不升成 admin，避免拿到原始全量消息。
+  const scopes = auth.scopes ?? [];
+  const adminView = auth.role === "admin" || scopes.includes("admin") || scopes.includes("*");
+  const ticketRole = auth.role === "observer" ? "observer" : adminView ? "admin" : auth.role;
   try {
     await env.DB.prepare(
       "INSERT INTO ws_tickets (ticket,project,agent_id,role,exp_ms,used) VALUES (?,?,?,?,?,0)"
-    ).bind(ticket, project, auth.agentId, auth.role, exp).run();
+    ).bind(ticket, project, auth.agentId, ticketRole, exp).run();
   } catch (e) {
     console.warn("ws-ticket insert failed", e);
     return dbUnavailable();
@@ -1847,7 +1862,8 @@ async function admin(req: Request, env: Env, url: URL) {
         ORDER BY created_at DESC LIMIT 1`
     ).bind(b.from_project, b.agent_id, Date.now()).first<any>();
     if (!source) return err(404, "source_agent_not_found");
-    const role = source.role === "admin" ? "admin" : "agent";
+    const role = source.role === "admin" ? "admin"
+      : source.role === "observer" ? "observer" : "agent";
     const scopes = String(source.scopes || "").split(",").map((x: string) => x.trim()).filter(Boolean);
     if (!scopes.length) return err(422, "source_agent_has_no_scopes");
 
@@ -1884,14 +1900,16 @@ async function admin(req: Request, env: Env, url: URL) {
     if (!/^[a-z0-9-]{2,40}$/.test(String(b.project ?? ""))) return err(422, "bad_project_name");
     if (!/^[a-zA-Z0-9._-]{2,40}$/.test(String(b.agent_id ?? ""))) return err(422, "bad_agent_id");
     const role = b.role ?? "agent";
-    if (role !== "admin" && role !== "agent") return err(422, "bad_role");
+    if (role !== "admin" && role !== "agent" && role !== "observer") return err(422, "bad_role");
     const proj = await env.DB.prepare("SELECT status FROM projects WHERE project = ?").bind(b.project).first<any>();
     if (!proj || proj.status !== "active") return err(404, "project_not_found");
 
     // 只接受已知 scope；缺省按角色给默认集，管理员绝不能签发成没有 admin 权限的假管理员。
     let list: string[];
     if (b.scopes === undefined || b.scopes === null || b.scopes === "") {
-      list = role === "admin" ? [...ADMIN_SCOPES] : [...AGENT_SCOPES];
+      list = role === "admin" ? [...ADMIN_SCOPES]
+        : role === "observer" ? [...OBSERVER_SCOPES]
+        : [...AGENT_SCOPES];
     } else if (typeof b.scopes === "string") {
       list = b.scopes.split(",").map((x: string) => x.trim()).filter(Boolean);
     } else if (Array.isArray(b.scopes)) {

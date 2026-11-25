@@ -298,7 +298,8 @@ export class ProjectRoom implements DurableObject {
                                              url.searchParams.get("topics"), Number(url.searchParams.get("limit") ?? 100),
                                              url.searchParams.get("agent"),
                                              url.searchParams.get("desc") === "1",
-                                             url.searchParams.get("project"));
+                                             url.searchParams.get("project"),
+                                             url.searchParams.get("event_role") ?? "agent");
       case "events":       return this.eventsFeed(url);
       case "heartbeat":    return this.heartbeat(body);
       case "ack":          return this.ack(body);
@@ -501,10 +502,10 @@ export class ProjectRoom implements DurableObject {
     };
   }
 
-  /** 事件可见性：管理端（role=admin）全量；普通 agent 只看自己相关的任务/交付，
+  /** 事件可见性：管理端（role=admin）、观察员（role=observer）全量；普通 agent 只看自己相关的任务/交付，
    *  以及项目级广播。永远由服务端判定，不把全量事件下发给普通连接再让客户端过滤。 */
   private eventVisible(e: ClientEvent, att: any): boolean {
-    if (!att || att.role === "admin") return true;
+    if (!att || att.role === "admin" || att.role === "observer") return true;
     const me = String(att.me ?? "");
     if (!me || me === "unknown" || me === "*") return false;
     if (e.to && this.isToMe(e.to, me)) return true;
@@ -848,7 +849,8 @@ export class ProjectRoom implements DurableObject {
   }
 
   private async inbox(since: number, topics: string | null, limit: number,
-                      me: string | null = null, desc = false, project: string | null = null) {
+                      me: string | null = null, desc = false, project: string | null = null,
+                      eventRole: string = "agent") {
     since = Math.max(0, Number.isFinite(since) ? since : 0);
     limit = Math.max(1, Math.min(500, Number.isFinite(limit) ? limit : 100));
     // 历史键 `msg:87` 是字符串，字典序里 msg:100 < msg:99，since 游标会失效。
@@ -901,7 +903,8 @@ export class ProjectRoom implements DurableObject {
     const epoch = await this.room();
     // 事件视图与消息视图共用游标，但可见范围独立：普通 agent 收不到别人的 artifact 原文，
     // 仍应收到自己的 submission.created；管理端（me="*"）看全量。
-    const eventAtt = { me: me === "*" ? "*" : me, role: (me === "*" || me === null) ? "admin" : "agent" };
+    const eventAtt = { me: me === "*" ? "*" : me,
+      role: (me === "*" || me === null) ? "admin" : (eventRole === "observer" ? "observer" : "agent") };
     const eventRows = rawMessages
       .map((m: any) => ({ m, e: this.clientEventOf(m) }))
       .filter((x: any) => x.e && this.eventVisible(x.e, eventAtt))
@@ -918,9 +921,10 @@ export class ProjectRoom implements DurableObject {
     const me = url.searchParams.get("agent");
     const topics = url.searchParams.get("topics");
     const project = url.searchParams.get("project");
+    const eventRole = url.searchParams.get("event_role") ?? "agent";
     // 不能把 topics 交给 inbox：submission.created 的原始消息 topic 是 artifact，
     // 用 submission 过滤会把它整条排掉。这里取全量事件，再按事件类别过滤。
-    const r = await this.inbox(since, null, limit, me, false, project);
+    const r = await this.inbox(since, null, limit, me, false, project, eventRole);
     const d: any = await r.json().catch(() => ({}));
     let events: any[] = d.events ?? [];
     if (topics) {
