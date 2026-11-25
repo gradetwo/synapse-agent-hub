@@ -487,6 +487,15 @@ class Client:
     def task(self, task_id: str) -> TaskLease:
         return TaskLease(self, task_id)
 
+    def fail_task(self, task_id: str, error: str, retryable: bool = True) -> dict:
+        """上报执行失败：服务端按 max_attempts 决定退避重试或进死信；成功后清本地 active task。"""
+        r = self._post(f"/p/{self.project}/tasks/fail",
+                       {"task_id": task_id, "error": str(error)[:500], "retryable": bool(retryable)})
+        if r.get("ok"):
+            self._active_task_clear(task_id)
+            self.work(Work(state="idle"))
+        return r
+
     # ── 内部：HTTP ───────────────────────────────────────────
     def _headers(self) -> dict:
         return {"authorization": f"Bearer {self._token}", "x-sdk-version": __version__,

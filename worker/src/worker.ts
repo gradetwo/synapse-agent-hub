@@ -307,7 +307,7 @@ export default {
     const taskPoolRead = req.method === "GET" && action === "tasks";
     // 单条任务自查：GET /p/{project}/tasks/{task_id}。排除内部动作，避免把
     // tasks/active-load 等管理端点误当成任务详情而绕过 admin 鉴权。
-    const taskInternal = /^(claim|release|create|list|get|active-load|admin-close|admin-reclaim|admin-reassign|submission-settled)$/;
+    const taskInternal = /^(claim|release|create|list|get|active-load|admin-close|admin-reclaim|admin-reassign|fail|submission-settled)$/;
     const taskDetailRead = req.method === "GET" && /^tasks\/[A-Za-z0-9._:-]{1,64}$/.test(action) &&
       !taskInternal.test(action.slice(6));
     const issuePoolRead = req.method === "GET" && action === "issues";
@@ -604,7 +604,7 @@ function need(action: string) {
   if (action.startsWith("report")) return "report";
   if (action.startsWith("inbox") || action === "events") return "poll";
   if (action === "tasks/claim") return "tasks.claim";
-  if (action === "tasks/release") return "tasks.release";
+  if (action === "tasks/release" || action === "tasks/fail") return "tasks.release";
   if (action.startsWith("tasks/admin-")) return "admin";
   if (action === "tasks/list" || action === "tasks/get" || action === "tasks/active-load") return "admin";
   // 台账/单任务元数据/内部 active-load 不对普通 agent 开放
@@ -1236,6 +1236,35 @@ async function admin(req: Request, env: Env, url: URL) {
     }
     if (action === "webhook/test" && req.method === "POST") {
       const r = await stub.fetch(new Request("https://do/webhook/test", { method: "POST" }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    // 效率观测：队列健康度、等待/周期分位、失败率、死信与节点 lane。
+    if (action === "observability" && req.method === "GET") {
+      const windowMs = Number(url.searchParams.get("window_ms") ?? 24 * 60 * 60_000);
+      const r = await stub.fetch(new Request("https://do/observability", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project, window_ms: windowMs }),
+      }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    // 单任务时间线：management-only，返回热窗口 + D1 归档 + 记录里程碑。
+    if (action === "tasks/timeline" && req.method === "GET") {
+      const taskId = String(url.searchParams.get("task_id") ?? "").trim();
+      if (!taskId) return err(422, "task_id_required");
+      const r = await stub.fetch(new Request("https://do/tasks/timeline", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project, task_id: taskId, sender: "admin" }),
+      }));
+      return Response.json(await r.json().catch(() => ({})), { status: r.status });
+    }
+    // 手动重试死信/阻塞任务；与任务四个出口一样由 admin sender 走 DO 审计。
+    if (action === "tasks/retry" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      if (!String(b.task_id ?? "").trim()) return err(422, "task_id_required");
+      const r = await stub.fetch(new Request("https://do/tasks/admin-retry", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...b, project, sender: "admin" }),
+      }));
       return Response.json(await r.json().catch(() => ({})), { status: r.status });
     }
     if (action === "tasks" && req.method === "POST") {
@@ -1955,12 +1984,20 @@ async function listPublicTasks(env: Env, project: string, url: URL) {
   const d: any = await r.json().catch(() => ({ tasks: [] }));
   const tasks = (d.tasks ?? [])
     .filter((t: any) => t && t.state === "open" && !t.to && !t.owner)
-    .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
+    .sort((a: any, b: any) => Number(a.effective_priority ?? a.priority ?? 2)
+      - Number(b.effective_priority ?? b.priority ?? 2)
+      || Number(a.deadline_at ?? Infinity) - Number(b.deadline_at ?? Infinity)
+      || Number(a.created_at ?? 0) - Number(b.created_at ?? 0))
     .slice(0, limit)
     .map((t: any) => ({
       task_id: t.task_id ?? t.id,
       title: t.title ?? "",
       body: t.body ?? "",
+      priority: Number(t.priority ?? 2),
+      effective_priority: Number(t.effective_priority ?? t.priority ?? 2),
+      deadline_at: t.deadline_at ?? null,
+      attempts: Number(t.attempts ?? 0),
+      max_attempts: Number(t.max_attempts ?? 3),
       created_at: t.created_at ?? 0,
       updated_at: t.updated_at ?? 0,
       ...(t.issue_id ? { issue_id: t.issue_id } : {}),
@@ -1989,6 +2026,16 @@ function agentTaskView(t: any, agentId: string) {
       : t.to && t.state === "open" ? "notified" : "closed"),
     queue_position: Number(t.queue_position ?? 0),
     dispatch_count: Number(t.dispatch_count ?? 0),
+    priority: Number(t.priority ?? 2),
+    effective_priority: Number(t.effective_priority ?? t.priority ?? 2),
+    deadline_at: t.deadline_at ?? null,
+    deadline_left_ms: t.deadline_at ? Number(t.deadline_at) - Date.now() : null,
+    sla_breached: !!t.deadline_at && Number(t.deadline_at) <= Date.now()
+      && t.state !== "done" && t.state !== "failed",
+    attempts: Number(t.attempts ?? 0),
+    max_attempts: Number(t.max_attempts ?? 3),
+    retry_in_ms: t.next_retry_at ? Math.max(0, Number(t.next_retry_at) - Date.now()) : null,
+    dead_letter: t.dead_letter === true,
     issue_id: t.issue_id ?? null,
     created_at: t.created_at ?? 0,
     updated_at: t.updated_at ?? 0,

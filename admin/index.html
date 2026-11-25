@@ -71,6 +71,7 @@ if (location.search.includes("reset=1")) {
   .badge.released{color:#ffd58a;border-color:#674b18;background:#241b0e}
   .badge.blocked{color:#ff9b9b;border-color:#5b2626;background:#211012}
   .badge.done{color:#86d99e;border-color:#1d3a25;background:#101b13}
+  .badge.failed{color:#ffb3ad;border-color:#6b2b2b;background:#241012}
   .badge.pending{color:#ffd58a;border-color:#674b18;background:#241b0e}
   .badge.accepted{color:#8fb8ff;border-color:#24406e;background:#101a2a}
   .badge.approved{color:#86d99e;border-color:#1d3a25;background:#101b13}
@@ -305,6 +306,21 @@ if (location.search.includes("reset=1")) {
   .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid #232a33;border-radius:8px;background:#151b23}
   .whoItem input{width:auto;height:15px;min-height:0;margin:0;flex:0 0 auto}
   .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(7,minmax(0,1fr))}
+  .obsKpis{display:grid;gap:8px;grid-template-columns:repeat(6,minmax(0,1fr));padding:0 14px 12px}
+  .obsKpis .stat{min-width:0}
+  .obsGrid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,.65fr);gap:10px;padding:0 14px 14px}
+  .obsPanel{min-width:0;background:#121820;border:1px solid #1d2530;border-radius:10px;padding:10px}
+  .obsPanel .dashHead{margin-bottom:7px}
+  .obsLane{display:grid;grid-template-columns:minmax(110px,1fr) 46px 44px 44px 72px 58px;gap:8px;align-items:center;
+    padding:7px 8px;border-top:1px solid #1d2530;font-size:11px}
+  .obsLane:first-child{border-top:0}
+  .obsLane .bar{height:5px;background:#202a36;border-radius:3px;overflow:hidden}
+  .obsLane .bar i{display:block;height:100%;background:var(--accent)}
+  .obsDead{display:grid;gap:6px;max-height:260px;overflow:auto}
+  .obsDead button{text-align:left;background:#161e27;border:1px solid #2a3543;border-radius:7px;padding:7px 8px;color:var(--fg)}
+  .obsDead .tid{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#9ecbff}
+  .obsDead .err{color:#ffb3ad;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  @media(max-width:1100px){.obsKpis{grid-template-columns:repeat(3,1fr)}.obsGrid{grid-template-columns:1fr}}
   .stat{position:relative;background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;overflow:hidden}
   .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:transparent}
   .stat.ok::before{background:var(--ok)}
@@ -591,6 +607,18 @@ if (location.search.includes("reset=1")) {
         <button class="primary" id="btnTaskCreate">派单</button>
         <span class="muted" style="font-size:11px;line-height:1.5">留空自动生成 ID；仅可指派在线节点。</span>
       </div>
+      <div class="row3">
+        <label>优先级
+          <select id="taskPriority">
+            <option value="0">P0 · 最紧急</option>
+            <option value="1">P1 · 高</option>
+            <option value="2" selected>P2 · 普通</option>
+            <option value="3">P3 · 低</option>
+          </select>
+        </label>
+        <label>截止时间<input id="taskDeadline" type="datetime-local" autocomplete="off"></label>
+        <label>最多尝试<input id="taskMaxAttempts" type="number" min="1" max="10" value="3"></label>
+      </div>
       <label>正文<textarea id="taskBody" placeholder="补丁范围、验收口径、依赖任务…"></textarea></label>
     </div>
     <table>
@@ -599,6 +627,26 @@ if (location.search.includes("reset=1")) {
       </tr></thead>
       <tbody id="tasks"><tr><td colspan="8" class="empty">选择具体项目查看任务</td></tr></tbody>
     </table>
+  </div>
+
+  <div class="card" id="obsCard">
+    <h2>效率观测 <span class="muted" id="obsStat">—</span></h2>
+    <div class="scopeHint" style="padding:0 14px 10px;margin:0">
+      队列健康度与端到端时间：等待 = 创建 → 首次下发；周期 = 创建 → 完成；失败率 = 窗口内失败 /（完成 + 失败）。
+    </div>
+    <div class="obsKpis" id="obsKpis">
+      <div class="stat"><div class="k">加载中</div><div class="v">—</div></div>
+    </div>
+    <div class="obsGrid">
+      <div class="obsPanel">
+        <div class="dashHead">节点队列 <span id="obsLaneHint" class="muted"></span></div>
+        <div id="obsLanes"><div class="scopeHint">暂无节点</div></div>
+      </div>
+      <div class="obsPanel">
+        <div class="dashHead">死信 <span id="obsDeadHint" class="muted"></span></div>
+        <div class="obsDead" id="obsDead"><div class="scopeHint">没有死信</div></div>
+      </div>
+    </div>
   </div>
 
   <div class="card" id="webhookCard">
@@ -743,6 +791,14 @@ if (location.search.includes("reset=1")) {
   </div>
 </div>
 
+<div id="taskTimeline" class="overlay" hidden>
+  <div class="sheet">
+    <div class="sheetHead"><b id="tlTitle">任务时间线</b><span class="muted" id="tlMeta"></span>
+      <button class="ghost iconBtn" id="tlClose" aria-label="关闭" title="关闭">×</button></div>
+    <div class="sheetBody"><div id="tlBody" class="workList list"></div></div>
+  </div>
+</div>
+
 <div id="detail" class="overlay" hidden>
   <div class="sheet">
     <div class="sheetHead"><b id="dName">agent</b><span class="muted" id="dMeta"></span>
@@ -868,6 +924,7 @@ let IDLE_ROWS = [];                // 最近一次“待唤醒”快照
 let IDLE_CONFIG = null;            // 当前项目空闲提醒配置
 let IDLE_CFG_DIRTY = false;        // 用户正在编辑时不被自动刷新覆盖
 let ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
+let OBS = null;                    // 最近一次效率观测快照（队列/分位/死信）
 let SUB_STATE = new Map();         // submission_id -> state；下载前判断是否待取
 let lastPending = null;            // 上一次待取数；只在新交付出现时弹提醒
 let toastTimer = null;
@@ -1213,11 +1270,32 @@ function taskRow(t, isAll) {
   cells[0].append(proj, br, idSpan, title);
 
   const stateBadge = document.createElement("span");
-  const known = ["open", "claimed", "released", "blocked", "done"];
+  const known = ["open", "claimed", "released", "blocked", "done", "failed"];
   stateBadge.className = `badge ${known.includes(st) ? st : "open"}`;
   stateBadge.textContent = taskStateLabel(st, t);
   cells[1].append(stateBadge);
-  if (t.dispatch_state === "queued") {
+  const pr = Number(t.priority ?? 2);
+  const prBadge = document.createElement("span");
+  prBadge.className = "badge";
+  prBadge.style.marginLeft = "4px";
+  prBadge.title = "P0 最高；排队 30 分钟自动提升一级";
+  prBadge.textContent = `P${Number.isFinite(pr) ? Math.max(0, Math.min(3, pr)) : 2}`;
+  if (pr <= 1) prBadge.style.color = pr === 0 ? "#ffb3ad" : "#ffd58a";
+  cells[1].append(prBadge);
+  if (Number(t.attempts ?? 0) > 0) {
+    const at = document.createElement("span");
+    at.className = "badge blocked";
+    at.style.marginLeft = "4px";
+    at.textContent = `重试 ${Number(t.attempts)}/${Number(t.max_attempts ?? 3)}`;
+    cells[1].append(at);
+  }
+  if (t.dispatch_state === "queued" && Number(t.retry_in_ms ?? 0) > 0) {
+    const rq = document.createElement("span");
+    rq.className = "badge released";
+    rq.style.marginLeft = "4px";
+    rq.textContent = `退避 ${Math.ceil(Number(t.retry_in_ms) / 1000)}s`;
+    cells[1].append(rq);
+  } else if (t.dispatch_state === "queued") {
     const q = document.createElement("span");
     q.className = "badge released";
     q.style.marginLeft = "4px";
@@ -1249,6 +1327,13 @@ function taskRow(t, isAll) {
   if (lease.cls) leaseSpan.className = lease.cls;
   leaseSpan.textContent = lease.text;
   cells[3].append(leaseSpan);
+  if (t.deadline_at) {
+    const dl = document.createElement("div");
+    dl.className = Number(t.sla_breached) ? "badv" : "muted";
+    dl.style.fontSize = "10px";
+    dl.textContent = `截止 ${new Date(Number(t.deadline_at)).toLocaleString()}`;
+    cells[3].append(dl);
+  }
 
   const pending = Number(t.pending_submissions ?? 0);
   if (pending > 0) {
@@ -1290,11 +1375,18 @@ function taskRow(t, isAll) {
     hint.textContent = "切到项目";
     cells[7].append(hint);
   } else if (st === "done") {
-    const hint = document.createElement("span");
-    hint.className = "muted";
-    hint.textContent = "已结";
-    cells[7].append(hint);
+    const tl = document.createElement("button");
+    tl.type = "button";
+    tl.className = "ghost mini";
+    tl.dataset.taskTimeline = id;
+    tl.textContent = "时间线";
+    cells[7].append(tl);
   } else {
+    const tl = document.createElement("button");
+    tl.type = "button";
+    tl.className = "ghost mini";
+    tl.dataset.taskTimeline = id;
+    tl.textContent = "时间线";
     const close = document.createElement("button");
     close.type = "button";
     close.className = "ghost mini";
@@ -1314,12 +1406,182 @@ function taskRow(t, isAll) {
     reassign.className = "ghost mini";
     reassign.dataset.taskReassign = id;
     reassign.textContent = "转派";
-    cells[7].append(close, document.createTextNode(" "), reclaim, document.createTextNode(" "),
-                    select, document.createTextNode(" "), reassign);
+    const extra = [];
+    if (st === "failed" || t.dead_letter === true) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "ghost mini";
+      retry.dataset.taskRetry = id;
+      retry.textContent = "重试";
+      extra.push(retry);
+    }
+    cells[7].append(tl, document.createTextNode(" "), close, document.createTextNode(" "),
+                    ...extra.flatMap((b) => [b, document.createTextNode(" ")]),
+                    reclaim, document.createTextNode(" "), select, document.createTextNode(" "), reassign);
   }
   cells[7].style.whiteSpace = "nowrap";
   return tr;
 }
+
+function fmtDur(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  const s = Math.round(n / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  if (h < 24) return `${h}h${mm ? `${mm}m` : ""}`;
+  return `${Math.floor(h / 24)}d${h % 24 ? `${h % 24}h` : ""}`;
+}
+
+function mergeObs(list) {
+  if (!list.length) return null;
+  const out = { ...list[0], summary: { ...list[0].summary }, lanes: [], recent_dead: [], health: { status: "ok", reasons: [] } };
+  for (const item of list.slice(1)) {
+    const a = out.summary, b = item.summary || {};
+    for (const k of ["tasks_total", "active", "wip", "claimed", "queued", "retry_wait", "public_pool",
+                     "done_window", "failed_window", "retries_window", "dead_letters", "sla_breaches"]) {
+      a[k] = Number(a[k] ?? 0) + Number(b[k] ?? 0);
+    }
+    for (const k of ["oldest_queue_age_ms", "queue_wait_p50_ms", "queue_wait_p95_ms",
+                     "cycle_p50_ms", "cycle_p95_ms", "throughput_per_hour"]) {
+      a[k] = Math.max(Number(a[k] ?? 0) || 0, Number(b[k] ?? 0) || 0);
+    }
+  }
+  const done = Number(out.summary.done_window ?? 0), failed = Number(out.summary.failed_window ?? 0);
+  out.summary.failure_rate = done + failed ? Math.round((failed / (done + failed)) * 1000) / 1000 : 0;
+  for (const item of list) {
+    out.lanes.push(...(item.lanes || []).map((l) => ({ ...l, project: item.project })));
+    out.recent_dead.push(...(item.recent_dead || []).map((d) => ({ ...d, project: item.project })));
+    if (item.health?.status === "bad") out.health.status = "bad";
+    else if (item.health?.status === "warn" && out.health.status !== "bad") out.health.status = "warn";
+    for (const r of item.health?.reasons || []) if (!out.health.reasons.includes(r)) out.health.reasons.push(r);
+  }
+  out.lanes.sort((a, b) => Number(b.queued ?? 0) - Number(a.queued ?? 0)
+    || Number(b.retry_wait ?? 0) - Number(a.retry_wait ?? 0)
+    || String(a.project || "").localeCompare(String(b.project || ""))
+    || String(a.agent_id || "").localeCompare(String(b.agent_id || "")));
+  return out;
+}
+
+async function loadObservability() {
+  const project = current;
+  if (!project || !$("obsCard")) return;
+  let obs = null;
+  try {
+    if (project === "*") {
+      const projects = (allProjects || []).filter((p) => p.project !== "*");
+      const got = await Promise.allSettled(projects.map((p) =>
+        api(`/admin/p/${p.project}/observability?window_ms=${24 * 60 * 60_000}`).then((d) => ({ ...d, project: p.project }))));
+      if (current !== project) return;
+      obs = mergeObs(got.filter((r) => r.status === "fulfilled").map((r) => r.value));
+    } else {
+      obs = await api(`/admin/p/${project}/observability?window_ms=${24 * 60 * 60_000}`);
+      if (current !== project) return;
+    }
+    OBS = obs;
+    renderObservability();
+  } catch (e) {
+    if (current !== project) return;
+    console.warn("[hub] observability failed", e);
+    OBS = null;
+    renderObservability();
+  }
+}
+
+function renderObservability() {
+  if (!$("obsCard")) return;
+  if (!OBS) {
+    $("obsStat").textContent = "接口未就绪";
+    $("obsKpis").innerHTML = `<div class="stat"><div class="k">效率观测</div><div class="v">—</div><div class="sub">部署 0057 后自动出现</div></div>`;
+    $("obsLanes").innerHTML = `<div class="scopeHint">暂无数据</div>`;
+    $("obsDead").innerHTML = `<div class="scopeHint">没有死信</div>`;
+    return;
+  }
+  const s = OBS.summary || {};
+  const health = OBS.health?.status || "ok";
+  const healthText = health === "bad" ? "风险" : health === "warn" ? "注意" : "健康";
+  $("obsStat").textContent = `${healthText}${OBS.health?.reasons?.length ? " · " + OBS.health.reasons.join("；") : ""}`
+    + (current === "*" ? " · 全部项目" : ` · 近 ${Math.round((OBS.window_ms || 0) / 3_600_000)}h`);
+  $("obsStat").className = `muted ${health === "bad" ? "badv" : health === "warn" ? "warnv" : ""}`;
+  const kpis = [
+    { k: "队列深度", v: Number(s.queued ?? 0), sub: `退避 ${Number(s.retry_wait ?? 0)} · 公共池 ${Number(s.public_pool ?? 0)}`, cls: Number(s.queued ?? 0) ? "warn" : "ok" },
+    { k: "最老等待", v: fmtDur(s.oldest_queue_age_ms), sub: `P95 ${fmtDur(s.queue_wait_p95_ms)}`, cls: Number(s.oldest_queue_age_ms ?? 0) > 2 * 3600_000 ? "warn" : "" },
+    { k: "周期 P95", v: fmtDur(s.cycle_p95_ms), sub: `P50 ${fmtDur(s.cycle_p50_ms)}`, cls: "" },
+    { k: "吞吐 / 时", v: Number(s.throughput_per_hour ?? 0), sub: `完成 ${Number(s.done_window ?? 0)}（窗口）`, cls: "accent" },
+    { k: "失败率", v: `${Math.round(Number(s.failure_rate ?? 0) * 100)}%`, sub: `失败 ${Number(s.failed_window ?? 0)} · 重试 ${Number(s.retries_window ?? 0)}`, cls: Number(s.failure_rate ?? 0) > .2 ? "warn" : "" },
+    { k: "死信 / SLA", v: `${Number(s.dead_letters ?? 0)} / ${Number(s.sla_breaches ?? 0)}`, sub: `执行中 ${Number(s.wip ?? 0)} · 完成 ${Number(s.done_window ?? 0)}`, cls: Number(s.dead_letters ?? 0) ? "warn" : "" },
+  ];
+  $("obsKpis").innerHTML = kpis.map((x) =>
+    `<div class="stat ${x.cls}"><div class="k">${x.k}</div><div class="v">${esc(String(x.v))}<span class="sub">${esc(x.sub)}</span></div></div>`).join("");
+  const lanes = OBS.lanes || [];
+  $("obsLaneHint").textContent = `${lanes.length} 个节点 · 窗口 ${Math.round((OBS.window_ms || 0) / 3_600_000)}h`;
+  $("obsLanes").innerHTML = lanes.length ? lanes.map((l) => {
+    const pct = Math.max(0, Math.min(100, Number(l.utilization ?? 0)));
+    const dot = l.alive === "alive" ? "alive" : l.alive === "late" ? "late" : "offline";
+    const name = current === "*" ? `${l.project || "?"}/${l.agent_id}` : l.agent_id;
+    return `<div class="obsLane">
+      <div><i class="dot ${dot}"></i> <span class="mono">${esc(name)}</span></div>
+      <div><span class="mono">${Number(l.in_flight ?? 0)}/${Number(l.max_parallel ?? 0)}</span><div class="bar"><i style="width:${pct}%"></i></div></div>
+      <div><span class="mono">${Number(l.queued ?? 0)}</span>${Number(l.retry_wait ?? 0) ? `<span class="muted"> +${Number(l.retry_wait)}</span>` : ""}</div>
+      <div class="${Number(l.oldest_queue_age_ms ?? 0) > 2 * 3600_000 ? "badv" : ""}">${fmtDur(l.oldest_queue_age_ms)}</div>
+      <div>${fmtDur(l.wait_p95_ms)}</div>
+      <div class="muted">${Number(l.completed_window ?? 0)} / <span class="${Number(l.failed_window ?? 0) ? "badv" : ""}">${Number(l.failed_window ?? 0)}</span></div>
+    </div>`;
+  }).join("") : `<div class="scopeHint">没有接入节点</div>`;
+  const dead = OBS.recent_dead || [];
+  $("obsDeadHint").textContent = dead.length ? `${dead.length} 个待重试` : "没有死信";
+  $("obsDead").innerHTML = dead.length ? dead.map((d) =>
+    `<button type="button" data-task-timeline="${esc(String(d.task_id || ""))}" title="查看时间线并重试">
+      <div class="tid">${esc(String(d.task_id || ""))}${d.project && current === "*" ? ` · ${esc(d.project)}` : ""}</div>
+      <div class="muted" style="font-size:11px">${esc(String(d.title || ""))} → ${esc(String(d.to || "公共池"))} · ${Number(d.attempts ?? 0)}/${Number(d.max_attempts ?? 3)}</div>
+      <div class="err">${esc(String(d.last_error || ""))}</div>
+    </button>`).join("") : `<div class="scopeHint">没有死信；失败任务会自动退避重试。</div>`;
+}
+
+async function showTaskTimeline(taskId) {
+  if (current === "*") return alert("先选择具体项目再查看时间线");
+  const ov = $("taskTimeline");
+  if (!ov) return;
+  $("tlTitle").textContent = `任务时间线 · ${taskId}`;
+  $("tlMeta").textContent = "加载中…";
+  $("tlBody").innerHTML = `<div class="scopeHint">加载中…</div>`;
+  ov.hidden = false;
+  ov.style.display = "flex";
+  document.body.classList.add("has-sheet");
+  try {
+    const d = await api(`/admin/p/${current}/tasks/timeline?task_id=${encodeURIComponent(taskId)}`);
+    const t = d.task || {};
+    $("tlMeta").textContent = `${taskStateLabel(t.state, t)} · P${Number(t.priority ?? 2)} · `
+      + `${Number(t.attempts ?? 0)}/${Number(t.max_attempts ?? 3)} 次 · ${d.count || 0} 个事件`;
+    const typeLabel = {
+      "task.created": "创建", "task.queued": "排队", "task.dispatched": "下发",
+      "task.claimed": "领取", "task.retry_scheduled": "失败退避", "task.retried": "重新下发",
+      "task.failed": "失败", "task.dead_lettered": "进入死信", "task.released": "交付待取",
+      "task.done": "完成", "task.reopened": "重开", "task.reclaimed": "取回",
+      "task.reassigned": "转派", "submission.created": "交付到达", "submission.reviewed": "交付裁决",
+      "submission.collected": "交付取走", "submission.archived": "交付归档",
+    };
+    const ev = (d.events || []).map((e) => {
+      const at = e.ts ? new Date(e.ts).toLocaleString() : "—";
+      const actor = e.actor || "system";
+      const extra = e.data?.message || e.data?.error || e.data?.reason
+        || (e.data?.submission_id ? `submission ${e.data.submission_id}` : "")
+        || (e.data?.queue_position ? `队列 #${e.data.queue_position}` : "");
+      return `<div class="row" style="align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid #1d2530">
+        <div class="muted mono" style="min-width:132px;font-size:10px">${esc(at)}</div>
+        <div style="min-width:82px"><span class="badge">${esc(typeLabel[e.type] || e.type)}</span></div>
+        <div style="min-width:64px" class="mono">${esc(actor)}</div>
+        <div class="muted" style="flex:1;font-size:11px;word-break:break-word">${esc(String(extra))}</div>
+      </div>`;
+    }).join("");
+    $("tlBody").innerHTML = ev || `<div class="scopeHint">没有事件</div>`;
+  } catch (e) {
+    $("tlBody").innerHTML = `<div class="badv">加载失败：${esc(String(e?.message || e))}</div>`;
+  }
+}
+
 
 async function loadAgents() {
   const project = current;
@@ -1369,11 +1631,13 @@ function taskLease(t) {
 function taskStateLabel(s, t) {
   if (s === "open") {
     if (!t || !t.to) return "待领取";
+    if (Number(t.retry_in_ms ?? 0) > 0) return "待重试";
     if (t.dispatch_state === "queued") return "排队中";
     if (t.dispatch_state === "notified") return "已下发";
     if (t.dispatch_state === "closed") return "待处理";
   }
-  return { open: "待领取", claimed: "执行中", released: "已交付待取", blocked: "已阻塞", done: "已完成" }[s] || s;
+  return { open: "待领取", claimed: "执行中", released: "已交付待取", blocked: "已阻塞",
+           done: "已完成", failed: t?.dead_letter ? "死信" : "失败" }[s] || s;
 }
 
 // 滞留：派了没人领，或领了但节点离线/租约过期。和“回收滞留”按钮共用同一口径。
@@ -1414,7 +1678,8 @@ async function loadTasks() {
     if (current !== project) return;
     rows = Array.isArray(raw) ? raw : (raw.tasks || []);
   }
-  const rank = (st) => st === "claimed" ? 0 : st === "open" ? 1 : st === "released" ? 2 : st === "blocked" ? 3 : 4;
+  const rank = (st) => st === "claimed" ? 0 : st === "open" ? 1 : st === "released" ? 2
+    : st === "blocked" ? 3 : st === "failed" ? 4 : 5;
   rows.sort((a, b) => rank(a.state) - rank(b.state)
     || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
   TASK_ROWS = rows;
@@ -2122,6 +2387,7 @@ function renderDashboard() {
     { key: "claimed", label: "执行中", color: "#6aa9ff", value: 0 },
     { key: "released", label: "待取", color: "#d29922", value: 0 },
     { key: "blocked", label: "阻塞", color: "#f85149", value: 0 },
+    { key: "failed", label: "死信", color: "#ff7b72", value: 0 },
     { key: "done", label: "完成", color: "#56d364", value: 0 },
   ];
   for (const t of (TASK_ROWS || [])) {
@@ -2676,9 +2942,11 @@ function decorateCards() {
     [...c.children].filter((x) => x !== h).forEach((x) => body.appendChild(x));
     c.appendChild(body);
 
-    // 只保留两块常驻：概览（一眼看健康度）、名册（最小操作面），其余默认收起
-    const title = (h.textContent || "").trim().replace(/[▸▾⤢⤡]/g, "").trim();
-    const keep = /^(概览|名册|注册审批|签发 token)/.test(title);   // 待审批准与签发入口默认展开
+    // 只保留常驻卡片默认展开：概览/名册/待审批准/签发/效率观测；
+    // 标题只取 h2 的首个文本节点，避免把动态状态/计数带进 localStorage 的折叠 key。
+    const title = ((h.firstChild && h.firstChild.nodeType === 3 ? h.firstChild.textContent : h.textContent) || "")
+      .trim().replace(/[▸▾⤢⤡]/g, "").trim();
+    const keep = /^(概览|名册|注册审批|签发 token|效率观测)/.test(title);
     const key = `hub.fold2.${title}`;
     let folded = !keep;
     try {
@@ -2854,6 +3122,7 @@ function bindFilters() {
         { v: "claimed", label: "执行中" },
         { v: "released", label: "已交付待取" },
         { v: "blocked", label: "已阻塞" },
+        { v: "failed", label: "死信/失败" },
         { v: "done", label: "已完成" },
         { v: "review:pending", label: "待裁决" },
       ],
@@ -2881,8 +3150,8 @@ function bindFilters() {
 }
 
 const GROUPS = [
-  { id: "overview", label: "总览", cards: ["概览", "名册"] },
-  { id: "task",     label: "任务", cards: ["任务"] },
+  { id: "overview", label: "总览", cards: ["概览", "效率观测", "名册"] },
+  { id: "task",     label: "任务", cards: ["任务", "效率观测"] },
   { id: "issue",    label: "Issue", cards: ["Issue"] },
   { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
   { id: "msg",      label: "消息", cards: ["消息流", "定向指令", "广播"] },
@@ -3159,7 +3428,8 @@ async function loadAnalytics(fresh = false) {
 function setProjectPanels(enabled) {
   document.body.classList.toggle("view-all", !enabled);
   syncBulkAvailability();
-  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast", "btnTaskCreate", "btnIdleSave", "btnIdleCheck"]) {
+  for (const id of ["btnIssueToken", "btnQuick", "btnSend", "btnBroadcast", "btnTaskCreate", "btnIdleSave", "btnIdleCheck",
+                    "taskPriority", "taskDeadline", "taskMaxAttempts", "taskTo", "taskTitle", "taskBody"]) {
     const el = $(id);
     if (el) el.disabled = !enabled;
   }
@@ -3206,7 +3476,7 @@ async function refresh(forceFresh = false) {
   const epoch = ++refreshEpoch;
   // 各面板独立容错：任一非核心接口失败不应让整页 lock()。
   // 用 allSettled 并打印失败项，界面其余部分照常渲染。
-  const parts = [loadAgents(), loadSec(), loadStats(forceFresh), loadEnr(), loadAnalytics(forceFresh)];
+  const parts = [loadAgents(), loadSec(), loadStats(forceFresh), loadEnr(), loadAnalytics(forceFresh), loadObservability()];
   if (current !== "*") parts.push(loadIdle());
   if (current !== "*") parts.push(loadWebhook());
   const results = await Promise.allSettled(parts);
@@ -3376,6 +3646,10 @@ const iCloseEl = $("issueDetailClose");
 if (iCloseEl) iCloseEl.onclick = () => { const d = $("issueDetail"); if (d) { d.hidden = true; document.body.classList.remove("has-sheet"); } };
 const iOv = $("issueDetail");
 if (iOv) iOv.onclick = (e) => { if (e.target === iOv) { iOv.hidden = true; document.body.classList.remove("has-sheet"); } };
+const tlCloseEl = $("tlClose");
+if (tlCloseEl) tlCloseEl.onclick = () => { const d = $("taskTimeline"); if (d) { d.hidden = true; d.style.display = ""; document.body.classList.remove("has-sheet"); } };
+const tlOv = $("taskTimeline");
+if (tlOv) tlOv.onclick = (e) => { if (e.target === tlOv) { tlOv.hidden = true; tlOv.style.display = ""; document.body.classList.remove("has-sheet"); } };
 const dOv = $("detail");
 if (dOv) dOv.onclick = (e) => { if (e.target === dOv) { dOv.hidden = true; document.body.classList.remove("has-sheet"); } };
 $("btnSettings").onclick = settings;
@@ -3450,15 +3724,25 @@ $("btnTaskCreate").onclick = async () => {
     id = `T-${stamp}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
   }
   const to = $("taskTo").value || null;
+  const priority = Number($("taskPriority")?.value ?? 2);
+  const maxAttempts = Number($("taskMaxAttempts")?.value ?? 3);
+  const deadlineRaw = $("taskDeadline")?.value || "";
+  const deadlineAt = deadlineRaw ? new Date(deadlineRaw).getTime() : null;
+  if (deadlineAt !== null && !Number.isFinite(deadlineAt)) return alert("截止时间格式不正确");
   $("btnTaskCreate").disabled = true;
   try {
-    const r = await api(`/admin/p/${current}/tasks`, "POST", { task_id: id, title, body, to });
+    const r = await api(`/admin/p/${current}/tasks`, "POST", {
+      task_id: id, title, body, to, priority, max_attempts: maxAttempts, deadline_at: deadlineAt,
+    });
     const warn = r.warning?.message ? `；⚠️ ${r.warning.message}` : "";
     const queue = r.dispatch_state === "queued"
       ? `；已排队${Number(r.queue_position) ? ` #${Number(r.queue_position)}` : ""}（并发上限 ${r.max_parallel_tasks || 1}，前序释放后自动下发）`
       : "";
     showToast(`已派单 ${r.task_id || id}${to ? " → " + to : ""}${queue}${warn}`, queue || warn ? 12000 : 6000);
     $("taskId").value = ""; $("taskTitle").value = ""; $("taskBody").value = "";
+    if ($("taskDeadline")) $("taskDeadline").value = "";
+    if ($("taskPriority")) $("taskPriority").value = "2";
+    if ($("taskMaxAttempts")) $("taskMaxAttempts").value = "3";
     await loadTasks();
     setCardOpen("任务", true);
   } finally {
@@ -3482,7 +3766,7 @@ document.addEventListener("click", async (e) => {
     const issueState = dash.getAttribute("data-dash-issue");
     if (issueState) return showCardFilter("Issue", "issue", issueState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-task-retry],[data-task-timeline],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const iv = btn.getAttribute("data-issue-view");
@@ -3576,6 +3860,22 @@ document.addEventListener("click", async (e) => {
     if (srj) return reviewSub(srj, "rejected");
     const ub = btn.getAttribute("data-unblock");
     if (ub) { if (!confirm(`解除 ${ub} 的封禁？`)) return; await api("/admin/security/unblock", "POST", { ip: ub }); return loadSec(); }
+    const tt = btn.getAttribute("data-task-timeline");
+    if (tt) { await showTaskTimeline(tt); return; }
+    const trt = btn.getAttribute("data-task-retry");
+    if (trt) {
+      if (current === "*") return alert("先选择具体项目再重试任务");
+      if (!confirm(`重试任务 ${trt}？会清零本轮失败次数并重新进入优先级队列。`)) return;
+      const reason = prompt("重试原因（写入任务审计）", "管理员手动重试");
+      if (reason === null) return;
+      try {
+        const r = await api(`/admin/p/${current}/tasks/retry`, "POST", { task_id: trt, reason });
+        const q = r.dispatch_state === "queued" ? "，已重新排队" : "";
+        showToast(`已重试 ${trt}${q}`, 6000);
+        await refresh(true);
+      } catch (e) { alert(`重试失败：${e.message || e}`); }
+      return;
+    }
     const tc = btn.getAttribute("data-task-close");
     if (tc) {
       const row = btn.closest("[data-task-id]");

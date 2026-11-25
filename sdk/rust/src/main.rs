@@ -1711,6 +1711,24 @@ fn main() {
             }
             return;
         }
+        "task-fail" => {
+            let id = args_map.get("task").or_else(|| args_map.get("task-id"))
+                .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                .or_else(|| active_task_id(&cfg)).unwrap_or_default();
+            if id.trim().is_empty() { eprintln!("task-fail 需要 --task <id>，或先 claim 写入 active_task.json"); std::process::exit(2); }
+            let error = args_map.get("error").or_else(|| args_map.get("reason"))
+                .cloned().unwrap_or_else(|| "task_failed".into());
+            let retryable = args_map.get("retryable").map(|s| s != "false" && s != "0").unwrap_or(true);
+            match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/fail", cfg.project),
+                             json!({ "task_id": id, "error": error, "retryable": retryable })) {
+                Ok(v) => {
+                    active_task_clear(&cfg, Some(&id));
+                    println!("{}", serde_json::to_string(&v).unwrap_or_default());
+                }
+                Err(e) => { eprintln!("task-fail 失败：{e}"); std::process::exit(1); }
+            }
+            return;
+        }
         "submit" => {
             let kind = args_map.get("kind").cloned().unwrap_or_else(|| "patch".into());
             let title = args_map.get("title").cloned().unwrap_or_default();

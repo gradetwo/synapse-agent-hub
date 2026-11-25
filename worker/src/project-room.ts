@@ -8,6 +8,40 @@ export const ACTIVE_TASK_LIMIT = 5;              // 普通 agent 自领公共任
 const DEFAULT_SURFACE_PARALLEL = 1;              // window/tmux 一次只能跑一个任务
 const DEFAULT_HEADLESS_PARALLEL = 2;             // 无窗口/无 tmux 的循环默认允许两件在途任务
 const MAX_PARALLEL_TASKS = 8;
+const DEFAULT_TASK_PRIORITY = 2;                // P0..P3，P2 为默认
+const MAX_TASK_PRIORITY = 3;
+const PRIORITY_AGING_MS = 30 * 60_000;          // 排队 30 分钟提升一级，防止低优先级饿死
+const DEFAULT_MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 10;
+const RETRY_BASE_MS = 15_000;                    // 15s 起指数退避，封顶 5 分钟
+const RETRY_MAX_MS = 5 * 60_000;
+
+function clampPriority(v: unknown): number {
+  if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TASK_PRIORITY;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return DEFAULT_TASK_PRIORITY;
+  return Math.max(0, Math.min(MAX_TASK_PRIORITY, Math.floor(n)));
+}
+
+function parseDeadlineAt(v: unknown): number | null {
+  if (v === undefined || v === null || String(v).trim() === "") return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v > 0 ? v : null;
+  const s = String(v).trim();
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return n > 0 ? n : null;
+  }
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+
+function percentile(values: number[], p: number): number | null {
+  if (!values.length) return null;
+  const sorted = values.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+  return Math.round(sorted[idx]);
+}
 
 /** 外部管理端 webhook。配置只存在 DO，secret 不回传管理端。 */
 type WebhookConfig = {
@@ -107,7 +141,35 @@ export class ProjectRoom implements DurableObject {
   }
 
   private isTerminalDispatch(t: any): boolean {
-    return ["done", "released", "blocked"].includes(String(t?.state ?? ""));
+    return ["done", "released", "blocked", "failed"].includes(String(t?.state ?? ""));
+  }
+
+  /** 基础优先级 + 排队老化 + 截止时间加成。数值越小越优先。 */
+  private effectivePriority(t: any, now = Date.now()): number {
+    let p = clampPriority(t?.priority);
+    const created = Number(t?.created_at ?? now);
+    const waited = Math.max(0, now - created);
+    p = Math.max(0, p - Math.floor(waited / PRIORITY_AGING_MS));
+    const deadline = Number(t?.deadline_at ?? 0);
+    if (deadline && deadline <= now) p = 0;
+    else if (deadline && deadline - now <= 10 * 60_000) p = Math.min(p, 1);
+    return p;
+  }
+
+  /** 队列统一排序：有效优先级 → 最近截止 → 最早创建。 */
+  private compareQueue(a: any, b: any, now = Date.now()): number {
+    const pa = this.effectivePriority(a, now);
+    const pb = this.effectivePriority(b, now);
+    if (pa !== pb) return pa - pb;
+    const da = Number(a?.deadline_at ?? Infinity);
+    const db = Number(b?.deadline_at ?? Infinity);
+    if (da !== db) return da - db;
+    return Number(a?.created_at ?? 0) - Number(b?.created_at ?? 0);
+  }
+
+  /** 重试时间未到的任务仍处于 queued，但不能被 promoteQueue 提前下发。 */
+  private retryReady(t: any, now = Date.now()): boolean {
+    return !t?.next_retry_at || Number(t.next_retry_at) <= now;
   }
 
   /** 当前占用并发槽的定向任务数。notified（已发消息）和 active（已 claim）都算；
@@ -121,9 +183,11 @@ export class ProjectRoom implements DurableObject {
 
   private async queuePosition(agentId: string, taskId: string): Promise<number> {
     if (!agentId) return 0;
+    const now = Date.now();
     const queued = (await this.listRawTasks())
-      .filter((t: any) => t.to === agentId && t.state === "open" && this.dispatchStateOf(t) === "queued")
-      .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0));
+      .filter((t: any) => t.to === agentId && t.state === "open" && this.dispatchStateOf(t) === "queued"
+        && this.retryReady(t, now))
+      .sort((a: any, b: any) => this.compareQueue(a, b, now));
     const idx = queued.findIndex((t: any) => String(t.task_id ?? t.id ?? "") === taskId);
     return idx >= 0 ? idx + 1 : 0;
   }
@@ -150,7 +214,10 @@ export class ProjectRoom implements DurableObject {
         seq = await this.append({
           project, sender: "admin", topic: "task", kind: "queued", to: t.to,
           payload: { task_id: taskId, title: t.title ?? "", work_item: false,
-                     dispatch_state: "queued", queue_position: pos, max_parallel: max },
+                     dispatch_state: "queued", queue_position: pos, max_parallel: max,
+                     priority: clampPriority(t.priority), effective_priority: this.effectivePriority(t),
+                     deadline_at: t.deadline_at ?? null, attempts: Number(t.attempts ?? 0),
+                     retry: Number(t.attempts ?? 0) > 0 },
           dedupe_key: `task-queued:${taskId}:${Number(t.dispatch_count ?? 0)}:${Date.now()}`,
         });
       } catch (e: any) {
@@ -160,42 +227,50 @@ export class ProjectRoom implements DurableObject {
                max_parallel: max, seq };
     }
     const count = Number(t.dispatch_count ?? 0) + 1;
+    const retried = Number(t.attempts ?? 0) > 0;
     const next = { ...t, dispatch_state: "notified", notified_at: Date.now(),
                    dispatch_count: count, updated_at: Date.now() };
     await this.st.put(`task:${taskId}`, next);
     const seq = await this.append({
       project, sender: "admin", topic: "task", kind: "task", to: t.to,
       payload: { task_id: taskId, title: t.title ?? "", body: t.body ?? "",
-                 work_item: true, dispatch_count: count, ...extra },
+                 work_item: true, dispatch_count: count, priority: clampPriority(t.priority),
+                 effective_priority: this.effectivePriority(t), deadline_at: t.deadline_at ?? null,
+                 attempts: Number(t.attempts ?? 0), retried, ...extra },
       dedupe_key: `task-dispatch:${taskId}:${count}`,
     });
     return { notified: true, dispatch_state: "notified", seq, max_parallel: max };
   }
 
-  /** 释放一个槽位后，按 FIFO 补发队列里的任务，直到达到并发上限。 */
+  /** 释放一个槽位后，按优先级/截止/老化补发队列里的任务，直到达到并发上限。 */
   private async promoteQueue(project: string, agentId: string | null | undefined): Promise<any[]> {
     if (!agentId) return [];
     const max = await this.agentMaxParallel(agentId);
     let inFlight = await this.directedInFlight(agentId);
     const promoted: any[] = [];
     while (inFlight < max) {
+      const now = Date.now();
       const queued = (await this.listRawTasks())
-        .filter((t: any) => t.to === agentId && t.state === "open" && this.dispatchStateOf(t) === "queued")
-        .sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0));
+        .filter((t: any) => t.to === agentId && t.state === "open" && this.dispatchStateOf(t) === "queued"
+          && this.retryReady(t, now))
+        .sort((a: any, b: any) => this.compareQueue(a, b, now));
       const t = queued[0];
       if (!t) break;
       const taskId = String(t.task_id ?? t.id ?? "");
       const count = Number(t.dispatch_count ?? 0) + 1;
+      const retried = Number(t.attempts ?? 0) > 0;
       const next = { ...t, dispatch_state: "notified", notified_at: Date.now(),
-                     dispatch_count: count, updated_at: Date.now() };
+                     next_retry_at: null, dispatch_count: count, updated_at: Date.now() };
       await this.st.put(`task:${taskId}`, next);
       const seq = await this.append({
         project, sender: "admin", topic: "task", kind: "task", to: agentId,
         payload: { task_id: taskId, title: t.title ?? "", body: t.body ?? "",
-                   work_item: true, dispatch_count: count, queue_promoted: true },
+                   work_item: true, dispatch_count: count, queue_promoted: true,
+                   priority: clampPriority(t.priority), effective_priority: this.effectivePriority(t),
+                   deadline_at: t.deadline_at ?? null, attempts: Number(t.attempts ?? 0), retried },
         dedupe_key: `task-dispatch:${taskId}:${count}`,
       });
-      promoted.push({ task_id: taskId, seq });
+      promoted.push({ task_id: taskId, seq, retried, attempts: Number(t.attempts ?? 0) });
       inFlight++;
     }
     return promoted;
@@ -228,6 +303,10 @@ export class ProjectRoom implements DurableObject {
       case "report":       return this.report(body);
       case "tasks/claim":  return this.claim(body);
       case "tasks/release":return this.release(body);
+      case "tasks/fail":   return this.failTask(body);
+      case "tasks/admin-retry": return this.adminRetry(body);
+      case "tasks/timeline": return this.taskTimeline(body);
+      case "observability": return this.observability(body);
       case "tasks/submission-settled": return this.submissionSettled(body);
       case "tasks/list":   return this.listTasks();
       case "tasks/active-load": return this.activeLoad(body);
@@ -338,10 +417,14 @@ export class ProjectRoom implements DurableObject {
       return "submission.reviewed";
     }
     if (msg.topic === "task") {
-      if (msg.kind === "task") return "task.dispatched";
+      if (msg.kind === "task") return p.retried ? "task.retried" : "task.dispatched";
       if (msg.kind === "created") return "task.created";
       if (msg.kind === "queued") return "task.queued";
       if (msg.kind === "claimed") return "task.claimed";
+      if (msg.kind === "failed") return "task.failed";
+      if (msg.kind === "dead_lettered") return "task.dead_lettered";
+      if (msg.kind === "retry_scheduled") return "task.retry_scheduled";
+      if (msg.kind === "retried") return "task.retried";
       if (msg.kind === "released") return "task.released";
       if (msg.kind === "blocked") return "task.blocked";
       if (msg.kind === "done") return "task.done";
@@ -361,7 +444,9 @@ export class ProjectRoom implements DurableObject {
   }
 
   private taskStateOfEvent(kind: string): string | undefined {
-    if (["task", "created", "queued", "open", "reassigned", "reassigned_away"].includes(kind)) return "open";
+    if (["task", "created", "queued", "open", "reassigned", "reassigned_away", "retried"].includes(kind)) return "open";
+    if (["failed", "retry_scheduled"].includes(kind)) return "open";
+    if (kind === "dead_lettered") return "failed";
     if (kind === "claimed") return "claimed";
     if (kind === "done") return "done";
     if (kind === "released") return "released";
@@ -378,7 +463,8 @@ export class ProjectRoom implements DurableObject {
     const taskId = typeof data.task_id === "string" ? data.task_id : undefined;
     const submissionId = typeof data.submission_id === "string" ? data.submission_id : undefined;
     const project = String(msg.project ?? this.projectSlug() ?? "").replace(/^v9:/, "");
-    const state = msg.topic === "task" ? this.taskStateOfEvent(String(msg.kind))
+    const state = msg.topic === "task" ? (msg.kind === "failed" && data.dead_letter === true
+      ? "failed" : this.taskStateOfEvent(String(msg.kind)))
       : msg.topic === "submission" ? String(data.state ?? msg.kind) : undefined;
     const reviewState = msg.topic === "submission" || (msg.topic === "artifact" && submissionId)
       ? String(data.review_state ?? (msg.topic === "artifact" ? "pending" : msg.kind))
@@ -940,6 +1026,16 @@ export class ProjectRoom implements DurableObject {
     const issueId = b.issue_id === undefined || b.issue_id === null || String(b.issue_id).trim() === ""
       ? null : String(b.issue_id).trim();
     if (issueId && !/^[A-Za-z0-9._:-]{1,128}$/.test(issueId)) return json({ error: "bad_issue_id" }, 422);
+    const priority = clampPriority(b.priority);
+    const deadlineAt = parseDeadlineAt(b.deadline_at);
+    if (b.deadline_at !== undefined && b.deadline_at !== null && String(b.deadline_at).trim() !== ""
+        && deadlineAt === null) return json({ error: "bad_deadline_at" }, 422);
+    const maxRaw = b.max_attempts;
+    const maxAttempts = maxRaw === undefined || maxRaw === null || String(maxRaw).trim() === ""
+      ? DEFAULT_MAX_ATTEMPTS
+      : Number.isFinite(Number(maxRaw))
+        ? Math.max(1, Math.min(MAX_ATTEMPTS, Math.floor(Number(maxRaw))))
+        : DEFAULT_MAX_ATTEMPTS;
     if (to) {
       const project = String(b.project ?? this.projectName());
       const active = await this.env.DB.prepare(
@@ -958,40 +1054,41 @@ export class ProjectRoom implements DurableObject {
       }
     }
     const projectName = String(b.project ?? this.projectName());
-    // 新建前先把已有队列按 FIFO 填满空槽；否则新任务会插队到老任务前面。
+    // 新建前先按优先级把已有队列补满空槽；否则新任务会插队到老任务前面。
     if (to) await this.promoteQueue(projectName, to);
     const t: any = { task_id: id, title, body: String(b.body ?? ""), state: "open",
                      project: projectName,
                      owner: null, lease_until: 0, created_at: now, updated_at: now,
                      created_by: b.sender ?? "admin", to, issue_id: issueId,
+                     priority, deadline_at: deadlineAt, max_attempts: maxAttempts, attempts: 0,
+                     last_error: null, next_retry_at: null, dead_letter: false,
                      dispatch_state: to ? "queued" : undefined, dispatch_count: 0 };
     await this.st.put(`task:${id}`, t);
+    // 任务创建事件对所有任务都落库：时间线需要稳定起点；它不是工作指令，
+    // 不进入任务队列，也不带 work_item。
+    let createdSeq: number | undefined;
+    try {
+      createdSeq = await this.append({
+        project: projectName, sender: String(b.sender ?? "admin"), topic: "task", kind: "created", to: "admin",
+        payload: { task_id: id, title, body: String(b.body ?? ""), state: "open",
+                   issue_id: issueId, work_item: false },
+        dedupe_key: `task-created:${id}`,
+      });
+    } catch (e: any) {
+      console.warn("task created event failed", id, e?.message ?? e);
+    }
     // 定向任务先经过单飞队列：没有槽位时只登记排队，不往窗口/循环里发消息。
     // 公共池任务不排队，仍然按原逻辑广播，agent 自己 claim。
     const dispatch = to
       ? await this.dispatchTaskOrQueue(projectName, t)
       : { notified: false, max_parallel: 0 };
-    // 公共池任务没有定向消息，也必须让管理端知道“有一张新单”。只发管理端可见，
-    // 普通 agent 仍通过任务池发现，不把创建事件当工作指令。
-    let createdSeq: number | undefined;
-    if (!to) {
-      try {
-        createdSeq = await this.append({
-          project: projectName, sender: "admin", topic: "task", kind: "created", to: "admin",
-          payload: { task_id: id, title, body: String(b.body ?? ""), state: "open",
-                     issue_id: issueId, work_item: false },
-          dedupe_key: `task-created:${id}`,
-        });
-      } catch (e: any) {
-        console.warn("task created event failed", id, e?.message ?? e);
-      }
-    }
     const seq = dispatch.seq ?? createdSeq ?? null;
     // S5：指派事件至少落一条定向消息（节点 wait/run 下一次拉取即被唤醒）。
     // 离线节点仍收不到，管理台账用 to_online 明确标出，避免“已派单”造成在线错觉。
     const hb: any = to ? await this.st.get(`agent:${to}`).catch(() => null) : null;
     const targetAge = hb?.last_hb_ms ? now - Number(hb.last_hb_ms) : Infinity;
     return json({ task_id: id, state: "open", seq,
+                  priority, deadline_at: deadlineAt, max_attempts: maxAttempts, attempts: 0,
                   dispatch_state: dispatch.dispatch_state ?? (to ? "queued" : "closed"),
                   queue_position: dispatch.queue_position ?? 0,
                   max_parallel_tasks: dispatch.max_parallel ?? 0,
@@ -1046,6 +1143,15 @@ export class ProjectRoom implements DurableObject {
     const t: any = await this.st.get(`task:${b.task_id}`);
     if (!t) return json({ error: "not_found" }, 404);
     const now = Date.now();
+    if (t.state === "failed" || t.dead_letter === true)
+      return json({ error: "task_dead_letter", state: t.state, attempts: Number(t.attempts ?? 0),
+                    max_attempts: Number(t.max_attempts ?? DEFAULT_MAX_ATTEMPTS),
+                    message: "任务已进入死信，需管理端重试后再下发。" }, 409);
+    if (Number(t.next_retry_at ?? 0) > now)
+      return json({ error: "task_retry_scheduled", task_id: t.task_id ?? t.id,
+                    retry_in_ms: Number(t.next_retry_at) - now,
+                    attempts: Number(t.attempts ?? 0),
+                    message: "任务失败后正在退避等待，时间到会自动重新下发。" }, 409);
     if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
     if (t.to && this.dispatchStateOf(t) === "queued")
       return json({ error: "task_not_dispatched", task_id: t.task_id ?? t.id,
@@ -1077,11 +1183,14 @@ export class ProjectRoom implements DurableObject {
     const lease = now + this.taskLeaseMs();
     const next = { ...t, state: "claimed", owner: b.agent_id,
                    ...(t.to ? { dispatch_state: "active" } : {}),
+                   ...(t.state === "claimed" ? {} : { claimed_at: now }),
                    lease_until: lease, updated_at: now };
     await this.st.put(`task:${b.task_id}`, next);
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "claimed",
                         payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
-                                   lease_until: lease },
+                                   lease_until: lease, attempts: Number(t.attempts ?? 0),
+                                   priority: clampPriority(t.priority),
+                                   deadline_at: t.deadline_at ?? null },
                         dedupe_key: `claim:${b.task_id}:${b.agent_id}:${now}` });
     return json({ ok: true, lease_until: lease });
   }
@@ -1172,6 +1281,7 @@ export class ProjectRoom implements DurableObject {
     const patch: any = { state, owner: null, lease_until: 0, pending_submissions: pending,
                          pending_review: pendingReview,
                          updated_at: now, released_by: b.agent_id,
+                         next_retry_at: null,
                          ...(t.to ? { dispatch_state: "closed" } : {}) };
     if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
     if (state === "blocked") { patch.blocked_at = now; }
@@ -1245,7 +1355,116 @@ export class ProjectRoom implements DurableObject {
                   pending_review: pendingReview, unapproved_reports: unapproved });
   }
 
-  // 单任务元数据：只给交付校验用，不返回正文，避免普通 agent 拉取任务内容。
+  /**
+   * 执行失败入口。调用者必须是当前 owner；失败次数达到 max_attempts 后进死信，
+   * 否则按指数退避设置 next_retry_at，释放并发槽位并让其它排队任务先跑。
+   */
+  private async failTask(b: any) {
+    const id = this.taskIdOf(b);
+    if (!id) return json({ error: "task_id_required" }, 422);
+    const t: any = await this.st.get(`task:${id}`);
+    if (!t) return json({ error: "not_found", task_id: id }, 404);
+    if (t.owner !== b.agent_id) return json({ error: "not_owner", owner: t.owner ?? null }, 403);
+    if (t.state !== "claimed") return json({ error: "task_not_claimed", state: t.state }, 409);
+    const project = String(b.project ?? t.project ?? this.projectName());
+    const pending = await this.pendingDeliveries(project, id);
+    if (pending > 0) return json({ error: "has_pending_deliveries", pending }, 409);
+    const now = Date.now();
+    const attempts = Number(t.attempts ?? 0) + 1;
+    const maxAttempts = Number.isFinite(Number(t.max_attempts))
+      ? Math.max(1, Math.min(MAX_ATTEMPTS, Math.floor(Number(t.max_attempts))))
+      : DEFAULT_MAX_ATTEMPTS;
+    const retryable = b.retryable !== false && attempts < maxAttempts;
+    const error = String(b.error ?? b.message ?? "task_failed").trim().slice(0, 500);
+    const dead = !retryable;
+    const nextRetryAt = dead ? null
+      : now + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.max(0, attempts - 1)));
+    const patch: any = {
+      state: dead ? "failed" : "open",
+      owner: null, lease_until: 0, updated_at: now,
+      attempts, last_error: error, last_failed_at: now,
+      next_retry_at: nextRetryAt,
+      dead_letter: dead,
+      ...(dead ? { dead_lettered_at: now } : {}),
+      ...(t.to ? { dispatch_state: dead ? "closed" : "queued" } : { dispatch_state: "closed" }),
+    };
+    const next = { ...t, ...patch };
+    await this.st.put(`task:${id}`, next);
+    const copy = dead
+      ? `任务失败 ${attempts}/${maxAttempts} 次，已进入死信；管理端重试后可再次下发。`
+      : `任务失败 ${attempts}/${maxAttempts} 次，将在 ${Math.max(1, Math.round((nextRetryAt! - now) / 1000))}s 后重试。`;
+    await this.append({
+      project, sender: b.agent_id, topic: "task", kind: "failed",
+      to: t.owner ?? t.to ?? "admin",
+      payload: { task_id: id, title: t.title ?? "", body: t.body ?? "",
+                 work_item: false, attempts, max_attempts: maxAttempts,
+                 error, retryable, dead_letter: dead, next_retry_at: nextRetryAt,
+                 message: copy },
+      dedupe_key: `task-fail:${id}:${attempts}:${now}`,
+    });
+    if (dead) {
+      await this.append({
+        project, sender: b.agent_id, topic: "task", kind: "dead_lettered",
+        to: t.owner ?? t.to ?? "admin",
+        payload: { task_id: id, title: t.title ?? "", work_item: false,
+                   attempts, max_attempts: maxAttempts, error,
+                   message: "任务已进入死信，管理端重试后可再次下发。" },
+        dedupe_key: `task-dead-lettered:${id}:${attempts}:${now}`,
+      });
+    }
+    if (nextRetryAt) {
+      await this.append({
+        project, sender: "agent", topic: "task", kind: "retry_scheduled",
+        to: t.owner ?? t.to ?? "admin",
+        payload: { task_id: id, title: t.title ?? "", work_item: false,
+                   attempts, max_attempts: maxAttempts, retry_at: nextRetryAt,
+                   retry_in_ms: Math.max(0, nextRetryAt - now),
+                   message: copy },
+        dedupe_key: `task-retry-scheduled:${id}:${attempts}:${now}`,
+      });
+    }
+    if (nextRetryAt) await this.setAlarmAt(nextRetryAt);
+    // 失败释放了一个并发槽位：先让队列里的其它任务补位，失败任务等退避时间到再参与。
+    const promoted = await this.promoteQueue(project, t.to);
+    return json({ ok: true, task_id: id, state: next.state, attempts, max_attempts: maxAttempts,
+                  retry_at: nextRetryAt, retry_in_ms: nextRetryAt ? Math.max(0, nextRetryAt - now) : null,
+                  dead_letter: dead, promoted, message: copy });
+  }
+
+  /** 管理端手动重试死信/阻塞任务：清空本轮失败计数，重新入优先级队列。 */
+  private async adminRetry(b: any) {
+    const got = await this.loadTaskForAdmin(b);
+    if (got instanceof Response) return got;
+    const { t, project } = got;
+    if (!["failed", "blocked"].includes(String(t.state)) && t.dead_letter !== true)
+      return json({ error: "task_not_retryable", state: t.state,
+                    hint: "只有 failed（死信）或 blocked 任务需要手动重试" }, 409);
+    const now = Date.now();
+    const task = {
+      ...t, state: "open", owner: null, lease_until: 0,
+      attempts: 0, next_retry_at: null, dead_letter: false,
+      manual_retries: Number(t.manual_retries ?? 0) + 1,
+      last_error: t.last_error ?? null, retried_at: now, updated_at: now,
+      ...(t.to ? { dispatch_state: "queued" } : { dispatch_state: "closed" }),
+    };
+    await this.st.put(`task:${t.task_id ?? t.id}`, task);
+    const reason = this.adminReason(b) || "管理员手动重试";
+    await this.append({
+      project, sender: "admin", topic: "task", kind: "retried",
+      to: t.owner ?? t.to ?? "admin",
+      payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", body: t.body ?? "",
+                 work_item: false, manual: true, reason,
+                 manual_retries: task.manual_retries, prev_state: t.state },
+      dedupe_key: `task-retry:${t.task_id ?? t.id}:${now}`,
+    });
+    // 定向任务重新参与优先级队列；公共池任务只需恢复 open，等待 agent 自领。
+    const promoted = t.to ? await this.promoteQueue(project, String(t.to)) : [];
+    return json({ ok: true, task_id: t.task_id ?? t.id, state: "open",
+                  dispatch_state: task.dispatch_state, promoted,
+                  manual_retries: task.manual_retries });
+  }
+
+
   private async getTask(b: any) {
     const id = this.taskIdOf(b);
     if (!id) return json({ error: "task_id_required" }, 422);
@@ -1289,25 +1508,36 @@ export class ProjectRoom implements DurableObject {
     const now = Date.now();
     const agents = new Map<string, any>();
     for (const a of (await this.st.list<any>({ prefix: "agent:" })).values()) agents.set(a.agent_id, a);
-    // 队列位置只对 queued 定向任务有意义；先按目标 group，再按创建时间排序。
+    // 队列位置只对当前可调度的 queued 定向任务有意义；按优先级/截止/老化排序。
     const queuedBy = new Map<string, any[]>();
     for (const t of r.values()) {
       const anyT: any = t;
-      if (!anyT.to || anyT.state !== "open" || this.dispatchStateOf(anyT) !== "queued") continue;
+      if (!anyT.to || anyT.state !== "open" || this.dispatchStateOf(anyT) !== "queued"
+          || !this.retryReady(anyT, now)) continue;
       const list = queuedBy.get(String(anyT.to)) ?? [];
       list.push(anyT);
       queuedBy.set(String(anyT.to), list);
     }
     const queuePos = new Map<string, number>();
     for (const [to, list] of queuedBy) {
-      list.sort((a: any, b: any) => Number(a.created_at ?? 0) - Number(b.created_at ?? 0));
+      list.sort((a: any, b: any) => this.compareQueue(a, b, now));
       list.forEach((t: any, i: number) => queuePos.set(String(t.task_id ?? t.id ?? ""), i + 1));
     }
     const tasks = [...r.values()].map((t: any) => {
       const ownerAge = t.owner ? now - Number(agents.get(t.owner)?.last_hb_ms ?? 0) : Infinity;
       const toAge = t.to ? now - Number(agents.get(t.to)?.last_hb_ms ?? 0) : Infinity;
+      const deadlineAt = Number(t.deadline_at ?? 0) || null;
       return {
         ...t,
+        priority: clampPriority(t.priority),
+        effective_priority: this.effectivePriority(t, now),
+        deadline_at: deadlineAt,
+        deadline_left_ms: deadlineAt ? deadlineAt - now : null,
+        sla_breached: !!deadlineAt && deadlineAt <= now
+          && !["done", "failed"].includes(String(t.state)),
+        attempts: Number(t.attempts ?? 0),
+        max_attempts: Number(t.max_attempts ?? DEFAULT_MAX_ATTEMPTS),
+        retry_in_ms: t.next_retry_at ? Math.max(0, Number(t.next_retry_at) - now) : null,
         dispatch_state: this.dispatchStateOf(t),
         queue_position: queuePos.get(String(t.task_id ?? t.id ?? "")) ?? 0,
         lease_left_ms: Math.max(0, Number(t.lease_until ?? 0) - now),
@@ -1319,7 +1549,8 @@ export class ProjectRoom implements DurableObject {
         pending_review: Number(t.pending_review ?? 0),
       };
     });
-    const rank = (s: string) => s === "claimed" ? 0 : s === "open" ? 1 : s === "released" ? 2 : s === "blocked" ? 3 : 4;
+    const rank = (s: string) => s === "claimed" ? 0 : s === "open" ? 1 : s === "released" ? 2
+      : s === "blocked" ? 3 : s === "failed" ? 4 : 5;
     tasks.sort((a: any, b: any) => rank(a.state) - rank(b.state)
       || Number(b.updated_at ?? b.created_at ?? 0) - Number(a.updated_at ?? a.created_at ?? 0));
     return json({ tasks });
@@ -1860,9 +2091,248 @@ export class ProjectRoom implements DurableObject {
     return json({ ok: true, agent_id: agentId, reminded_at: now, idle_since_ms: idleSince });
   }
 
+  /** 由 DO 单线程统一设置闹钟；已有更早的闹钟时不要把它推迟。 */
+  private async setAlarmAt(at: number) {
+    const storage: any = this.st;
+    if (typeof storage.setAlarm !== "function") return;
+    const current = typeof storage.getAlarm === "function"
+      ? await storage.getAlarm().catch(() => null) : null;
+    if (current && Number(current) > 0 && Number(current) <= at) return;
+    await storage.setAlarm(at).catch(() => {});
+  }
+
+  /** 到期的重试任务从“退避等待”切回可调度；实际补位仍走 promoteQueue 的优先级排序。 */
+  private async processRetries() {
+    const now = Date.now();
+    let due = 0;
+    let retried = 0;
+    const tasks = await this.listRawTasks();
+    for (const t of tasks) {
+      if (!t || t.state !== "open" || !t.next_retry_at || Number(t.next_retry_at) > now) continue;
+      const project = String(t.project ?? this.projectName());
+      const cleared = { ...t, next_retry_at: null, updated_at: now };
+      await this.st.put(`task:${t.task_id ?? t.id}`, cleared);
+      due++;
+      if (t.to) {
+        const promoted = await this.promoteQueue(project, String(t.to));
+        if (promoted.some((p: any) => String(p.task_id) === String(t.task_id ?? t.id))) retried++;
+      } else {
+        // 公共池任务没有服务端投递通道，发一条管理端可见的“可重领”事件即可。
+        await this.append({
+          project, sender: "system", topic: "task", kind: "retried", to: "admin",
+          payload: { task_id: t.task_id ?? t.id, title: t.title ?? "", work_item: false,
+                     attempts: Number(t.attempts ?? 0), pool: true,
+                     message: "公共池任务退避结束，可重新领取。" },
+          dedupe_key: `task-retry-ready:${t.task_id ?? t.id}:${now}`,
+        }).catch(() => {});
+      }
+    }
+    // 下一次最近的重试时间重新挂闹钟（webhook 队列自己的 flush 会再设）。
+    let next = Infinity;
+    for (const t of await this.listRawTasks()) {
+      if (t?.state === "open" && t.next_retry_at) next = Math.min(next, Number(t.next_retry_at));
+    }
+    if (next < Infinity) await this.setAlarmAt(next);
+    return { due, retried };
+  }
+
   async alarm() {
     try { await this.flushWebhooks(); } catch (e) { console.warn("webhook alarm failed", e); }
+    try { await this.processRetries(); } catch (e) { console.warn("retry alarm failed", e); }
   }
+
+  /** 管理台效率观测：队列健康度、等待/周期分位、失败与死信、节点 lane。 */
+  private async observability(b: any) {
+    const now = Date.now();
+    const rawWindow = Number(b?.window_ms ?? 24 * 60 * 60_000);
+    const windowMs = Number.isFinite(rawWindow)
+      ? Math.max(60 * 60_000, Math.min(7 * 24 * 60 * 60_000, rawWindow)) : 24 * 60 * 60_000;
+    const tasks = await this.listRawTasks();
+    const agents = [...(await this.st.list<any>({ prefix: "agent:" })).values()];
+    const doneWindow = tasks.filter((t: any) => t.state === "done" && Number(t.closed_at ?? 0) >= now - windowMs);
+    const failedWindow = tasks.filter((t: any) => Number(t.last_failed_at ?? 0) >= now - windowMs
+      || (t.state === "failed" && Number(t.dead_lettered_at ?? t.last_failed_at ?? 0) >= now - windowMs));
+    const queued = tasks.filter((t: any) => t.to && t.state === "open"
+      && this.dispatchStateOf(t) === "queued" && this.retryReady(t, now));
+    const retryWait = tasks.filter((t: any) => t.to && t.state === "open"
+      && Number(t.next_retry_at ?? 0) > now);
+    const publicPool = tasks.filter((t: any) => !t.to && t.state === "open");
+    const inFlight = tasks.filter((t: any) => t.to && !this.isTerminalDispatch(t)
+      && ["notified", "active"].includes(this.dispatchStateOf(t)));
+    const claimed = tasks.filter((t: any) => t.state === "claimed");
+    const waitValues: number[] = [];
+    for (const t of tasks) {
+      if (!t.created_at) continue;
+      const activeOrQueued = !["done", "failed", "blocked"].includes(String(t.state));
+      if (Number(t.notified_at ?? 0) > 0
+          && (activeOrQueued || Number(t.notified_at) >= now - windowMs))
+        waitValues.push(Math.max(0, Number(t.notified_at) - Number(t.created_at)));
+      else if (t.to && t.state === "open" && this.dispatchStateOf(t) === "queued")
+        waitValues.push(Math.max(0, now - Number(t.created_at)));
+    }
+    const queueAges = queued.map((t: any) => Math.max(0, now - Number(t.created_at ?? now)));
+    const cycleValues = doneWindow.map((t: any) => Number(t.closed_at ?? t.updated_at ?? now) - Number(t.created_at ?? now))
+      .filter((x: number) => x >= 0);
+    const deadLetters = tasks.filter((t: any) => t.state === "failed" || t.dead_letter === true);
+    const slaBreaches = tasks.filter((t: any) => {
+      const deadline = Number(t.deadline_at ?? 0);
+      if (!deadline) return false;
+      if (["done", "failed"].includes(String(t.state))) return Number(t.closed_at ?? now) > deadline;
+      return deadline <= now;
+    });
+    const queueP95 = percentile(waitValues, 95);
+    const oldestQueueAge = queueAges.length ? Math.max(...queueAges) : 0;
+    const failedCount = failedWindow.length;
+    const denominator = doneWindow.length + failedCount;
+    const healthReasons: string[] = [];
+    if (deadLetters.length) healthReasons.push(`${deadLetters.length} 个死信待处理`);
+    if (oldestQueueAge > 2 * 60 * 60_000) healthReasons.push(`最老排队已 ${Math.round(oldestQueueAge / 60_000)} 分钟`);
+    if (queued.some((t: any) => {
+      const age = now - Number(agents.find((a: any) => a.agent_id === t.to)?.last_hb_ms ?? 0);
+      return age > 5 * 60_000;
+    })) healthReasons.push("有排队任务的目标节点离线");
+    if (queueP95 !== null && queueP95 > 30 * 60_000) healthReasons.push(`等待 P95 ${Math.round(queueP95 / 60_000)} 分钟`);
+    const health = healthReasons.length ? (deadLetters.length || oldestQueueAge > 2 * 60 * 60_000 ? "bad" : "warn") : "ok";
+
+    const lanes: any[] = [];
+    for (const a of agents) {
+      const id = String(a.agent_id ?? "");
+      const maxParallel = await this.agentMaxParallel(id);
+      const laneQueued = queued.filter((t: any) => t.to === id);
+      const laneRetry = retryWait.filter((t: any) => t.to === id);
+      const laneInFlight = inFlight.filter((t: any) => t.to === id);
+      const laneDone = doneWindow.filter((t: any) => t.to === id || t.released_by === id || t.owner === id);
+      const laneFailed = failedWindow.filter((t: any) => t.to === id || t.owner === id || t.released_by === id);
+      const laneDead = deadLetters.filter((t: any) => t.to === id || t.owner === id);
+      const laneAges = laneQueued.map((t: any) => Math.max(0, now - Number(t.created_at ?? now)));
+      const laneWait = laneQueued.map((t: any) => Math.max(0, now - Number(t.created_at ?? now)))
+        .concat(laneRetry.map((t: any) => Math.max(0, now - Number(t.created_at ?? now))));
+      const hbAge = now - Number(a.last_hb_ms ?? 0);
+      lanes.push({
+        agent_id: id,
+        online: hbAge <= 300_000,
+        alive: hbAge <= 120_000 ? "alive" : hbAge <= 300_000 ? "late" : "offline",
+        max_parallel: maxParallel,
+        in_flight: laneInFlight.length,
+        queued: laneQueued.length,
+        retry_wait: laneRetry.length,
+        oldest_queue_age_ms: laneAges.length ? Math.max(...laneAges) : 0,
+        wait_p50_ms: percentile(laneWait, 50),
+        wait_p95_ms: percentile(laneWait, 95),
+        utilization: maxParallel ? Math.round((laneInFlight.length / maxParallel) * 100) : 0,
+        completed_window: laneDone.length,
+        failed_window: laneFailed.length,
+        dead_letters: laneDead.length,
+      });
+    }
+    lanes.sort((a: any, b: any) => b.queued - a.queued || b.retry_wait - a.retry_wait
+      || a.agent_id.localeCompare(b.agent_id));
+    const recentDead = deadLetters
+      .sort((a: any, b: any) => Number(b.dead_lettered_at ?? b.last_failed_at ?? 0)
+        - Number(a.dead_lettered_at ?? a.last_failed_at ?? 0))
+      .slice(0, 20)
+      .map((t: any) => ({
+        task_id: t.task_id ?? t.id, title: t.title ?? "", to: t.to ?? null,
+        attempts: Number(t.attempts ?? 0), max_attempts: Number(t.max_attempts ?? DEFAULT_MAX_ATTEMPTS),
+        last_error: t.last_error ?? null, at: t.dead_lettered_at ?? t.last_failed_at ?? t.updated_at ?? 0,
+      }));
+    return json({
+      generated_at: now, window_ms: windowMs,
+      summary: {
+        tasks_total: tasks.length,
+        active: tasks.filter((t: any) => !["done", "failed"].includes(String(t.state))).length,
+        wip: tasks.filter((t: any) => t.state === "claimed"
+          || (!!t.to && !this.isTerminalDispatch(t) && this.dispatchStateOf(t) === "notified")).length,
+        claimed: claimed.length,
+        queued: queued.length,
+        retry_wait: retryWait.length,
+        public_pool: publicPool.length,
+        done_window: doneWindow.length,
+        failed_window: failedCount,
+        retries_window: failedWindow.reduce((sum: number, t: any) => sum + Number(t.attempts ?? 0), 0),
+        dead_letters: deadLetters.length,
+        sla_breaches: slaBreaches.length,
+        oldest_queue_age_ms: oldestQueueAge,
+        queue_wait_p50_ms: percentile(waitValues, 50),
+        queue_wait_p95_ms: queueP95,
+        cycle_p50_ms: percentile(cycleValues, 50),
+        cycle_p95_ms: percentile(cycleValues, 95),
+        failure_rate: denominator ? Math.round((failedCount / denominator) * 1000) / 1000 : 0,
+        throughput_per_hour: Math.round((doneWindow.length / (windowMs / 3_600_000)) * 100) / 100,
+      },
+      public_pool: {
+        open: publicPool.length,
+        claimed: tasks.filter((t: any) => !t.to && t.state === "claimed").length,
+        oldest_age_ms: publicPool.length
+          ? Math.max(0, ...publicPool.map((t: any) => Math.max(0, now - Number(t.created_at ?? now)))) : 0,
+      },
+      lanes, recent_dead: recentDead,
+      health: { status: health, reasons: healthReasons },
+    });
+  }
+
+  /** 单任务时间线：热窗口 + D1 归档消息 + 任务记录里程碑；管理台专用。 */
+  private async taskTimeline(b: any) {
+    const id = this.taskIdOf(b);
+    if (!id) return json({ error: "task_id_required" }, 422);
+    const t: any = await this.st.get(`task:${id}`);
+    if (!t) return json({ error: "not_found", task_id: id }, 404);
+    const project = String(b?.project ?? t.project ?? this.projectName());
+    const room = await this.room();
+    const events: any[] = [];
+    const seen = new Set<string>();
+    const addRaw = (m: any) => {
+      const p: any = safeJson(m?.payload);
+      if (String(p?.task_id ?? "") !== id) return;
+      const e = this.clientEventOf(m as Msg);
+      if (e) {
+        const key = `msg:${e.seq}`;
+        if (!seen.has(key)) { seen.add(key); events.push(e); }
+      }
+    };
+    for (const m of (await this.st.list<Msg>({ prefix: "msg:", limit: 2000 })).values()) addRaw(m);
+    const archived = await this.env.DB.prepare(
+      `SELECT seq, sender, topic, kind, to_agent, payload_json, ts FROM archive
+        WHERE project = ? AND room = ? AND payload_json LIKE ? ORDER BY seq ASC LIMIT 500`
+    ).bind(project, room, `%${id}%`).all<any>().catch(() => ({ results: [] }));
+    for (const r of archived.results ?? []) {
+      addRaw({ seq: r.seq, sender: r.sender, topic: r.topic, kind: r.kind,
+               to: r.to_agent ?? undefined, payload: safeJson(r.payload_json), ts: r.ts });
+    }
+    const derived = (type: string, at: number, data: any = {}, state?: string, actor = "system") => {
+      if (!at) return;
+      const ts = new Date(at).toISOString();
+      // 实际消息和任务字段记录的是同一个里程碑；2 秒内同类型只保留消息版本。
+      if (events.some((e: any) => e.type === type && Math.abs(new Date(e.ts).getTime() - at) <= 2000)) return;
+      events.push({ id: `tl-${id}-${type}-${at}`, version: 1, source: "synapse-agent-hub",
+                    project, type, seq: 0, ts, actor, to: null, task_id: id,
+                    ...(state ? { state } : {}),
+                    data: { task_id: id, ...data, derived: true } });
+    };
+    derived("task.created", Number(t.created_at ?? 0), { title: t.title ?? "" }, "open", t.created_by ?? "system");
+    derived("task.dispatched", Number(t.notified_at ?? 0), { dispatch_count: t.dispatch_count ?? 0 }, "open", t.created_by ?? "admin");
+    derived("task.claimed", Number(t.claimed_at ?? 0), { owner: t.owner ?? null }, "claimed", t.owner ?? "system");
+    derived("task.failed", Number(t.last_failed_at ?? 0), { attempts: t.attempts ?? 0, error: t.last_error ?? null }, t.dead_letter ? "failed" : "open", t.owner ?? "system");
+    derived("task.done", Number(t.closed_at ?? 0), { closed_by: t.closed_by ?? null }, "done", t.closed_by ?? "system");
+    const rows = await this.env.DB.prepare(
+      `SELECT submission_id, state, review_state, created_at FROM submissions
+        WHERE project = ? AND task_id = ? ORDER BY created_at ASC LIMIT 100`
+    ).bind(project, id).all<any>().catch(() => ({ results: [] }));
+    for (const s of rows.results ?? []) {
+      const at = Number(s.created_at ?? 0);
+      derived("submission.created", at, { submission_id: s.submission_id, state: s.state,
+                                           review_state: s.review_state });
+    }
+    events.sort((a: any, b: any) => String(a.ts).localeCompare(String(b.ts)) || Number(a.seq) - Number(b.seq));
+    const limited = events.slice(-200);
+    return json({
+      task_id: id, task: { ...t, dispatch_state: this.dispatchStateOf(t),
+                           effective_priority: this.effectivePriority(t),
+                           retry_in_ms: t.next_retry_at ? Math.max(0, Number(t.next_retry_at) - Date.now()) : null },
+      events: limited, count: limited.length, truncated: events.length > 200,
+    });
+  }
+
 
   private async snapshot() {
     const seq = (await this.st.get<number>("seq")) ?? 0;
@@ -1904,7 +2374,8 @@ export class ProjectRoom implements DurableObject {
     const idle = project ? await this.idleTick(project) : { reminded: 0, flagged: 0 };
     // 兜底：alarm 没触发时，每分钟 cron 也把 webhook 重试队列推一遍。
     const webhook = await this.flushWebhooks();
-    return json({ ok: true, reclaimed, webhook, ...idle });
+    const retry = await this.processRetries();
+    return json({ ok: true, reclaimed, webhook, retry, ...idle });
   }
 }
 

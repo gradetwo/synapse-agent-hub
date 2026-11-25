@@ -332,6 +332,12 @@ export class Client {
   releaseTask(taskId: string, state: "done" | "open" | "blocked" = "done") {
     return this.post(`/p/${this.opts.project}/tasks/release`, { task_id: taskId, state });
   }
+  async failTask(taskId: string, error: string, retryable = true) {
+    const r = await this.post(`/p/${this.opts.project}/tasks/fail`,
+      { task_id: taskId, error: String(error).slice(0, 500), retryable });
+    if ((r as any)?.ok) this.activeTaskClear(taskId);
+    return r;
+  }
 
   // ── 内部 ──────────────────────────────────────────────
   private headers() {

@@ -48,7 +48,7 @@
 
 | 类别 | 类型 |
 |---|---|
-| 任务 | `task.created`、`task.queued`、`task.dispatched`、`task.claimed`、`task.released`、`task.blocked`、`task.done`、`task.reopened`、`task.reclaimed`、`task.reassigned`、`task.updated` |
+| 任务 | `task.created`、`task.queued`、`task.dispatched`、`task.claimed`、`task.released`、`task.blocked`、`task.done`、`task.reopened`、`task.reclaimed`、`task.reassigned`、`task.failed`、`task.retry_scheduled`、`task.retried`、`task.dead_lettered`、`task.updated` |
 | 交付 | `submission.created`、`submission.reviewed`、`submission.collected`、`submission.archived` |
 | 通知 | `announcement.created`、`notice.created`、`system.notice`、`report.created`、`issue.created`、`status.changed`、`alert.created` |
 

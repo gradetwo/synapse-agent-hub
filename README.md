@@ -218,6 +218,8 @@ loop = Loop(c)          # WS 优先；没有 WS 时自动改用 /events
 
 TypeScript 用 `c.onEvent(...)` / `c.eventStream(...)`；Rust `run` 自动写 `events.jsonl`，可用 `--event-cmd` 接回调。完整协议见 [`docs/EVENT-PUSH.md`](./docs/EVENT-PUSH.md)。
 
+任务调度、失败退避/死信和管理台效率观测见 [`docs/EFFICIENCY.md`](./docs/EFFICIENCY.md)。
+
 ### TypeScript
 
 ```ts
@@ -349,6 +351,9 @@ print(r["issue_id"])
 | POST | `/x/admin/p/{project}/issues/{id}/reopen` | 重新打开；自动关闭的会清空 task_id |
 | POST | `/x/admin/p/{project}/issues/{id}/merge` | 合并到另一个 open Issue |
 | POST | `/x/admin/p/{project}/issues/{id}/dispatch` | 转任务派发；任务 done 自动关闭 |
+| GET | `/x/admin/p/{project}/observability` | 队列健康度、等待/周期分位、失败率、死信与节点 lane |
+| GET | `/x/admin/p/{project}/tasks/timeline?task_id=...` | 单任务端到端时间线（热窗口 + D1 归档 + 记录里程碑） |
+| POST | `/x/admin/p/{project}/tasks/retry` | 手动重试死信/阻塞任务 |
 
 管理端事件推送（交付/任务变化，秒级 Webhook）见 `docs/EVENT-PUSH.md`；管理台自身走 WebSocket 实时刷新。
 
@@ -360,6 +365,7 @@ print(r["issue_id"])
 | GET | `/p/{project}/tasks?mine=1` | 自查名下任务：open 定向、claimed、blocked、released；带 `counts_toward_limit` |
 | GET | `/p/{project}/tasks/{task_id}` | 自查单条任务详情；非本人名下返回 404 |
 | POST | `/p/{project}/tasks/claim` | 认领公共任务；名下 `claimed` ≥5 时返回 `409 agent_task_limit_exceeded` |
+| POST | `/p/{project}/tasks/fail` | 执行失败上报；按 `max_attempts` 自动退避或进死信，需 `tasks.release` |
 | GET | `/p/{project}/issues?limit=50` | 只列 `open` 且 `task_id IS NULL` 的 Issue（需 `issues.read`） |
 | POST | `/p/{project}/issues/{id}/claim` | 任意项目 agent 认领未指派 Issue；同样受已 claim 任务上限约束 |
 

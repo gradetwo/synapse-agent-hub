@@ -58,10 +58,29 @@ export interface Task {
   id?: string;
   title?: string;
   body?: string;
-  /** released = 执行侧已交付放手、但仍有交付未被管理侧取走；取完最后一件才转 done */
-  state: "open" | "claimed" | "released" | "done" | "blocked";
+  /** released = 执行侧已交付放手、但仍有交付未被管理侧取走；取完最后一件才转 done；
+   *  failed = 已达最大失败次数、进入死信，不再自动派发，需管理端显式重试 */
+  state: "open" | "claimed" | "released" | "done" | "blocked" | "failed";
   owner: string | null;
   lease_until: number;
+  /** 调度优先级：0=P0 最高，3=P3 最低；默认 P2。排队 30 分钟提升一级，避免饿死。 */
+  priority?: number;
+  /** 截止时间（epoch ms）；逾期任务提升到 P0，并在可观测面板计入 SLA 违约。 */
+  deadline_at?: number | null;
+  /** 首次被 claim 的时间，用于区分“排队等待”和“执行耗时”。 */
+  claimed_at?: number;
+  /** 自动重试上限，默认 3；达到后进 failed/dead_letter。 */
+  max_attempts?: number;
+  /** 已失败次数；手动重试会重置为 0，并累加 manual_retries。 */
+  attempts?: number;
+  last_error?: string | null;
+  last_failed_at?: number;
+  /** 下一次可重新派发的时间；未来时间内的任务不参与 promoteQueue。 */
+  next_retry_at?: number | null;
+  dead_letter?: boolean;
+  dead_lettered_at?: number;
+  manual_retries?: number;
+  retried_at?: number;
   /** state = released 时尚未取走的交付数；其余状态为 0 或缺省 */
   pending_submissions?: number;
   /** 指派目标；空表示公共池，可被任意 agent claim */
