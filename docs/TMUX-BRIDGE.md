@@ -2,6 +2,8 @@
 
 > 适用：`synapse-agent` Rust 客户端，Linux / macOS。Windows 用 [`WINDOW-BRIDGE.md`](./WINDOW-BRIDGE.md)。
 >
+> 多 agent 批量拉起与隔离状态目录见 [TMUX-AGENT-FLEET.md](./TMUX-AGENT-FLEET.md)。
+
 > 目的：`synapse-agent run` 收到 Hub 消息后，直接把正文注入配置好的 tmux pane（通常是正在运行的 agent TUI），并在 TUI 输入框中回车提交；**确认 pane 里出现 `[Synapse #seq]` 标记后才 ACK**，否则消息留在本地 WAL，空闲时每 5 秒重试。
 
 ```
