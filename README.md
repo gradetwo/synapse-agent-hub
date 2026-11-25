@@ -306,11 +306,11 @@ scripts/hubctl get sub-a-0049-r2 --project yanshi --to ./incoming
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/ver` | 版本探针；带 `sdk`、`build`、`skill_url`、`skill_sha256`、`capabilities` |
+| GET | `/ver` | 版本探针；带 `sdk`、`build`、`skill_url`、`skill_sha256`、`capabilities_url`、`capabilities_sha256`、`capabilities` |
 | GET | `/skill` | Agent 能力说明书 Markdown；响应头 `x-skill-sha256` 与 ETag 可用于缓存 |
-| GET | `/capabilities` | 同一份能力表的 JSON 版，适合程序判定；不含项目数据或 token |
+| GET | `/capabilities` | 同一份能力表的 JSON 版，适合程序判定；每条带 `status`、`min_sdk`、`scope`；不含项目数据或 token |
 
-升级后客户端先读 `/ver`：`skill_sha256` 变化再拉 `/skill`，不要每次重发整份提示词。
+升级后客户端先读 `/ver`：`capabilities_sha256` 变化再拉 `/capabilities`，`skill_sha256` 变化再拉 `/skill`；不要每次重发整份提示词，也不要从 GitHub 或 `--help` 推断服务端能力。
 
 ### 管理 API
 

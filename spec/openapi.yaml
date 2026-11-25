@@ -955,6 +955,8 @@ paths:
                   tabs: { type: boolean }
                   skill_url: { type: string, example: /skill }
                   skill_sha256: { type: string }
+                  capabilities_url: { type: string, example: /capabilities }
+                  capabilities_sha256: { type: string }
                   capabilities:
                     type: array
                     items: { type: string }
@@ -982,10 +984,12 @@ paths:
               schema:
                 type: object
                 properties:
+                  manifest_version: { type: integer, example: 1 }
                   sdk: { type: string }
                   build: { type: string }
                   skill_url: { type: string }
                   skill_sha256: { type: string }
+                  capabilities_sha256: { type: string }
                   capabilities:
                     type: array
                     items:
@@ -993,12 +997,16 @@ paths:
                       properties:
                         id: { type: string }
                         since: { type: string }
+                        status: { type: string, enum: [ga, beta, unverified, partial] }
                         audience: { type: string, enum: [agent, admin, both] }
                         title: { type: string }
                         summary: { type: string }
                         method: { type: string }
                         path: { type: string }
                         event: { type: string }
+                        scope: { type: string }
+                        min_sdk: { type: string }
+                        required: { type: boolean }
   /sdk/manifest:
     get:
       summary: SDK 版本与二进制清单

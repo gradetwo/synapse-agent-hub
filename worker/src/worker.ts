@@ -3162,25 +3162,36 @@ function skillMeta(): Promise<SkillMeta> {
   }
   return SKILL_META_CACHE;
 }
+async function capabilityManifest() {
+  const capabilities = AGENT_CAPABILITIES;
+  const capsSha = await sha256(JSON.stringify(capabilities));
+  return { capabilities, sha256: capsSha };
+}
 async function versionPayload() {
   const meta = await skillMeta();
+  const caps = await capabilityManifest();
   return {
     build: BUILD_TAG,
     sdk: SDK_VERSION,
     tabs: true,
     skill_url: "/skill",
     skill_sha256: meta.sha256,
-    capabilities: AGENT_CAPABILITIES.map((c) => c.id),
+    capabilities_url: "/capabilities",
+    capabilities_sha256: caps.sha256,
+    capabilities: caps.capabilities.map((c) => c.id),
   };
 }
 async function capabilitiesResponse() {
   const meta = await skillMeta();
+  const caps = await capabilityManifest();
   return json({
+    manifest_version: 1,
     sdk: SDK_VERSION,
     build: BUILD_TAG,
     skill_url: "/skill",
     skill_sha256: meta.sha256,
-    capabilities: AGENT_CAPABILITIES,
+    capabilities_sha256: caps.sha256,
+    capabilities: caps.capabilities,
   });
 }
 async function skillResponse(req: Request) {

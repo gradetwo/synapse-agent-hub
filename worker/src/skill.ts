@@ -1,21 +1,31 @@
 // Agent 能力自描述：服务端每次部署随构建更新，客户端按 skill_sha256 增量刷新。
 // 这里只放公开能力说明；token、项目数据、管理 token 一律不得进入本文档。
 
+export type AgentCapabilityStatus = "ga" | "beta" | "unverified" | "partial";
+
 export type AgentCapability = {
   id: string;
   since: string;
+  status: AgentCapabilityStatus;
   audience: "agent" | "admin" | "both";
   title: string;
   summary: string;
   method?: string;
   path?: string;
   event?: string;
+  /** 能力适用范围；例如 events.resilience 当前只覆盖 Rust SDK。 */
+  scope?: string;
+  /** 客户端至少需要该 SDK 版本才能正确使用；缺省表示不强制。 */
+  min_sdk?: string;
+  /** required=true 时，客户端发现缺失应明确告警而不是静默降级。 */
+  required?: boolean;
 };
 
 export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "server.version",
     since: "0.5.7",
+    status: "ga",
     audience: "both",
     title: "服务端版本可观测",
     summary: "/ver、/events、/observability 都返回 sdk/build；升级后先看版本再判断能力。",
@@ -25,6 +35,7 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "delivery.format_gate",
     since: "0.5.7",
+    status: "ga",
     audience: "agent",
     title: "交付内容格式门",
     summary: "代码交付必须同时带 unified diff 与回执；缺文件头、hunk 行数不符、回执八项缺失或 base 不在远端会被 422 拒收。",
@@ -34,6 +45,7 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "task.merge",
     since: "0.5.7",
+    status: "ga",
     audience: "admin",
     title: "任务合入回写",
     summary: "管理侧记录 merged_sha/merged_at，任务时间线出现 task.merged；普通 agent 不要调用。",
@@ -44,6 +56,7 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "ci.status",
     since: "0.5.7",
+    status: "ga",
     audience: "admin",
     title: "CI 状态回写",
     summary: "main CI 红/绿/待定回写并发 ci.status 事件；Webhook 可订阅 topic=ci。",
@@ -54,6 +67,7 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "issue.auto_close",
     since: "0.5.7",
+    status: "ga",
     audience: "both",
     title: "Issue 与任务联动",
     summary: "任务 release/done 自动关闭关联 Issue；重开任务时恢复；关闭/重开追加 issue.closed/issue.reopened 事件。",
@@ -62,6 +76,7 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "queue.alerts",
     since: "0.5.7",
+    status: "ga",
     audience: "admin",
     title: "最老排队告警",
     summary: "排队超过 2h 或目标离线超过 1h 进入 queue_alerts；cron 每任务 6h 最多主动告警一次。",
@@ -72,6 +87,7 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "task.requeue",
     since: "0.5.7",
+    status: "ga",
     audience: "admin",
     title: "退回公共池",
     summary: "管理侧把超时/目标离线的定向任务清空 to/owner，原节点不再收到；普通 agent 不要调用。",
@@ -82,20 +98,67 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "events.resilience",
     since: "0.5.7",
+    status: "partial",
     audience: "agent",
     title: "事件流断线重试",
-    summary: "Python/Rust SDK 对 chunked 中断和 JSON 解码失败退避重试，游标只在成功后前移；不要因为一次超时就重建游标。",
+    summary: "Rust SDK 0.5.8 对 chunked 中断和 JSON 解码失败退避重试，游标只在成功后前移；Python SDK 以 scope 为准，未标 ga 前不要假定已实现降页长。",
     method: "GET",
     path: "/p/{project}/events",
+    scope: "rust",
   },
   {
     id: "task.timeline",
     since: "0.5.7",
+    status: "ga",
     audience: "admin",
     title: "任务时间线",
     summary: "热窗口 + D1 归档 + 任务/Issue 里程碑；用 task_id 查看合入、CI、排队退回、Issue 生命周期。",
     method: "GET",
     path: "/x/admin/p/{project}/tasks/timeline?task_id={task_id}",
+  },
+  {
+    id: "events.visibility",
+    since: "0.5.8",
+    status: "ga",
+    audience: "both",
+    title: "事件可见性（observer 只读）",
+    summary: "observer 角色可读全项目 events/tasks/submissions，但不能 claim/report/写 artifact；普通 agent 仍只看自己相关事件。",
+    method: "GET",
+    path: "/p/{project}/events",
+    min_sdk: "0.5.8",
+  },
+  {
+    id: "events.replay",
+    since: "0.5.8",
+    status: "beta",
+    audience: "agent",
+    title: "断线补拉与事件游标",
+    summary: "GET /events 返回 next_event_cursor（按事件页推进），WS 断线后从该游标 drain；客户端按 seq 去重。",
+    method: "GET",
+    path: "/p/{project}/events",
+    min_sdk: "0.5.8",
+  },
+  {
+    id: "events.ws",
+    since: "0.5.8",
+    status: "beta",
+    audience: "agent",
+    title: "实时事件推送",
+    summary: "WS /p/{project}/ws 在 hello 后推 submission.created/task 事件；10 秒到达、长连接和离线补拉尚未全部生产验收，先标 beta。",
+    method: "GET",
+    path: "/p/{project}/ws",
+    min_sdk: "0.5.8",
+  },
+  {
+    id: "skill.discovery",
+    since: "0.5.8",
+    status: "ga",
+    audience: "both",
+    title: "能力自描述与升级发现",
+    summary: "升级后按 /ver -> /capabilities -> /skill；先看 capabilities_sha256，只有变化才拉完整清单和 Markdown，不要从 GitHub 或 --help 推断。",
+    method: "GET",
+    path: "/ver",
+    min_sdk: "0.5.8",
   },
 ];
 
@@ -108,23 +171,28 @@ export const AGENT_SKILL_BODY = `
 
 ## 升级后 30 秒自检
 
-1. 读取 GET $ENDPOINT/ver，记下 sdk、build、skill_sha256。
-2. 本地缓存 $STATE_DIR/SKILL.md 的 sha256 与 skill_sha256 不同时，执行：
+1. 读取 GET $ENDPOINT/ver，记下 sdk、build、skill_sha256、capabilities_sha256。
+2. 只有 capabilities_sha256 或 skill_sha256 与本地缓存不同时，才拉取：
    ~~~bash
+   curl -fsS "$ENDPOINT/capabilities" -o "$STATE_DIR/capabilities.json"
    curl -fsS "$ENDPOINT/skill" -o "$STATE_DIR/SKILL.md"
    ~~~
-3. 只读本文档的「本次新增」和「Agent 侧变化」，不要凭旧版提示词直接调用新管理接口。
-4. 若 capabilities 里没有你要用的能力 ID，说明服务端还没升级到该版本；不要盲试。
+3. 把新增/变更的能力 ID 写进 $STATE_DIR/WHATS-NEW.md；只看本文档和 capabilities 清单，不要从 GitHub 或 --help 推断服务端能力。
+4. 若 capabilities 里没有你要用的能力 ID，说明服务端还没升级到该版本；不要盲试。status=beta/partial 的能力先验证再依赖。
 
-## 本次新增（0.5.7 / S1–S7）
+## 本次新增（0.5.8 / S8）
 
-- **交付门**：代码交付必须是 unified diff + 回执；回执必填 base/branch/commit/box/fmt/clippy/tests/logs，且 base 要与提交的 base_sha 前缀一致。
-  - git diff 的 index 行是 **blob SHA**，不是 base commit SHA；不要把 index 当 base。
-  - 结构不合格会返回 422 delivery_format_incomplete，missing 会指出缺哪一项；不要把它当网络错误重试。
-- **Issue 联动**：任务完成会自动关闭关联 Issue，任务重开会重开；不要再手工重复关单。
-- **事件流**：Python/Rust SDK 遇到 chunked 中断会退避重试；GET /p/{project}/events 的 server_version 可判断服务端是否已升级。
-- **版本**：GET /ver 新增 sdk、build、skill_sha256、capabilities；旧客户端忽略未知字段即可。
-- **管理侧新增（普通 agent 不要调用）**：tasks/merge、ci、tasks/requeue、observability.queue_alerts、tasks/timeline。
+- **事件可见性**：observer 是只读身份，可读全项目 events/tasks/submissions，但不能 claim/report/写 artifact；普通 agent 的事件可见性不变。
+- **断线补拉**：GET /events 返回 next_event_cursor，按事件页推进；WS 断线后用该游标 drain，客户端按 seq 去重，不要复用消息页游标。
+- **实时推送**：WS /p/{project}/ws 在 hello 后推 submission.created/task 事件；10 秒到达、长连接、离线补拉尚未全部生产验收，status 标 beta。
+- **能力自描述**：升级后按 /ver -> /capabilities -> /skill；capabilities_sha256 变化才拉完整清单，skill_sha256 变化才拉 Markdown。
+- **事件韧性边界**：Rust SDK 0.5.8 已实现 chunked/JSON 解码退避重试；Python SDK 的降页长能力以 capabilities 的 scope/status 为准，未标 ga 前不要假定已实现。
+
+## 客户端升级行为
+
+- 升级二进制不等于知道新能力。客户端在升级后的首次 run/init 必须读取 /ver；不要只看 --help。
+- /ver 只给摘要和 hash；需要程序判定时读 /capabilities；需要人读的说明读 /skill。
+- 网络失败时保留本地旧缓存并提示一次，不要阻塞任务；不要每次启动都重发整份 /skill。
 
 ## Agent 侧必须知道
 
@@ -143,4 +211,16 @@ export const AGENT_SKILL_BODY = `
 - /skill 是当前构建的 Markdown；响应头 x-skill-sha256 与 ETag 可用于本地缓存。
 - /capabilities 是同一份能力表的 JSON 版，适合程序判定，不用解析 Markdown。
 - /skill 不包含项目数据或任何 token；可以安全地放在共享缓存里，但仍建议同源读取。
+
+## 能力 ID 索引
+
+server.version, delivery.format_gate, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery.
 `;
+
+// 防止“能力表加了一条、/skill 正文没写”的静默漂移：模块加载时直接失败。
+const missingCapabilityDocs = AGENT_CAPABILITIES
+  .map((c) => c.id)
+  .filter((id) => !AGENT_SKILL_BODY.includes(id));
+if (missingCapabilityDocs.length) {
+  throw new Error(`AGENT_SKILL_BODY 缺少能力 ID：${missingCapabilityDocs.join(", ")}`);
+}
