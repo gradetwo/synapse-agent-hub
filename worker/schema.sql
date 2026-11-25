@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS agents (
   project     TEXT NOT NULL,
   agent_id    TEXT NOT NULL,
-  role        TEXT NOT NULL DEFAULT 'agent',        -- agent|admin|observer
+  role        TEXT NOT NULL DEFAULT 'agent',        -- agent|admin
   scopes      TEXT NOT NULL,                        -- 逗号分隔
   token_sha   TEXT NOT NULL,
   created_at  INTEGER NOT NULL,
