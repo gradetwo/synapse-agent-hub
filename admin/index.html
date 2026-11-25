@@ -945,13 +945,22 @@ function showToast(msg, ms = 6000) {
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
 }
 
+// ResizeObserver 的 loop 提示是浏览器布局抖动产生的非业务错误：
+// 它会被 window.error 捕获，若当成操作失败弹 toast，会掩盖真正的接口错误。
+const BENIGN_BROWSER_ERROR = /ResizeObserver loop (completed with undelivered notifications|limit exceeded)/i;
+function isBenignBrowserError(msg) {
+  return BENIGN_BROWSER_ERROR.test(String(msg || ""));
+}
 window.addEventListener("error", (e) => {
-  console.error("[hub] error", e.error || e.message);
-  showToast("操作出错：" + (e.message || "unknown"), 6000);
+  const msg = e.message || (e.error && e.error.message) || "";
+  if (isBenignBrowserError(msg)) return console.warn("[hub] suppressed browser layout warning", msg);
+  console.error("[hub] error", e.error || msg);
+  showToast("操作出错：" + (msg || "unknown"), 6000);
 });
 window.addEventListener("unhandledrejection", (e) => {
-  console.error("[hub] rejection", e.reason);
   const msg = (e.reason && e.reason.message) || e.reason || "unknown";
+  if (isBenignBrowserError(msg)) return console.warn("[hub] suppressed browser layout warning", msg);
+  console.error("[hub] rejection", e.reason);
   if (msg instanceof Error || typeof msg === "string") showToast("操作失败：" + msg, 6000);
 });
 const STUB = {

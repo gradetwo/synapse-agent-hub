@@ -944,7 +944,7 @@ paths:
       security: []
       responses:
         '200':
-          description: build / sdk / at
+          description: build / sdk / skill / at
           content:
             application/json:
               schema:
@@ -953,7 +953,52 @@ paths:
                   build: { type: string }
                   sdk: { type: string }
                   tabs: { type: boolean }
+                  skill_url: { type: string, example: /skill }
+                  skill_sha256: { type: string }
+                  capabilities:
+                    type: array
+                    items: { type: string }
                   at: { type: integer }
+  /skill:
+    get:
+      summary: Agent 能力说明书（Markdown）
+      security: []
+      responses:
+        '200':
+          description: 当前构建的 Agent Skill；响应头带 x-skill-sha256 / ETag
+          content:
+            text/markdown:
+              schema: { type: string }
+        '304': { description: 未变化；客户端带 If-None-Match 时返回 }
+  /capabilities:
+    get:
+      summary: Agent 能力清单（JSON）
+      security: []
+      responses:
+        '200':
+          description: 与 /skill 同源的能力表；不含项目数据或 token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sdk: { type: string }
+                  build: { type: string }
+                  skill_url: { type: string }
+                  skill_sha256: { type: string }
+                  capabilities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        since: { type: string }
+                        audience: { type: string, enum: [agent, admin, both] }
+                        title: { type: string }
+                        summary: { type: string }
+                        method: { type: string }
+                        path: { type: string }
+                        event: { type: string }
   /sdk/manifest:
     get:
       summary: SDK 版本与二进制清单

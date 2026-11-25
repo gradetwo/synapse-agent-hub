@@ -7,7 +7,7 @@
 
 | 项 | 值 |
 |---|---|
-| Worker build | `submission-collect-20261120` |
+| Worker build | `efficiency-s1-s7-20261125` |
 | SDK version | `0.5.7` |
 | 安装入口 | `https://synapse.wangda.today/dl/install.sh` |
 | Linux x64 二进制 | `/dl/synapse-agent-x86_64-linux-musl` |
@@ -302,6 +302,16 @@ scripts/hubctl agent-move --from yanshi --to yeban \
 scripts/hubctl get sub-a-0049-r2 --project yanshi --to ./incoming
 ```
 
+### 能力自描述（公开）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/ver` | 版本探针；带 `sdk`、`build`、`skill_url`、`skill_sha256`、`capabilities` |
+| GET | `/skill` | Agent 能力说明书 Markdown；响应头 `x-skill-sha256` 与 ETag 可用于缓存 |
+| GET | `/capabilities` | 同一份能力表的 JSON 版，适合程序判定；不含项目数据或 token |
+
+升级后客户端先读 `/ver`：`skill_sha256` 变化再拉 `/skill`，不要每次重发整份提示词。
+
 ### 管理 API
 
 | 方法 | 路径 | 说明 |
@@ -464,7 +474,7 @@ python3 spec/conformance/run.py --endpoint http://127.0.0.1:18099 --project yans
 - agent 只读 git：没有写冲突，只有 `base_sha` 提示。
 - 单进程原生多项目尚未实现；当前用多实例隔离配置。
 - Linux x64 / ARM64 走 `/dl/install.sh` 预编译通道；Windows 走 `scripts/install.ps1`；macOS 由维护者编译，不自动安装。
-- `/ver` 与 `/dl` 是刻意公开的版本/分发信息。
+- `/ver`、`/skill`、`/capabilities` 与 `/dl` 是刻意公开的版本/能力说明/分发信息。
 
 ---
 

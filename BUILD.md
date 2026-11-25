@@ -206,6 +206,8 @@ cd ../.. && npx wrangler deploy --dry-run --outdir /tmp/synapse-worker-dry
 ```
 
 - [ ] `/ver` 的 build 与文档一致
+- [ ] `/ver.skill_sha256` 与 `/skill` 响应头 `x-skill-sha256` 一致
+- [ ] `/capabilities` 返回合法 JSON，能力 ID 覆盖本次新增 API
 - [ ] `/sdk/manifest` 的 sha 与 R2 对象一致
 - [ ] `/sdk/manifest` 同时列出 Linux x86_64 和 linux-aarch64（两者都已上传时）
 - [ ] `/dl/install.sh` 内容与 `scripts/install.sh` 一致

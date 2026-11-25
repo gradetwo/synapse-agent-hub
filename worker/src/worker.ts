@@ -3,6 +3,7 @@
 import { Env, IDLE_AFTER_DEFAULT_S, IDLE_DEFAULT_MESSAGE, IDLE_FOLLOWUP_DEFAULT_S } from "./types";
 import CONSOLE_HTML from "../../admin/index.html";
 import { ACTIVE_TASK_LIMIT } from "./project-room";
+import { AGENT_CAPABILITIES, AGENT_SKILL_BODY } from "./skill";
 export { ProjectRoom } from "./project-room";
 
 const AGENT_SCOPES = ["poll", "ack", "report", "heartbeat", "publish", "tasks.claim", "tasks.release",
@@ -22,6 +23,11 @@ export default {
     const path = url.pathname;
 
     if (path === "/") return html(LANDING);
+
+    // 公开能力自描述：只包含版本与公开 API 说明，不含项目数据/token。
+    // 客户端升级后先读 /ver 的 skill_sha256，再决定是否拉 /skill。
+    if (path === "/skill") return skillResponse(req);
+    if (path === "/capabilities") return capabilitiesResponse();
 
     // 控制台：没有有效会话连页面都不给（不泄露任何界面结构）
     // PWA 资源（公开，不含任何业务数据）
@@ -274,7 +280,7 @@ export default {
     }
 
     if (path === "/ver")
-      return json({ build: BUILD_TAG, sdk: SDK_VERSION, tabs: true, at: Date.now() });
+      return json({ ...(await versionPayload()), at: Date.now() });
 
     // 自助注册必须拦在 /p/{project}/{action} 之前：否则 "enroll" 会被当成 project 名
     if (path === "/p/enroll" || path.startsWith("/p/enroll/")) return enroll(req, env, url, path);
@@ -1150,7 +1156,7 @@ async function admin(req: Request, env: Env, url: URL) {
       max_msgs_per_min: maxMsgs, retention_days: retention } });
   }
 
-  if (p === "/ver") return json({ build: BUILD_TAG, sdk: SDK_VERSION, tabs: true, at: Date.now() });
+  if (p === "/ver") return json({ ...(await versionPayload()), at: Date.now() });
 
   // /admin/p/{project}/…
   const m = p.match(/^\/admin\/p\/([a-z0-9-]+)\/(.+)$/);
@@ -3126,6 +3132,52 @@ async function sha256Bytes(buf: Uint8Array): Promise<string> {
 async function sha256(s: string) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ── Agent 能力自描述：/ver 给 hash，/skill 给说明，/capabilities 给机器可读清单 ──
+type SkillMeta = { text: string; sha256: string };
+let SKILL_META_CACHE: Promise<SkillMeta> | null = null;
+function skillMeta(): Promise<SkillMeta> {
+  if (!SKILL_META_CACHE) {
+    const text = `# Synapse Agent Skill\n\n- SDK: ${SDK_VERSION}\n- Build: ${BUILD_TAG}\n- 生成方式: 服务端构建内嵌，随部署更新\n${AGENT_SKILL_BODY}`;
+    SKILL_META_CACHE = sha256(text).then((sha256) => ({ text, sha256 }));
+  }
+  return SKILL_META_CACHE;
+}
+async function versionPayload() {
+  const meta = await skillMeta();
+  return {
+    build: BUILD_TAG,
+    sdk: SDK_VERSION,
+    tabs: true,
+    skill_url: "/skill",
+    skill_sha256: meta.sha256,
+    capabilities: AGENT_CAPABILITIES.map((c) => c.id),
+  };
+}
+async function capabilitiesResponse() {
+  const meta = await skillMeta();
+  return json({
+    sdk: SDK_VERSION,
+    build: BUILD_TAG,
+    skill_url: "/skill",
+    skill_sha256: meta.sha256,
+    capabilities: AGENT_CAPABILITIES,
+  });
+}
+async function skillResponse(req: Request) {
+  if (req.method !== "GET" && req.method !== "HEAD") return err(405, "method_not_allowed");
+  const meta = await skillMeta();
+  const etag = `"${meta.sha256}"`;
+  const headers = {
+    ...SEC_HEADERS,
+    "content-type": "text/markdown; charset=utf-8",
+    "cache-control": "public, max-age=60, must-revalidate",
+    "etag": etag,
+    "x-skill-sha256": meta.sha256,
+  };
+  if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
+  return new Response(req.method === "HEAD" ? null : meta.text, { headers });
 }
 /** 统一响应序列化：不输出异常堆栈字段（错误响应只留稳定的 error code）。 */
 function jsonBody(value: unknown): string {
