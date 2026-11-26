@@ -42,7 +42,7 @@ if (location.search.includes("reset=1")) {
     document.documentElement.dataset.themePref = preference;
     document.documentElement.style.colorScheme = theme;
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", theme === "light" ? "#f6f7f9" : "#0e1116");
+    if (meta) meta.setAttribute("content", theme === "light" ? "#f5f6f8" : "#0e1116");
     const status = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
     if (status) status.setAttribute("content", theme === "light" ? "default" : "black-translucent");
     if (notify) document.dispatchEvent(new CustomEvent("synapse:themechange", { detail: { preference, theme } }));
@@ -113,34 +113,37 @@ if (location.search.includes("reset=1")) {
   }
   :root[data-theme="light"]{
     color-scheme:light;
-    --bg:#f6f7f9; --panel:#ffffff; --line:#e4e7ec; --fg:#1f2937; --dim:#667085;
-    --ok:#2f855a; --warn:#9a6700; --bad:#c53030; --accent:#3b5f8a;
-    --canvas:#ffffff; --surface-input:#ffffff; --surface-1:#f9fafb;
-    --surface-sheet:#ffffff; --surface-sheet-head:#f8fafb; --surface-tabs:#f8fafb;
-    --surface-2:#ffffff; --surface-hover:#f2f4f7;
-    --surface-accent-hover:#f4f7fa; --surface-accent:#eff3f7; --surface-accent-strong:#e2e9f0;
-    --surface-ok:#eff9f3; --surface-ok-2:#e3f4ea; --surface-ok-3:#d2ecdf;
-    --surface-warn:#fff8ec; --surface-warn-2:#fdf2df;
-    --surface-bad:#fdf1f0; --surface-bad-2:#fbe4e2; --surface-bad-3:#f8d6d3;
-    --line-soft:#eceff3; --line-strong:#d6dce5; --line-faint:#f0f2f5;
-    --fg-strong:#111827; --fg-soft:#334155; --fg-code:#475569; --fg-chip:#475569;
-    --dim-2:#667085; --dim-3:#6b7280;
-    --accent-text:#2f5378; --accent-border:#b9cadb; --accent-border-soft:#d4dfe9;
-    --ok-text:#16794c; --ok-soft:#2f855a; --ok-border:#c6e3d3; --ok-border-strong:#9ed1b5;
-    --warn-text:#8a5a17; --warn-bright:#6f4710; --warn-dim:#8a5a17; --warn-soft:#9a6700;
-    --warn-border:#e8d5b5; --warn-border-strong:#d1b083; --on-warn:#ffffff;
-    --bad-text:#b42318; --bad-soft:#c53030; --bad-border:#f3c7c4;
-    --purple:#6b46c1; --unknown:#94a3b8;
-    --warn-glow:rgba(154,103,0,.05); --gate-bg:rgba(246,247,249,.96); --overlay:rgba(15,23,42,.22); --shadow-soft:rgba(15,23,42,.08); --shadow-strong:rgba(15,23,42,.14);
-    --chart-msg:#3b6ea5; --chart-sub:#2f855a; --chart-issue:#a16207;
-    --chart-grid:#e4e7ec; --chart-empty:#6b7280; --chart-fg:#111827; --chart-dim:#667085;
-    --chart-cpu:#3b6ea5; --chart-mem:#2f855a; --chart-disk:#a16207;
-    --chart-task-open:#64748b; --chart-task-claimed:#3b6ea5; --chart-task-released:#a16207;
-    --chart-task-blocked:#c53030; --chart-task-done:#2f855a; --chart-task-failed:#c53030;
-    --chart-task-other:#64748b; --chart-purple:#6b46c1;
-    --btn-bg:#f6f7f9; --btn-bg-hover:#eceff3; --btn-border:#d6dce5;
-    --btn-primary-bg:#35577f; --btn-primary-hover:#2b4868; --btn-primary-fg:#ffffff;
+    /* 极简冷淡：冷灰底、近黑正文、石墨主按钮；彩色只留给极小状态点和图表 */
+    --bg:#f5f6f8; --panel:#ffffff; --line:#e3e4e8; --fg:#181a1f; --dim:#5f636b;
+    --ok:#5b7f6b; --warn:#8a7658; --bad:#8a5f62; --accent:#3f4652;
+    --canvas:#ffffff; --surface-input:#ffffff; --surface-1:#f7f8fa;
+    --surface-sheet:#ffffff; --surface-sheet-head:#f7f8fa; --surface-tabs:#f7f8fa;
+    --surface-2:#ffffff; --surface-hover:#f2f3f5;
+    --surface-accent-hover:#edeff2; --surface-accent:#f3f4f6; --surface-accent-strong:#e4e6ea;
+    --surface-ok:#f3f7f4; --surface-ok-2:#e8f1eb; --surface-ok-3:#dce9e1;
+    --surface-warn:#f5f6f6; --surface-warn-2:#eceded;
+    --surface-bad:#f8f4f4; --surface-bad-2:#f2e9e9; --surface-bad-3:#eadcdd;
+    --line-soft:#ececef; --line-strong:#d4d6db; --line-faint:#f1f2f3;
+    --fg-strong:#121317; --fg-soft:#343740; --fg-code:#4a4e57; --fg-chip:#4a4e57;
+    --dim-2:#666b74; --dim-3:#686d76;
+    --accent-text:#343a44; --accent-border:#cbd0d7; --accent-border-soft:#e0e2e6;
+    --ok-text:#456b56; --ok-soft:#5b7f6b; --ok-border:#d8e3db; --ok-border-strong:#b8cec0;
+    --warn-text:#5d6066; --warn-bright:#22242a; --warn-dim:#6a6d74; --warn-soft:#8a7658;
+    --warn-border:#dedfe2; --warn-border-strong:#c9c2b7; --on-warn:#ffffff;
+    --bad-text:#7a5055; --bad-soft:#8a5f62; --bad-border:#e3d8d9;
+    --purple:#706880; --unknown:#8b9099;
+    --warn-glow:rgba(90,90,92,.04); --gate-bg:rgba(245,246,248,.96); --overlay:rgba(17,18,22,.18);
+    --shadow-soft:rgba(17,18,22,.06); --shadow-strong:rgba(17,18,22,.12);
+    --chart-msg:#5b6f85; --chart-sub:#5d7968; --chart-issue:#8a7658;
+    --chart-grid:#e3e4e8; --chart-empty:#686d76; --chart-fg:#181a1f; --chart-dim:#5f636b;
+    --chart-cpu:#5b6f85; --chart-mem:#5d7968; --chart-disk:#8a7658;
+    --chart-task-open:#737b86; --chart-task-claimed:#5b6f85; --chart-task-released:#8a7658;
+    --chart-task-blocked:#8a5f62; --chart-task-done:#5d7968; --chart-task-failed:#8a5f62;
+    --chart-task-other:#737b86; --chart-purple:#706880;
+    --btn-bg:#f5f6f8; --btn-bg-hover:#eceef1; --btn-border:#d4d6db;
+    --btn-primary-bg:#23262c; --btn-primary-hover:#14161a; --btn-primary-fg:#ffffff;
   }
+
   :root[data-theme="light"] .gate{background:var(--gate-bg)}
   :root[data-theme="light"] .overlay{background:var(--overlay)}
   :root[data-theme="light"] .alertbar button.primary{background:var(--btn-primary-bg);border-color:var(--btn-primary-bg);color:var(--btn-primary-fg)}
@@ -157,6 +160,12 @@ if (location.search.includes("reset=1")) {
   .bar h1::before{content:"";width:7px;height:7px;border-radius:2px;background:var(--accent);flex:0 0 auto;vertical-align:1px}
   #build{max-width:290px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #scope{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #liveDot{color:var(--dim)}
+  #liveDot.live-on{color:var(--ok)}
+  #liveDot.live-alert{color:var(--warn)}
+  #liveDot #liveMark{color:inherit}
+  #liveDot.live-on #liveMark{color:var(--ok)}
+  #liveDot.live-alert #liveMark{color:var(--warn-soft)}
   #btnMore{display:none}
   #btnTheme{display:flex;align-items:center;height:34px;width:auto;min-width:76px;padding:0 9px;gap:5px;justify-content:center;font-size:12px;line-height:1;border-color:var(--line-strong);background:var(--btn-bg)}
   #btnTheme .themeIcon{font-size:16px;line-height:1}
@@ -704,6 +713,27 @@ if (location.search.includes("reset=1")) {
     tr.clickable:active{background:var(--surface-hover)}
     button:active{transform:scale(.98)}
   }
+  /* 浅色模式：文字去彩色，彩色只保留极小圆点和图表线；状态用底色而不是彩色字 */
+  :root[data-theme="light"] .stat::before{background:transparent}
+  :root[data-theme="light"] .stat.warn .v,
+  :root[data-theme="light"] .stat.accent .v,
+  :root[data-theme="light"] .agentStat.ok .v,
+  :root[data-theme="light"] .agentStat.warn .v,
+  :root[data-theme="light"] .agentStat.accent .v,
+  :root[data-theme="light"] .warnv,
+  :root[data-theme="light"] .badv,
+  :root[data-theme="light"] .launchKv b.warnv,
+  :root[data-theme="light"] .ctrlHint.warnv{color:var(--fg-soft)}
+  :root[data-theme="light"] .badge{color:var(--fg-strong)!important}
+  :root[data-theme="light"] .tabs button.on{color:var(--fg-strong)}
+  :root[data-theme="light"] .card>h2{color:var(--fg-soft);font-weight:600}
+  :root[data-theme="light"] .dashMore{color:var(--dim);background:var(--panel);border-color:var(--line-strong)}
+  :root[data-theme="light"] .alertbar{border-left:3px solid var(--warn-soft)}
+  :root[data-theme="light"] #liveDot,
+  :root[data-theme="light"] #liveDot.live-on,
+  :root[data-theme="light"] #liveDot.live-alert{color:var(--dim)}
+  :root[data-theme="light"] #liveDot.live-on #liveMark{color:var(--ok)}
+  :root[data-theme="light"] #liveDot.live-alert #liveMark{color:var(--warn-soft)}
 </style>
 
 <div class="gate" id="gate">
@@ -724,7 +754,7 @@ if (location.search.includes("reset=1")) {
   <span class="muted" id="scope">—</span>
   <span class="muted" id="build" title="构建标识">build —</span>
   <div class="seg">
-    <span class="mono" id="liveDot" title="实时通道状态" style="cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:6px 10px">○ 轮询</span>
+    <span class="mono" id="liveDot" title="实时通道状态" style="cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:6px 10px"><span id="liveMark">○</span> <span id="liveText">轮询</span></span>
     <select id="proj" title="项目"></select>
     <button class="ghost" id="btnReload" title="立即刷新各面板">刷新</button>
     <button class="ghost" id="btnSettings">可见性</button>
@@ -5216,8 +5246,12 @@ let liveConnectTimer = null;
 let liveGen = 0, liveMode = localStorage.getItem("hub.live") || "ws";
 function paintLive(on, note, why) {
   const el = $("liveDot"); if (!el) return;
-  el.textContent = on ? "● 实时" : "○ " + (why || (liveMode === "ws" ? "连接中…" : "轮询"));
-  el.style.color = on ? "var(--ok)" : /重连|超时|失败/.test(why || "") ? "var(--warn)" : "var(--dim)";
+  const mark = $("liveMark"), text = $("liveText");
+  // 状态点保留一丁点语义色，状态文字始终用正文灰，避免浅色模式出现整块绿色/橙色字。
+  if (mark) mark.textContent = on ? "●" : "○";
+  if (text) text.textContent = on ? "实时" : (why || (liveMode === "ws" ? "连接中…" : "轮询"));
+  el.classList.toggle("live-on", on);
+  el.classList.toggle("live-alert", !on && /重连|超时|失败/.test(why || ""));
   el.title = note + (on ? "（点击切到轮询）" : "（点击尝试实时）");
 }
 function scheduleRefresh(forceFresh = false) {
