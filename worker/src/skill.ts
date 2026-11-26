@@ -280,6 +280,23 @@ export const AGENT_SKILL_BODY = `
 - 事件流游标只在成功读取后前移；重连不要从头清空，避免重复消费。
 - Token 只放 Authorization: Bearer，不要拼进 URL、日志、skill 缓存或汇报正文。
 
+### 给管理员发消息
+
+普通节点没有 /send 接口：/x/admin/p/{project}/send 是管理侧入口，节点 token 调用会 403。
+节点给管理员发消息统一用 POST /p/{project}/publish（scope: publish），dedupe_key 必填，正文放 payload：
+
+~~~json
+{
+  "topic": "admin",
+  "kind": "notice",
+  "to": "admin",
+  "dedupe_key": "node-report-20261126-001",
+  "payload": { "title": "节点汇报", "body": "任务已完成" }
+}
+~~~
+
+to: "admin" 让消息定向进管理台；不带 to 的项目广播也只会进管理台，不会打扰其它节点。
+
 ## 管理侧能力
 
 管理侧能力用于回写合入、CI、排队告警和任务时间线；普通 agent 调用会 403。
