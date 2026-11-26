@@ -18,7 +18,7 @@ export interface ClientOptions {
   stateDir?: string; heartbeatS?: number;
 }
 
-const VERSION = "0.5.11";
+const VERSION = "0.5.12";
 
 /** 服务端 4xx/5xx：保留 code/hint/use，调用方可以直接打印下一步。 */
 export class SynapseAPIError extends Error {

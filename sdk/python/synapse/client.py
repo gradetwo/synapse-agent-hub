@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 import requests
 
-__version__ = "0.5.11"
+__version__ = "0.5.12"
 
 class SynapseAPIError(RuntimeError):
     """服务端 4xx/5xx：保留 code/hint/use，agent 可以直接照着下一步调用。"""
