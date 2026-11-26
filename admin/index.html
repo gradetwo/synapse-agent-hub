@@ -279,10 +279,12 @@ if (location.search.includes("reset=1")) {
   .card.maxed>h2{position:sticky;top:0;z-index:2;background:var(--surface-sheet);padding:8px 0;margin:0 0 6px;
     border-bottom:1px solid var(--line-soft)}
   /* 最大化时给一个"永远在屏幕里"的退出按钮，手机上也点得到 */
-  #maxExit{display:none;position:fixed;right:12px;z-index:15;
-    top:calc(env(safe-area-inset-top) + 12px);padding:8px 14px;border-radius:10px;
-    border:1px solid var(--accent-border);background:var(--surface-accent);color:var(--fg-strong);font:600 13px/1 -apple-system,sans-serif}
-  body.has-max #maxExit{display:block}
+  #maxExit{display:none;position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 14px);
+    transform:translateX(-50%);z-index:40;min-height:44px;padding:0 18px;border-radius:999px;
+    border:1px solid var(--accent-border);background:var(--surface-accent);color:var(--fg-strong);
+    font:600 14px/1 -apple-system,sans-serif;box-shadow:0 6px 22px var(--shadow-strong)}
+  body.has-max #maxExit{display:flex;align-items:center;justify-content:center}
+  body.has-max.has-sheet #maxExit{display:none}
   body.has-max,body.has-sheet{overflow:hidden}
   .cardTools{margin-left:auto;display:flex;gap:6px}
   thead th{position:sticky;top:0;background:var(--canvas);z-index:1;box-shadow:0 1px 0 var(--line-soft)}
@@ -345,19 +347,6 @@ if (location.search.includes("reset=1")) {
   /* 头部关闭还原成 × 图标 */
   .iconBtn{width:34px;height:34px;min-width:34px!important;padding:0;display:flex;align-items:center;justify-content:center;
     font-size:18px;line-height:1;border-radius:9px}
-  /* 移动端详情始终保留一个可点的返回入口：头部滚出视口后不能把人困在详情里 */
-  #dBack{display:none}
-  @media(max-width:720px){
-    #dBack{display:flex;position:fixed;z-index:30;
-      top:calc(env(safe-area-inset-top) + 10px);left:12px;
-      height:42px;min-width:64px;padding:0 12px;border-radius:999px;
-      align-items:center;justify-content:center;gap:2px;
-      border:1px solid var(--line-strong);background:var(--surface-sheet-head);
-      color:var(--fg-strong);font-size:13px;font-weight:600;line-height:1;
-      box-shadow:0 6px 18px var(--shadow-soft)}
-    #dBack:active{background:var(--surface-hover)}
-    #detail .sheetHead{padding-left:88px;position:sticky;top:0;z-index:7;background:var(--surface-sheet-head)}
-  }
   /* 权限一行流：角色 + 有效期 + 三个动作，窄屏自动换行 */
   .permBar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .permBar .permRole{margin:0}
@@ -747,6 +736,56 @@ if (location.search.includes("reset=1")) {
   :root[data-theme="light"] #liveDot.live-alert{color:var(--dim)}
   :root[data-theme="light"] #liveDot.live-on #liveMark{color:var(--ok)}
   :root[data-theme="light"] #liveDot.live-alert #liveMark{color:var(--warn-soft)}
+
+  /* 手机详情：固定顶部条、长卡折叠、小节导航 */
+  .mobileFold{border:0;background:transparent;margin:0;padding:0}
+  .mobileFold>summary{display:none}
+  .mobileFold>.launchCard{margin:0}
+  .mobileNav{display:none}
+  .copyField{display:none}
+  #dClose .backGlyph{display:none}
+  #dClose .closeX{display:inline}
+  @media(max-width:720px){
+    /* 其他全屏面板：标题栏始终留在顶部，避免滚出屏幕后无路可退 */
+    .overlay .sheetHead{position:sticky;top:0;z-index:20;box-shadow:0 1px 0 var(--line-soft)}
+    .overlay .sheetHead .iconBtn{width:44px;height:44px;min-width:44px!important}
+    /* agent 详情：干净的返回箭头 + 名称，不做大号方块按钮压内容 */
+    #detail .sheetHead{position:fixed;top:0;left:0;right:0;z-index:31;margin:0;box-sizing:border-box;
+      height:calc(env(safe-area-inset-top) + 56px);
+      display:grid;grid-template-columns:44px minmax(0,1fr);grid-template-areas:"back title" "back meta";
+      column-gap:8px;align-items:center;
+      padding:calc(env(safe-area-inset-top) + 6px) 12px 6px;
+      background:var(--surface-sheet-head);border-bottom:1px solid var(--line-soft)}
+    #detail .sheetHead #dClose{grid-area:back;justify-self:start;width:44px;height:44px;min-width:44px!important;
+      padding:0;border:0;background:transparent;border-radius:12px;color:var(--fg);font-size:26px;line-height:1}
+    #detail .sheetHead #dClose:active{background:var(--surface-hover)}
+    #detail .sheetHead #dName{grid-area:title;font-size:15px}
+    #detail .sheetHead #dMeta{grid-area:meta;font-size:11px}
+    #dClose .backGlyph{display:inline}
+    #dClose .closeX{display:none}
+    #detail .sheetBody{padding-top:calc(env(safe-area-inset-top) + 56px);overscroll-behavior:contain}
+    #dMobileNav{display:flex;position:static;gap:6px;overflow-x:auto;padding:8px 0 4px;margin:0 0 4px;
+      background:transparent;scrollbar-width:none}
+    #dMobileNav::-webkit-scrollbar{display:none}
+    #dMobileNav button{flex:0 0 auto;height:44px;box-sizing:border-box;padding:0 14px;border-radius:999px;
+      background:var(--surface-tabs);border:1px solid var(--line-soft);color:var(--dim-2);
+      font-size:12px;line-height:1.2;white-space:nowrap;touch-action:manipulation}
+    #dMobileNav button:active{background:var(--surface-hover);color:var(--fg-strong)}
+    #detail .mobileFold{border:1px solid var(--line-soft);border-radius:9px;
+      background:var(--surface-1);margin:0 0 10px;padding:0;overflow:hidden}
+    #detail .mobileFold>summary{display:flex;align-items:center;gap:8px;padding:10px 12px;
+      cursor:pointer;list-style:none;font-size:12.5px;color:var(--fg-chip)}
+    #detail .mobileFold>summary::-webkit-details-marker{display:none}
+    #detail .mobileFold>summary .lead{margin-left:auto;color:var(--dim-2);font-size:11px}
+    #detail .mobileFold[open]>summary{border-bottom:1px solid var(--line-faint);padding-bottom:8px}
+    #detail .mobileFold>.launchCard{border:0;background:transparent;padding:10px;margin:0}
+    #detail .mobileFold .launchTop .cap{display:none}
+    #detail #dStats,#detail #dLaunchBox,#detail #dTasks,#detail #dMsgs,#detail #dSubs,#detail #dPermDetails{
+      scroll-margin-top:calc(env(safe-area-inset-top) + 110px)}
+    .copyField{display:inline-flex;position:relative;margin-top:4px;padding:1px 7px;height:20px;
+      align-items:center;font-size:10px;line-height:1;border-radius:5px;touch-action:manipulation}
+    .copyField::before{content:"";position:absolute;inset:-12px -8px}
+  }
 </style>
 
 <div class="gate" id="gate">
@@ -1161,8 +1200,15 @@ if (location.search.includes("reset=1")) {
 <div id="detail" class="overlay" hidden>
   <div class="sheet">
     <div class="sheetHead"><b id="dName">agent</b><span class="muted" id="dMeta"></span>
-      <button class="ghost iconBtn" id="dClose" aria-label="关闭" title="关闭">×</button></div>
+      <button class="ghost iconBtn" id="dClose" aria-label="返回" title="返回"><span class="backGlyph">‹</span><span class="closeX">×</span></button></div>
     <div class="sheetBody">
+    <div id="dMobileNav" class="mobileNav" aria-label="详情页导航">
+      <button type="button" data-jump="dStats">概览</button>
+      <button type="button" data-jump="dLaunchBox">客户端</button>
+      <button type="button" data-jump="dTasks">任务</button>
+      <button type="button" data-jump="dMsgs">消息</button>
+      <button type="button" data-jump="dSubs">交付</button>
+    </div>
     <div class="agentStats" id="dStats"></div>
     <div class="quick detailQuick" style="margin-top:10px">
       <button class="ghost" data-dq="sync" data-da="__AGENT__">同步代码</button>
@@ -1171,9 +1217,18 @@ if (location.search.includes("reset=1")) {
       <button class="ghost" id="dIdleRemind" hidden>重发提醒</button>
       <button class="ghost" id="dNotice">发提醒（非任务）</button>
     </div>
-    <div class="launchCard" id="dLaunch"><div class="scopeHint">客户端启动参数加载中…</div></div>
-    <div class="launchCard" id="dControl"><div class="scopeHint">远程运行控制加载中…</div></div>
-    <div class="launchCard" id="dDiag"><div class="scopeHint">客户端诊断日志加载中…</div></div>
+    <details class="mobileFold" id="dLaunchBox" open>
+      <summary><span>客户端启动</span><span class="lead">运行环境</span></summary>
+      <div class="launchCard" id="dLaunch"><div class="scopeHint">客户端启动参数加载中…</div></div>
+    </details>
+    <details class="mobileFold" id="dControlBox" open>
+      <summary><span>远程运行控制</span><span class="lead">投送开关</span></summary>
+      <div class="launchCard" id="dControl"><div class="scopeHint">远程运行控制加载中…</div></div>
+    </details>
+    <details class="mobileFold" id="dDiagBox" open>
+      <summary><span>客户端诊断</span><span class="lead">异常与日志</span></summary>
+      <div class="launchCard" id="dDiag"><div class="scopeHint">客户端诊断日志加载中…</div></div>
+    </details>
     <div class="activityHead">
       <div class="cap">活动趋势 <span class="scopeHint" id="dActivityMeta"></span></div>
       <div class="trendSeg trendSegSmall" id="dActivityRange" aria-label="agent 活动范围">
@@ -1259,7 +1314,6 @@ if (location.search.includes("reset=1")) {
     <div class="cap" style="margin-top:12px">提交历史</div><div id="dSubs" class="list"></div>
     </div>
   </div>
-  <button type="button" id="dBack" aria-label="返回 agent 列表" title="返回">‹ 返回</button>
 </div>
 <div id="toast" class="toast" hidden></div>
 <script>
@@ -1360,6 +1414,27 @@ function showToast(msg, ms = 6000) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
 }
+
+async function copyFieldText(text) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast("已复制", 2500);
+    return;
+  } catch {}
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.left = "-9999px";
+  document.body.append(ta); ta.select();
+  try { document.execCommand("copy"); showToast("已复制", 2500); }
+  catch { showToast("复制失败，请长按选中", 4000); }
+  ta.remove();
+}
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest && e.target.closest("[data-copy]");
+  if (!btn) return;
+  e.preventDefault();
+  copyFieldText(btn.dataset.copy || "");
+});
 
 // ResizeObserver 的 loop 提示是浏览器布局抖动产生的非业务错误：
 // 它会被 window.error 捕获，若当成操作失败弹 toast，会掩盖真正的接口错误。
@@ -2225,7 +2300,8 @@ async function showTaskTimeline(taskId) {
   $("tlBody").innerHTML = `<div class="scopeHint">加载中…</div>`;
   ov.hidden = false;
   ov.style.display = "flex";
-  document.body.classList.add("has-sheet");
+  pushSheetHistory("timeline");
+  syncSheetLock();
   try {
     const d = await api(`/admin/p/${current}/tasks/timeline?task_id=${encodeURIComponent(taskId)}`);
     const t = d.task || {};
@@ -2823,7 +2899,8 @@ function showIssueDetail(issue) {
     issue.close_reason ? `关闭原因 ${issue.close_reason}` : ""].filter(Boolean).join(" · ");
   $("issueDetailBody").textContent = issue.body || "（无正文）";
   box.hidden = false;
-  document.body.classList.add("has-sheet");
+  pushSheetHistory("issue");
+  syncSheetLock();
 }
 
 async function loadSubs() {
@@ -3517,16 +3594,17 @@ function openTrendSheet(mode = "global", agent = null) {
   };
   $("trendTitle").textContent = "活动趋势";
   ov.hidden = false; ov.style.display = "flex";
-  document.body.classList.add("has-sheet");
+  pushSheetHistory("trend");
+  syncSheetLock();
   loadTrendSheet();
 }
-function closeTrendSheet() {
+function closeTrendSheet(fromHistory = false) {
   const ov = $("trendDetail");
-  if (ov) { ov.hidden = true; ov.style.display = ""; }
+  if (!ov || ov.hidden) return;
+  ov.hidden = true; ov.style.display = "";
   TREND_VIEW.open = false;
-  const detail = $("detail");
-  if (detail && !detail.hidden) document.body.classList.add("has-sheet");
-  else document.body.classList.remove("has-sheet");
+  if (!fromHistory) backSheetHistory("trend");
+  syncSheetLock();
 }
 function bindTrendChartHover() {
   const cv = $("trendDetailChart");
@@ -3788,6 +3866,8 @@ window.addEventListener("resize", () => {
   dashResizeTimer = setTimeout(() => {
     renderDashboard();
     if (TREND_VIEW.open) renderTrendSheet();
+    const detail = $("detail");
+    if (detail && !detail.hidden) setDetailFoldDefaults();
   }, 120);
 });
 
@@ -4044,22 +4124,27 @@ function renderClientLaunch(client, available, fallbackSummary) {
     ? "自动投送当前由服务端远程控制覆盖" : "";
   const controlText = control
     ? `${autoForwardLabel(control.auto_forward)} · rev ${control.rev ?? "—"}` : "未下发";
-  const kv = (k, v, warn = false) => `<div class="launchKv"><span>${txt(k)}</span><b class="${warn ? "warnv" : ""}">${txt(v || "—")}</b></div>`;
+  const kv = (k, v, warn = false, copy = false) => {
+    const val = txt(v || "—");
+    const cp = copy && v && String(v) !== "—"
+      ? `<button type="button" class="mini copyField" data-copy="${val}" title="复制">复制</button>` : "";
+    return `<div class="launchKv"><span>${txt(k)}</span><b class="${warn ? "warnv" : ""}">${val}</b>${cp}</div>`;
+  };
   box.innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
       <span class="launchBadge ${auto ? "on" : "off"}">消息自动投送：${txt(autoText)}</span></div>
     <div class="launchMeta">启动 ${txt(started)} · 最后上报 ${lastAt !== null ? txt(fmtLast(lastAt)) : "—"}</div>
     <div class="launchGrid">
       ${kv("投送面", deliveryLabel, !auto)}
-      ${kv("投送目标", targetText, !auto && !!target)}
+      ${kv("投送目标", targetText, !auto && !!target, true)}
       ${kv("执行器", effective.exec || "—")}
       ${kv("事件回调", effective.event_cmd || "—")}
-      ${kv("通知命令", effective.notify_cmd || "—")}
+      ${kv("通知命令", effective.notify_cmd || "—", false, true)}
       ${kv("心跳", hasNum(effective.heartbeat_s) ? `${Number(effective.heartbeat_s)}s` : "—")}
-      ${kv("配置目录", effective.config_dir || launch.config_dir || "—")}
-      ${kv("进程", proc)}
+      ${kv("配置目录", effective.config_dir || launch.config_dir || "—", false, true)}
+      ${kv("进程", proc, false, true)}
       ${kv("客户端", `${launch.kind || "unknown"} ${launch.version || ""}`.trim())}
       ${kv("远程控制", controlText, sourceHint ? true : false)}
-      ${kv("工作目录", launch.cwd || "—")}
+      ${kv("工作目录", launch.cwd || "—", false, true)}
     </div>
     ${sourceHint ? `<div class="launchMeta warnv">${txt(sourceHint)}</div>` : ""}
     <details class="permDetails launchDetails">
@@ -4211,6 +4296,7 @@ function renderAgentDiag(client, live, available) {
 }
 
 let detailAgent = null;
+let detailHistoryPushed = false;
 let LAST_DETAIL = null;
 let detailRole = "agent";
 let detailReady = false;
@@ -4266,6 +4352,70 @@ function setDetailReady(on) {
     if (el) el.disabled = !on;
   }
 }
+let detailRecentHome = null;
+function setDetailMobileLayout() {
+  const body = document.querySelector("#detail .sheetBody");
+  const msgs = document.getElementById("dMsgs");
+  const subs = document.getElementById("dSubs");
+  if (!body || !msgs || !subs) return;
+  const mobile = window.matchMedia && window.matchMedia("(max-width:720px)").matches;
+  let box = document.getElementById("dRecentMobile");
+  if (mobile) {
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "dRecentMobile";
+      box.className = "recentMobile";
+    }
+    if (!detailRecentHome) {
+      detailRecentHome = {
+        parent: msgs.parentElement,
+        msgCap: msgs.previousElementSibling,
+        subCap: subs.previousElementSibling,
+        anchor: subs.nextElementSibling,
+      };
+    }
+    const launchBox = document.getElementById("dLaunchBox");
+    if (box.parentElement !== body) body.insertBefore(box, launchBox || document.getElementById("dMobileNav")?.nextSibling || body.firstChild);
+    const home = detailRecentHome;
+    if (home.msgCap && home.msgCap.parentElement !== box) box.append(home.msgCap);
+    if (msgs.parentElement !== box) box.append(msgs);
+    if (home.subCap && home.subCap.parentElement !== box) box.append(home.subCap);
+    if (subs.parentElement !== box) box.append(subs);
+    refreshRecentBlock();
+  } else if (box && detailRecentHome) {
+    const home = detailRecentHome;
+    home.parent.insertBefore(home.msgCap, home.anchor);
+    home.parent.insertBefore(msgs, home.anchor);
+    home.parent.insertBefore(home.subCap, home.anchor);
+    home.parent.insertBefore(subs, home.anchor);
+    box.remove();
+    detailRecentHome = null;
+  }
+}
+function refreshRecentBlock() {
+  const box = document.getElementById("dRecentMobile");
+  const msgs = document.getElementById("dMsgs");
+  const subs = document.getElementById("dSubs");
+  if (!box) return;
+  box.hidden = !((msgs && msgs.querySelector(".row")) || (subs && subs.querySelector(".row")));
+}
+function setDetailFoldDefaults() {
+  setDetailMobileLayout();
+  const mobile = window.matchMedia && window.matchMedia("(max-width:720px)").matches;
+  document.querySelectorAll("#detail .mobileFold").forEach((fold) => { fold.open = !mobile; });
+}
+function setupDetailMobileNav() {
+  document.querySelectorAll("#dMobileNav [data-jump]").forEach((btn) => {
+    btn.onclick = () => {
+      const target = $(btn.dataset.jump);
+      if (!target) return;
+      if (target.tagName === "DETAILS") target.open = true;
+      try { target.scrollIntoView({ behavior: "smooth", block: "start" }); }
+      catch { target.scrollIntoView(); }
+    };
+  });
+}
+setupDetailMobileNav();
 function openAgent(id, project, days = detailDays) {
   detailDays = [7, 30, 90].includes(Number(days)) ? Number(days) : 7;
   if (project && project !== current) {
@@ -4285,6 +4435,11 @@ function openAgent(id, project, days = detailDays) {
     if (!sameAgentRefresh) {
       const sheetBody = ov.querySelector(".sheetBody");
       if (sheetBody) sheetBody.scrollTop = 0;
+      setDetailFoldDefaults();
+      if (!detailHistoryPushed) {
+        try { history.pushState({ synapseDetail: true }, "", location.href); detailHistoryPushed = true; }
+        catch {}
+      }
     }
     ov.scrollTop = 0;
   }
@@ -4292,6 +4447,7 @@ function openAgent(id, project, days = detailDays) {
   $("dMeta").textContent = "加载中…";
   document.querySelectorAll("#detail [data-dq]").forEach((b) => { b.dataset.da = id; });
   $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
+  refreshRecentBlock();
   $("dStats").innerHTML = $("dTasks").innerHTML = $("dIssues").innerHTML = "";
   $("dLaunch").innerHTML = `<div class="scopeHint">客户端启动参数加载中…</div>`;
   $("dControl").innerHTML = `<div class="scopeHint">远程运行控制加载中…</div>`;
@@ -4376,7 +4532,7 @@ function openAgent(id, project, days = detailDays) {
     const subsMissing = d.stats_available?.submissions === false;
     const subTotal = hasNum(d.stats?.submissions_total) ? Number(d.stats.submissions_total) : null;
     $("dSubs").innerHTML = subsMissing ? `<div class="muted">交付列表读取失败</div>` : (d.submissions || []).map((x) => `
-      <div class="row subrow"><span class="mono subid">${x.submission_id}</span><span>${x.kind}</span>
+      <div class="row subrow"><span class="mono subid">${esc(x.submission_id)}</span><button type="button" class="mini copyField" data-copy="${esc(x.submission_id)}" title="复制 submission ID">复制</button><span>${x.kind}</span>
         <span class="badge ${x.state}">${x.state}</span>
         <span class="badge ${x.review_state || "pending"}">${{pending:"待裁决",accepted:"已收待批",approved:"已批准",rejected:"已拒收"}[x.review_state || "pending"] || "待裁决"}</span>
         ${x.task_id ? `<span class="muted mono">${x.task_id}</span>` : `<span class="warnv">未绑定任务</span>`}
@@ -4392,6 +4548,7 @@ function openAgent(id, project, days = detailDays) {
         : "列表未返回"}</div>`);
     // 详情页的下载按钮也要知道状态，否则会漏掉"下载即取走"
     (d.submissions || []).forEach((x) => SUB_STATE.set(x.submission_id, x.state));
+    refreshRecentBlock();
   }).catch((e) => {
     $("dMeta").textContent = "加载失败：" + e.message;
     $("dLaunch").innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
@@ -4407,6 +4564,7 @@ function openAgent(id, project, days = detailDays) {
     $("dIssues").innerHTML = `<div class="muted">详情读取失败</div>`;
     $("dSubs").innerHTML = `<div class="muted">详情读取失败</div>`;
     $("dMsgs").innerHTML = `<div class="muted">详情读取失败</div>`;
+    refreshRecentBlock();
     setDetailReady(false);
   });
 }
@@ -4611,7 +4769,11 @@ function decorateCards() {
       const now = c.classList.contains("maxed");
       max.textContent = now ? "⤡" : "⤢";
       document.body.classList.toggle("has-max", !!document.querySelector(".card.maxed"));
-      if (now) c.scrollTop = 0;
+      if (now) { c.scrollTop = 0; pushMaxHistory(); }
+      else if (maxHistoryPushed) {
+        maxHistoryPushed = false;
+        try { history.back(); } catch {}
+      }
       if (now && c.classList.contains("collapsed")) {
         c.classList.remove("collapsed");
         col.textContent = "▾";
@@ -4621,21 +4783,35 @@ function decorateCards() {
   });
 }
 
-// 全局退出最大化：固定按钮 + Esc，两者都不依赖卡片内部的滚动位置
+// 全局退出最大化：固定按钮 + Esc + 浏览器返回，三者都不依赖卡片内部滚动位置
+let maxHistoryPushed = false;
+function exitMaxCards(fromHistory = false) {
+  document.querySelectorAll(".card.maxed").forEach((c) => {
+    c.classList.remove("maxed");
+    const m = c.querySelector(".cardTools .ghost");
+    if (m) m.textContent = "⤢";
+  });
+  document.body.classList.remove("has-max");
+  if (!fromHistory && maxHistoryPushed) {
+    maxHistoryPushed = false;
+    try { history.back(); } catch {}
+  }
+}
+function pushMaxHistory() {
+  if (maxHistoryPushed) return;
+  maxHistoryPushed = true;
+  try { history.pushState({ synapseMax: true }, ""); } catch {}
+}
 (function bindMaxExit() {
   const btn = document.createElement("button");
   btn.id = "maxExit"; btn.textContent = "✕ 退出全屏"; btn.type = "button";
-  btn.onclick = () => {
-    document.querySelectorAll(".card.maxed").forEach((c) => {
-      c.classList.remove("maxed");
-      const m = c.querySelector(".cardTools .ghost");
-      if (m) m.textContent = "⤢";
-    });
-    document.body.classList.remove("has-max");
-  };
+  btn.onclick = () => exitMaxCards();
   document.body.appendChild(btn);
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && document.querySelector(".card.maxed")) btn.click();
+    if (e.key === "Escape" && document.querySelector(".card.maxed")) {
+      e.preventDefault();
+      exitMaxCards();
+    }
   });
 })();
 
@@ -5374,28 +5550,100 @@ const btnSendEl = $("btnSend");
 if (btnSendEl) btnSendEl.onclick = sendTargeted;
 const btnQuickEl = $("btnQuick");
 if (btnQuickEl) btnQuickEl.onclick = quickRun;
-function closeAgentDetail() {
+function anySheetOpen() {
+  return ["detail", "trendDetail", "issueDetail", "taskTimeline"].some((id) => {
+    const el = document.getElementById(id);
+    return el && !el.hidden;
+  });
+}
+function syncSheetLock() {
+  document.body.classList.toggle("has-sheet", anySheetOpen());
+}
+const sheetHistoryPushed = { trend: false, issue: false, timeline: false };
+function pushSheetHistory(key) {
+  if (sheetHistoryPushed[key]) return;
+  sheetHistoryPushed[key] = true;
+  try { history.pushState({ synapseSheet: key }, ""); } catch {}
+}
+function backSheetHistory(key) {
+  if (!sheetHistoryPushed[key]) return;
+  sheetHistoryPushed[key] = false;
+  try { history.back(); } catch {}
+}
+function hideAgentDetail() {
   const d = $("detail");
   if (!d) return;
   d.hidden = true; d.style.display = "";
-  document.body.classList.remove("has-sheet");
+  syncSheetLock();
   const body = d.querySelector(".sheetBody");
   if (body) body.scrollTop = 0;
 }
+function closeAgentDetail() {
+  hideAgentDetail();
+  if (detailHistoryPushed) {
+    detailHistoryPushed = false;
+    try { history.back(); } catch {}
+  }
+}
 const dCloseEl = $("dClose");
 if (dCloseEl) dCloseEl.onclick = closeAgentDetail;
-const dBackEl = $("dBack");
-if (dBackEl) dBackEl.onclick = closeAgentDetail;
+function closeIssueDetail(fromHistory = false) {
+  const d = $("issueDetail");
+  if (!d || d.hidden) return;
+  d.hidden = true;
+  if (!fromHistory) backSheetHistory("issue");
+  syncSheetLock();
+}
+function closeTaskTimeline(fromHistory = false) {
+  const d = $("taskTimeline");
+  if (!d || d.hidden) return;
+  d.hidden = true; d.style.display = "";
+  if (!fromHistory) backSheetHistory("timeline");
+  syncSheetLock();
+}
 const iCloseEl = $("issueDetailClose");
-if (iCloseEl) iCloseEl.onclick = () => { const d = $("issueDetail"); if (d) { d.hidden = true; document.body.classList.remove("has-sheet"); } };
+if (iCloseEl) iCloseEl.onclick = () => closeIssueDetail();
 const iOv = $("issueDetail");
-if (iOv) iOv.onclick = (e) => { if (e.target === iOv) { iOv.hidden = true; document.body.classList.remove("has-sheet"); } };
+if (iOv) iOv.onclick = (e) => { if (e.target === iOv) closeIssueDetail(); };
 const tlCloseEl = $("tlClose");
-if (tlCloseEl) tlCloseEl.onclick = () => { const d = $("taskTimeline"); if (d) { d.hidden = true; d.style.display = ""; document.body.classList.remove("has-sheet"); } };
+if (tlCloseEl) tlCloseEl.onclick = () => closeTaskTimeline();
 const tlOv = $("taskTimeline");
-if (tlOv) tlOv.onclick = (e) => { if (e.target === tlOv) { tlOv.hidden = true; tlOv.style.display = ""; document.body.classList.remove("has-sheet"); } };
+if (tlOv) tlOv.onclick = (e) => { if (e.target === tlOv) closeTaskTimeline(); };
 const dOv = $("detail");
-if (dOv) dOv.onclick = (e) => { if (e.target === dOv) { dOv.hidden = true; document.body.classList.remove("has-sheet"); } };
+if (dOv) dOv.onclick = (e) => { if (e.target === dOv) closeAgentDetail(); };
+window.addEventListener("popstate", () => {
+  if ($("trendDetail") && !$("trendDetail").hidden && sheetHistoryPushed.trend) {
+    sheetHistoryPushed.trend = false;
+    closeTrendSheet(true);
+    return;
+  }
+  if ($("issueDetail") && !$("issueDetail").hidden && sheetHistoryPushed.issue) {
+    sheetHistoryPushed.issue = false;
+    closeIssueDetail(true);
+    return;
+  }
+  if ($("taskTimeline") && !$("taskTimeline").hidden && sheetHistoryPushed.timeline) {
+    sheetHistoryPushed.timeline = false;
+    closeTaskTimeline(true);
+    return;
+  }
+  if ($("detail") && !$("detail").hidden && detailHistoryPushed) {
+    detailHistoryPushed = false;
+    hideAgentDetail();
+    return;
+  }
+  if (maxHistoryPushed && document.querySelector(".card.maxed")) {
+    maxHistoryPushed = false;
+    exitMaxCards(true);
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if ($("trendDetail") && !$("trendDetail").hidden) { e.preventDefault(); closeTrendSheet(); return; }
+  if ($("issueDetail") && !$("issueDetail").hidden) { e.preventDefault(); closeIssueDetail(); return; }
+  if ($("taskTimeline") && !$("taskTimeline").hidden) { e.preventDefault(); closeTaskTimeline(); return; }
+  if ($("detail") && !$("detail").hidden) { e.preventDefault(); closeAgentDetail(); }
+});
 
 const trendTile = $("dashTrendTile");
 if (trendTile) {
@@ -5403,7 +5651,7 @@ if (trendTile) {
   trendTile.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTrendSheet("global"); } };
 }
 const trendCloseEl = $("trendClose");
-if (trendCloseEl) trendCloseEl.onclick = closeTrendSheet;
+if (trendCloseEl) trendCloseEl.onclick = () => closeTrendSheet();
 const trendOv = $("trendDetail");
 if (trendOv) trendOv.onclick = (e) => { if (e.target === trendOv) closeTrendSheet(); };
 const trendRangeEl = $("trendRange");
