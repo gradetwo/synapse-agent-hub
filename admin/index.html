@@ -757,6 +757,7 @@ if (location.search.includes("reset=1")) {
       padding:calc(env(safe-area-inset-top) + 6px) 12px 6px;
       background:var(--surface-sheet-head);border-bottom:1px solid var(--line-soft)}
     #detail .sheetHead #dClose{grid-area:back;justify-self:start;width:44px;height:44px;min-width:44px!important;
+      display:flex;align-items:center;justify-content:center;
       padding:0;border:0;background:transparent;border-radius:12px;color:var(--fg);font-size:26px;line-height:1}
     #detail .sheetHead #dClose:active{background:var(--surface-hover)}
     #detail .sheetHead #dName{grid-area:title;font-size:15px}
@@ -773,15 +774,17 @@ if (location.search.includes("reset=1")) {
     #dMobileNav button:active{background:var(--surface-hover);color:var(--fg-strong)}
     #detail .mobileFold{border:1px solid var(--line-soft);border-radius:9px;
       background:var(--surface-1);margin:0 0 10px;padding:0;overflow:hidden}
-    #detail .mobileFold>summary{display:flex;align-items:center;gap:8px;padding:10px 12px;
-      cursor:pointer;list-style:none;font-size:12.5px;color:var(--fg-chip)}
+    #detail .mobileFold>summary{display:flex;align-items:center;gap:8px;min-height:44px;box-sizing:border-box;
+      padding:10px 12px;cursor:pointer;list-style:none;font-size:12.5px;color:var(--fg-chip)}
     #detail .mobileFold>summary::-webkit-details-marker{display:none}
     #detail .mobileFold>summary .lead{margin-left:auto;color:var(--dim-2);font-size:11px}
+    #detail .mobileFold>summary::after{content:"▾";color:var(--dim-2);font-size:12px;line-height:1;margin-left:2px}
+    #detail .mobileFold[open]>summary::after{content:"▴"}
     #detail .mobileFold[open]>summary{border-bottom:1px solid var(--line-faint);padding-bottom:8px}
     #detail .mobileFold>.launchCard{border:0;background:transparent;padding:10px;margin:0}
     #detail .mobileFold .launchTop .cap{display:none}
     #detail #dStats,#detail #dLaunchBox,#detail #dTasks,#detail #dMsgs,#detail #dSubs,#detail #dPermDetails{
-      scroll-margin-top:calc(env(safe-area-inset-top) + 110px)}
+      scroll-margin-top:calc(env(safe-area-inset-top) + 64px)}
     .copyField{display:inline-flex;position:relative;margin-top:4px;padding:1px 7px;height:20px;
       align-items:center;font-size:10px;line-height:1;border-radius:5px;touch-action:manipulation}
     .copyField::before{content:"";position:absolute;inset:-12px -8px}
@@ -2300,6 +2303,7 @@ async function showTaskTimeline(taskId) {
   $("tlBody").innerHTML = `<div class="scopeHint">加载中…</div>`;
   ov.hidden = false;
   ov.style.display = "flex";
+  raiseOverlay(ov);
   pushSheetHistory("timeline");
   syncSheetLock();
   try {
@@ -2899,6 +2903,7 @@ function showIssueDetail(issue) {
     issue.close_reason ? `关闭原因 ${issue.close_reason}` : ""].filter(Boolean).join(" · ");
   $("issueDetailBody").textContent = issue.body || "（无正文）";
   box.hidden = false;
+  raiseOverlay(box);
   pushSheetHistory("issue");
   syncSheetLock();
 }
@@ -3594,6 +3599,7 @@ function openTrendSheet(mode = "global", agent = null) {
   };
   $("trendTitle").textContent = "活动趋势";
   ov.hidden = false; ov.style.display = "flex";
+  raiseOverlay(ov);
   pushSheetHistory("trend");
   syncSheetLock();
   loadTrendSheet();
@@ -4431,6 +4437,7 @@ function openAgent(id, project, days = detailDays) {
   if (!sameAgentRefresh) LAST_DETAIL = null;
   if (ov) {
     ov.hidden = false; ov.style.display = "flex";
+    raiseOverlay(ov);
     document.body.classList.add("has-sheet");
     if (!sameAgentRefresh) {
       const sheetBody = ov.querySelector(".sheetBody");
@@ -4772,6 +4779,7 @@ function decorateCards() {
       if (now) { c.scrollTop = 0; pushMaxHistory(); }
       else if (maxHistoryPushed) {
         maxHistoryPushed = false;
+        suppressPopstate = true;
         try { history.back(); } catch {}
       }
       if (now && c.classList.contains("collapsed")) {
@@ -4794,6 +4802,7 @@ function exitMaxCards(fromHistory = false) {
   document.body.classList.remove("has-max");
   if (!fromHistory && maxHistoryPushed) {
     maxHistoryPushed = false;
+    suppressPopstate = true;
     try { history.back(); } catch {}
   }
 }
@@ -4808,7 +4817,7 @@ function pushMaxHistory() {
   btn.onclick = () => exitMaxCards();
   document.body.appendChild(btn);
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && document.querySelector(".card.maxed")) {
+    if (e.key === "Escape" && document.querySelector(".card.maxed") && !anySheetOpen()) {
       e.preventDefault();
       exitMaxCards();
     }
@@ -5550,16 +5559,30 @@ const btnSendEl = $("btnSend");
 if (btnSendEl) btnSendEl.onclick = sendTargeted;
 const btnQuickEl = $("btnQuick");
 if (btnQuickEl) btnQuickEl.onclick = quickRun;
+let overlayZ = 20;
+function raiseOverlay(el) {
+  if (!el) return;
+  overlayZ += 1;
+  el.style.zIndex = String(overlayZ);
+}
 function anySheetOpen() {
   return ["detail", "trendDetail", "issueDetail", "taskTimeline"].some((id) => {
     const el = document.getElementById(id);
     return el && !el.hidden;
   });
 }
+function topOpenSheet() {
+  return ["detail", "trendDetail", "issueDetail", "taskTimeline"]
+    .map((id) => document.getElementById(id))
+    .filter((el) => el && !el.hidden)
+    .sort((a, b) => (Number(getComputedStyle(b).zIndex) || 20) - (Number(getComputedStyle(a).zIndex) || 20))[0] || null;
+}
 function syncSheetLock() {
+  if (!anySheetOpen()) overlayZ = 20;
   document.body.classList.toggle("has-sheet", anySheetOpen());
 }
 const sheetHistoryPushed = { trend: false, issue: false, timeline: false };
+let suppressPopstate = false;
 function pushSheetHistory(key) {
   if (sheetHistoryPushed[key]) return;
   sheetHistoryPushed[key] = true;
@@ -5568,6 +5591,7 @@ function pushSheetHistory(key) {
 function backSheetHistory(key) {
   if (!sheetHistoryPushed[key]) return;
   sheetHistoryPushed[key] = false;
+  suppressPopstate = true;
   try { history.back(); } catch {}
 }
 function hideAgentDetail() {
@@ -5582,6 +5606,7 @@ function closeAgentDetail() {
   hideAgentDetail();
   if (detailHistoryPushed) {
     detailHistoryPushed = false;
+    suppressPopstate = true;
     try { history.back(); } catch {}
   }
 }
@@ -5612,24 +5637,22 @@ if (tlOv) tlOv.onclick = (e) => { if (e.target === tlOv) closeTaskTimeline(); };
 const dOv = $("detail");
 if (dOv) dOv.onclick = (e) => { if (e.target === dOv) closeAgentDetail(); };
 window.addEventListener("popstate", () => {
-  if ($("trendDetail") && !$("trendDetail").hidden && sheetHistoryPushed.trend) {
-    sheetHistoryPushed.trend = false;
-    closeTrendSheet(true);
-    return;
-  }
-  if ($("issueDetail") && !$("issueDetail").hidden && sheetHistoryPushed.issue) {
-    sheetHistoryPushed.issue = false;
-    closeIssueDetail(true);
-    return;
-  }
-  if ($("taskTimeline") && !$("taskTimeline").hidden && sheetHistoryPushed.timeline) {
-    sheetHistoryPushed.timeline = false;
-    closeTaskTimeline(true);
-    return;
-  }
-  if ($("detail") && !$("detail").hidden && detailHistoryPushed) {
-    detailHistoryPushed = false;
-    hideAgentDetail();
+  if (suppressPopstate) { suppressPopstate = false; return; }
+  const top = topOpenSheet();
+  if (top) {
+    if (top.id === "trendDetail") {
+      sheetHistoryPushed.trend = false;
+      closeTrendSheet(true);
+    } else if (top.id === "issueDetail") {
+      sheetHistoryPushed.issue = false;
+      closeIssueDetail(true);
+    } else if (top.id === "taskTimeline") {
+      sheetHistoryPushed.timeline = false;
+      closeTaskTimeline(true);
+    } else {
+      detailHistoryPushed = false;
+      hideAgentDetail();
+    }
     return;
   }
   if (maxHistoryPushed && document.querySelector(".card.maxed")) {
@@ -5639,10 +5662,13 @@ window.addEventListener("popstate", () => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if ($("trendDetail") && !$("trendDetail").hidden) { e.preventDefault(); closeTrendSheet(); return; }
-  if ($("issueDetail") && !$("issueDetail").hidden) { e.preventDefault(); closeIssueDetail(); return; }
-  if ($("taskTimeline") && !$("taskTimeline").hidden) { e.preventDefault(); closeTaskTimeline(); return; }
-  if ($("detail") && !$("detail").hidden) { e.preventDefault(); closeAgentDetail(); }
+  const top = topOpenSheet();
+  if (!top) return;
+  e.preventDefault();
+  if (top.id === "trendDetail") closeTrendSheet();
+  else if (top.id === "issueDetail") closeIssueDetail();
+  else if (top.id === "taskTimeline") closeTaskTimeline();
+  else closeAgentDetail();
 });
 
 const trendTile = $("dashTrendTile");
