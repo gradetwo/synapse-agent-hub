@@ -1429,20 +1429,40 @@ async function admin(req: Request, env: Env, url: URL) {
 
   if (p === "/admin/projects" && req.method === "POST") {
     const b: any = await req.json().catch(() => ({}));
-    if (!/^[a-z0-9-]{2,40}$/.test(String(b.project ?? ""))) return err(422, "bad_project_name");
-    const maxAgents = Math.max(1, Math.min(1000, Number(b.max_agents ?? 200)));
-    const maxStorage = Math.max(1, Math.min(10240, Number(b.max_storage_mb ?? 2048)));
-    const maxMsgs = Math.max(1, Math.min(1000, Number(b.max_msgs_per_min ?? 60)));
-    const retention = Math.max(1, Math.min(3650, Number(b.retention_days ?? 30)));
-    await env.DB.prepare(
+    const project = String(b.project ?? "").trim();
+    if (!/^[a-z0-9-]{2,40}$/.test(project)) return err(422, "bad_project_name");
+    const boundedInt = (v: any, fallback: number, min: number, max: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback;
+    };
+    const maxAgents = boundedInt(b.max_agents, 200, 1, 1000);
+    const maxStorage = boundedInt(b.max_storage_mb, 2048, 1, 10240);
+    const maxMsgs = boundedInt(b.max_msgs_per_min, 60, 1, 1000);
+    const retention = boundedInt(b.retention_days, 30, 1, 3650);
+    const displayName = String(b.display_name ?? project).trim().slice(0, 80) || project;
+    // 重复创建不能静默成功：控制台需要知道“已有项目、配额没改”，否则
+    // 用户会以为新建的配额已经生效。
+    const existing = await env.DB.prepare(
+      "SELECT display_name, status, max_agents, max_storage_mb, max_msgs_per_min, retention_days FROM projects WHERE project = ?"
+    ).bind(project).first<any>();
+    if (existing) {
+      return Response.json({
+        ok: true, created: false, existing: true, project,
+        quotas: { max_agents: existing.max_agents, max_storage_mb: existing.max_storage_mb,
+                  max_msgs_per_min: existing.max_msgs_per_min, retention_days: existing.retention_days },
+      });
+    }
+    const inserted = await env.DB.prepare(
       `INSERT OR IGNORE INTO projects
          (project, display_name, status, max_agents, max_storage_mb, max_msgs_per_min,
           retention_days, created_at)
        VALUES (?,?, 'active', ?,?,?,?,?)`
-    ).bind(b.project, b.display_name ?? b.project, maxAgents, maxStorage, maxMsgs,
-           retention, Date.now()).run();
-    return Response.json({ ok: true, quotas: { max_agents: maxAgents, max_storage_mb: maxStorage,
-      max_msgs_per_min: maxMsgs, retention_days: retention } });
+    ).bind(project, displayName, maxAgents, maxStorage, maxMsgs, retention, Date.now()).run();
+    return Response.json({
+      ok: true, created: Number(inserted.meta.changes ?? 0) > 0, project, display_name: displayName,
+      quotas: { max_agents: maxAgents, max_storage_mb: maxStorage, max_msgs_per_min: maxMsgs,
+                retention_days: retention },
+    });
   }
 
   if (p === "/ver") return json({ ...(await versionPayload()), at: Date.now() });

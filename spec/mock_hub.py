@@ -21,7 +21,9 @@ from urllib.parse import urlparse, parse_qs
 LEASE_TTL = 3
 HB_PERIOD = 60
 LOCK = threading.RLock()
-PROJECTS = {"yanshi": {"project": "yanshi", "display_name": "偃师", "status": "active"}}
+PROJECTS = {"yanshi": {"project": "yanshi", "display_name": "偃师", "status": "active",
+                        "max_agents": 200, "max_storage_mb": 2048, "max_msgs_per_min": 60,
+                        "retention_days": 30, "created_at": int(time.time() * 1000)}}
 POLICY = {"mode": "all", "projects": []}
 STATE = {}          # project -> dict(seq, msgs, dedupe, hb, tasks, acks, bc, superseded)
 SUBS = {}           # (project, sid) -> dict
@@ -233,9 +235,20 @@ class H(BaseHTTPRequestHandler):
 
         if seg[:1] == ["admin"]:
             if seg == ["admin", "projects"]:
-                PROJECTS[b["project"]] = {"project": b["project"],
-                                          "display_name": b.get("display_name", b["project"]), "status": "active"}
-                return self._out({"ok": True})
+                project = b["project"]
+                if project in PROJECTS:
+                    return self._out({"ok": True, "created": False, "existing": True, "project": project})
+                PROJECTS[project] = {
+                    "project": project,
+                    "display_name": b.get("display_name", project),
+                    "status": "active",
+                    "max_agents": b.get("max_agents", 200),
+                    "max_storage_mb": b.get("max_storage_mb", 2048),
+                    "max_msgs_per_min": b.get("max_msgs_per_min", 60),
+                    "retention_days": b.get("retention_days", 30),
+                    "created_at": int(time.time() * 1000),
+                }
+                return self._out({"ok": True, "created": True, "project": project})
             if seg == ["admin", "visibility"]:
                 POLICY.update(mode=b.get("mode", "all"), projects=b.get("projects", []))
                 return self._out({"ok": True})

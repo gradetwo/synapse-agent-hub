@@ -679,7 +679,7 @@ paths:
                 max_storage_mb: { type: integer, default: 2048 }
                 max_msgs_per_min: { type: integer, default: 60 }
                 retention_days: { type: integer, default: 30 }
-      responses: { '200': { description: ok + quotas } }
+      responses: { '200': { description: ok + created + quotas；重复创建返回 created=false，不改已有配额 } }
   /admin/visibility:
     get:
       summary: 读取可见性策略

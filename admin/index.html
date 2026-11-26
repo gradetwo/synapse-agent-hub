@@ -542,6 +542,29 @@ if (location.search.includes("reset=1")) {
   .projChip b{font-size:12px;font-weight:600}
   .projChip span{font-size:11px;color:var(--dim);white-space:nowrap}
   .projChip:hover{border-color:var(--accent-border);background:var(--surface-accent)}
+  .projGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:0 14px 14px}
+  .projItem{display:grid;gap:9px;min-width:0;padding:12px;border:1px solid var(--line-soft);
+    border-radius:10px;background:var(--surface-1)}
+  .projTop{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
+  .projTop b{font-size:13px;font-weight:600;min-width:0;overflow-wrap:anywhere}
+  .projTop .mono{color:var(--dim-2);font-size:10.5px}
+  .projTop .spacer{margin-left:auto}
+  .projQuota{display:flex;flex-wrap:wrap;gap:5px}
+  .projQuota span{padding:2px 7px;border:1px solid var(--line-soft);border-radius:6px;
+    color:var(--dim-2);font-size:10.5px;white-space:nowrap}
+  .projFoot{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:28px}
+  .projFoot .muted{font-size:10.5px}
+  .projFoot .mini{flex:0 0 auto}
+  .inlineCheck{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--dim);
+    min-height:38px;cursor:pointer}
+  .inlineCheck[hidden]{display:none!important}
+  .inlineCheck input{width:auto;min-height:0;margin:0}
+  #projCreateForm .projAction{grid-template-columns:220px minmax(0,1fr);align-items:center}
+  @media(max-width:700px){
+    .projGrid{grid-template-columns:1fr;padding:0 10px 12px}
+    .projFoot .mini{min-height:38px}
+    #projCreateForm .row,#projCreateForm .projAction{grid-template-columns:1fr}
+  }
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
 .dashTile.clickable{cursor:pointer}
 .dashTile.clickable:hover,.dashTile.clickable:focus-visible{border-color:var(--accent-border);background:var(--surface-accent-hover);outline:0}
@@ -878,6 +901,31 @@ if (location.search.includes("reset=1")) {
       </div>
     </div>
   </div>
+  <div class="card">
+    <h2>项目管理 <span class="muted" id="projMgrStat"></span></h2>
+    <div class="scopeHint" style="margin:0 14px 8px">新建项目后，再到“接入”页签发 token 或让 agent 自助注册。项目名只支持小写字母、数字和短横线。</div>
+    <div class="form" id="projCreateForm" style="padding-bottom:10px">
+      <div class="row">
+        <label>项目 ID<input id="npId" placeholder="例如 acme-web" maxlength="40" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
+        <label>显示名称<input id="npName" placeholder="例如 Acme Web" maxlength="80" autocomplete="off"></label>
+      </div>
+      <div class="row">
+        <label>Agent 上限<input id="npAgents" type="number" min="1" max="1000" step="1" value="200"></label>
+        <label>存储上限（MB）<input id="npStorage" type="number" min="1" max="10240" step="1" value="2048"></label>
+      </div>
+      <div class="row">
+        <label>消息上限（条/分钟）<input id="npMsgs" type="number" min="1" max="1000" step="1" value="60"></label>
+        <label>数据保留（天）<input id="npRetention" type="number" min="1" max="3650" step="1" value="30"></label>
+      </div>
+      <div class="row projAction">
+        <button class="primary" id="npCreate" type="button">创建项目</button>
+        <label class="inlineCheck" id="npVisibleWrap" hidden><input id="npVisible" type="checkbox" checked> 创建后加入可见项目</label>
+      </div>
+      <div class="scopeHint" id="npHint">创建后会出现在顶部项目下拉；重复创建不会覆盖已有配额。配额目前只能在创建时设定。</div>
+    </div>
+    <div class="projGrid" id="projRows"><div class="empty">加载中…</div></div>
+  </div>
+
   <div class="card">
     <h2>注册审批 <span class="muted" id="enrStat"></span></h2>
     <div class="scopeHint" style="margin:-2px 0 8px">批准前可直接修改 Agent ID；批准后新 ID 会通过注册轮询下发给节点。</div>
@@ -1365,6 +1413,7 @@ const deepEsc = (v) => Array.isArray(v) ? v.map(deepEsc)
 let policy = { mode: "all", projects: [] };
 let current = "";
 let allProjects = [];
+let PROJECTS_HIDDEN = 0;
 let refreshEpoch = 0;              // 切换项目/并发刷新时，旧请求只能静默丢弃
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
@@ -1576,6 +1625,8 @@ async function loadProjects() {
   const d = await api("/admin/projects");
   policy = d.policy;
   allProjects = d.projects || [];
+  PROJECTS_HIDDEN = Math.max(0, Number(d.hidden ?? 0) || 0);
+  syncProjectVisibilityOption();
   const sel = $("proj");
   sel.innerHTML = `<option value="*">全部项目</option>` + d.projects.map(p =>
     `<option value="${esc(p.project)}">${esc(decEsc(p.display_name))}</option>`).join("");
@@ -1589,10 +1640,149 @@ async function loadProjects() {
   }
   sel.value = current;
   try { localStorage.setItem("hub.project", current); } catch {}
+  renderProjectList();
   updateScopeLabel();
   fillDetailProjects();
   connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
 }
+
+function projectStatusMeta(status) {
+  const s = String(status || "").toLowerCase();
+  if (s === "paused") return { label: "已暂停", badge: "released" };
+  if (s === "archived") return { label: "已归档", badge: "archived" };
+  return { label: "运行中", badge: "done" };
+}
+
+function renderProjectList() {
+  const host = $("projRows");
+  if (!host) return;
+  const rows = allProjects || [];
+  const stat = $("projMgrStat");
+  if (stat) {
+    stat.textContent = `${rows.length} 个可见`
+      + (PROJECTS_HIDDEN ? ` · ${PROJECTS_HIDDEN} 个被可见性策略隐藏` : "");
+  }
+  if (!rows.length) {
+    host.innerHTML = `<div class="empty" style="grid-column:1/-1">还没有项目。在上面的表单里创建第一个项目。</div>`;
+    return;
+  }
+  host.innerHTML = rows.map((p) => {
+    const pid = esc(decEsc(p.project));
+    const name = esc(decEsc(p.display_name || p.project));
+    const st = projectStatusMeta(p.status);
+    let created = "—";
+    if (hasNum(p.created_at)) {
+      const d = new Date(Number(p.created_at));
+      if (Number.isFinite(d.getTime())) created = d.toLocaleDateString("zh-CN");
+    }
+    const quota = [
+      `Agent ${numOrDash(p.max_agents)}`,
+      `存储 ${numOrDash(p.max_storage_mb)} MB`,
+      `消息 ${numOrDash(p.max_msgs_per_min)}/分`,
+      `保留 ${numOrDash(p.retention_days)} 天`,
+    ].map((t) => `<span>${esc(t)}</span>`).join("");
+    return `<article class="projItem">
+      <div class="projTop"><b>${name}</b><span class="badge ${st.badge}">${st.label}</span>
+        ${p.project === current ? '<span class="badge approved">当前</span>' : ''}
+        <span class="mono spacer">${pid}</span></div>
+      <div class="projQuota">${quota}</div>
+      <div class="projFoot"><span class="muted">创建 ${esc(created)}</span>
+        ${String(p.status || "").toLowerCase() === "archived"
+          ? '<span class="muted">只读存档</span>'
+          : `<button class="mini" type="button" data-goto-project="${pid}" title="切到该项目">切到项目</button>`}</div>
+    </article>`;
+  }).join("");
+}
+
+function syncProjectVisibilityOption() {
+  const wrap = $("npVisibleWrap");
+  if (!wrap) return;
+  const isList = policy.mode === "list";
+  wrap.hidden = !isList;
+  if (isList) $("npVisible").checked = true;
+}
+
+function projectIntField(id, label, min, max) {
+  const n = Number($(id).value);
+  if (!Number.isFinite(n) || n < min || n > max)
+    throw new Error(`${label}需为 ${min}–${max} 的整数`);
+  return Math.floor(n);
+}
+
+async function createProject() {
+  const btn = $("npCreate");
+  const hint = $("npHint");
+  const id = ($("npId").value || "").trim().toLowerCase();
+  if (!/^[a-z0-9-]{2,40}$/.test(id)) {
+    hint.textContent = "项目 ID 需为 2–40 位小写字母、数字或短横线，例如 acme-web。";
+    $("npId").focus();
+    return;
+  }
+  let agents, storage, msgs, retention;
+  try {
+    agents = projectIntField("npAgents", "Agent 上限", 1, 1000);
+    storage = projectIntField("npStorage", "存储上限", 1, 10240);
+    msgs = projectIntField("npMsgs", "消息上限", 1, 1000);
+    retention = projectIntField("npRetention", "保留天数", 1, 3650);
+  } catch (e) {
+    hint.textContent = e.message;
+    return;
+  }
+  const visible = policy.mode === "list" && $("npVisible").checked;
+  btn.disabled = true;
+  btn.textContent = "创建中…";
+  hint.textContent = `正在创建 ${id}…`;
+  try {
+    const r = await api("/admin/projects", "POST", {
+      project: id,
+      display_name: ($("npName").value || "").trim() || id,
+      max_agents: agents,
+      max_storage_mb: storage,
+      max_msgs_per_min: msgs,
+      retention_days: retention,
+    });
+    let visibilityChanged = false;
+    if (visible && !policy.projects.includes(id)) {
+      await api("/admin/visibility", "POST", {
+        mode: "list", projects: [...policy.projects, id],
+      });
+      visibilityChanged = true;
+    }
+    await loadProjects();
+    const listed = (allProjects || []).some((p) => p.project === id);
+    if (listed) {
+      activateProject(id);
+      await refresh();
+    }
+    const existed = r && r.created === false;
+    if (existed) {
+      showToast(`项目 ${id} 已存在，本次未修改已有配额`, 8000);
+    } else if (!listed && policy.mode === "list") {
+      showToast(`项目 ${id} 已创建，但未加入可见列表；点“可见性”加入后才能在这里看到`, 9000);
+    } else if (!listed) {
+      showToast(`项目 ${id} 已创建`, 5000);
+    } else {
+      showToast(`项目 ${id} 已创建，已切换到该项目${visibilityChanged ? "并加入可见列表" : ""}`, 6000);
+    }
+    if (!existed) {
+      $("npId").value = "";
+      $("npName").value = "";
+      hint.textContent = `已创建 ${id}。下一步：到“接入”页签发 token，或让 agent 自助注册。`;
+    } else {
+      hint.textContent = `项目 ${id} 已存在；如需修改配额，请先在项目台账里确认。`;
+    }
+  } catch (e) {
+    if (!(e instanceof AuthError)) {
+      hint.textContent = `创建失败：${e.message || e}`;
+      showToast(`创建项目失败：${e.message || e}`, 9000);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "创建项目";
+  }
+}
+
+$("npCreate").onclick = createProject;
 
 function updateScopeLabel() {
   const el = $("scope");
@@ -1674,6 +1864,7 @@ function activateProject(project) {
   renderObservability();
   fillDetailProjects();
   connectLive();
+  renderProjectList();
 }
 
 /** 表格行全部用 DOM API 组装：服务端字段只进 textContent / setAttribute，绝不拼进 innerHTML。 */
@@ -4754,7 +4945,7 @@ function decorateCards() {
     // 标题只取 h2 的首个文本节点，避免把动态状态/计数带进 localStorage 的折叠 key。
     const title = ((h.firstChild && h.firstChild.nodeType === 3 ? h.firstChild.textContent : h.textContent) || "")
       .trim().replace(/[▸▾⤢⤡]/g, "").trim();
-    const keep = /^(概览|名册|注册审批|签发 token|效率观测)/.test(title);
+    const keep = /^(概览|项目管理|名册|注册审批|签发 token|效率观测)/.test(title);
     const key = `hub.fold2.${title}`;
     let folded = !keep;
     try {
@@ -4997,6 +5188,7 @@ function bindFilters() {
 
 const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "效率观测", "名册"] },
+  { id: "project",  label: "项目", cards: ["项目管理"] },
   { id: "task",     label: "任务", cards: ["任务", "效率观测"] },
   { id: "issue",    label: "Issue", cards: ["Issue"] },
   { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
@@ -5109,6 +5301,10 @@ function syncBulkAvailability() {
 }
 
 function bindBulk() {
+  // 项目：可见性当前只有白名单/全量两种模式，入口放在项目卡片上，
+  // 避免用户新建项目后在顶部“可见性”里找不到。
+  const projCard = cardByTitle("项目管理");
+  if (projCard) addCardBtn(projCard, "可见性", settings);
   // 注册审批：一次批完，不用逐个点
   const enr = cardByTitle("注册审批");
   if (enr) addCardBtn(enr, "全部批准", async () => {
