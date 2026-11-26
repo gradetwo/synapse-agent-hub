@@ -365,6 +365,7 @@ export default {
         { required_scope: requiredScope, granted_scopes: auth.scopes ?? [],
           hint: `当前 token 缺少 ${requiredScope} scope。先 GET /p/${project}/whoami 核对 scopes，再找管理员换发/扩权；不要改用 /x/admin 绕过权限。` });
     if (auth.projectStatus === "paused" && req.method !== "GET") return err(423, "project_paused");
+    if (auth.projectStatus === "archived" && req.method !== "GET") return err(423, "project_archived");
 
     // 普通 agent 的主动调用记录：心跳/自动 ack/收件不算，其余接口都算“有动作”，
     // 避免把一直在 wait 的节点误判为空闲。写 D1 异步执行，不拖慢原请求。
@@ -562,6 +563,8 @@ async function enroll(req: Request, env: Env, url: URL, path: string) {
   if (!/^[a-f0-9]{64}$/.test(tokenSha)) return err(422, "bad_token_sha");
   const p = await env.DB.prepare("SELECT status FROM projects WHERE project = ?").bind(project).first<any>();
   if (!p) return err(404, "unknown_project");
+  if (String(p.status ?? "active") !== "active")
+    return err(423, String(p.status) === "archived" ? "project_archived" : "project_paused");
   // 同一个 agent 用同一个 token 重复注册时，复用已有待审申请，避免生成两条
   // 相同 token 的 enrollment；否则审批后一条会撞 agents 的唯一键。
   const samePending = await env.DB.prepare(
@@ -796,6 +799,39 @@ async function projectQuota(env: Env, project: string) {
   };
 }
 
+/** 项目配置的可审计快照；不要把 SQL 行的扩展字段带进 JSON。 */
+function projectConfigOf(row: any) {
+  return {
+    project: String(row?.project ?? ""),
+    display_name: String(row?.display_name ?? ""),
+    status: String(row?.status ?? "active"),
+    max_agents: Number(row?.max_agents ?? 200),
+    max_storage_mb: Number(row?.max_storage_mb ?? 2048),
+    max_msgs_per_min: Number(row?.max_msgs_per_min ?? 60),
+    retention_days: Number(row?.retention_days ?? 30),
+  };
+}
+
+/** 审计写入失败不能阻断配置变更；旧库未迁移时控制台会显示“暂无记录”。 */
+async function auditProjectChange(
+  env: Env, project: string, action: string, actor: string, before: any, after: any,
+) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO project_audit (project, action, actor, at, before_json, after_json)
+       VALUES (?,?,?,?,?,?)`
+    ).bind(project, action, String(actor || "admin").slice(0, 120), Date.now(),
+           JSON.stringify(before ?? {}), JSON.stringify(after ?? {})).run();
+  } catch (e) {
+    console.warn("project audit write failed", project, action, e);
+  }
+}
+
+function projectConfigChanged(before: any, after: any) {
+  return ["display_name", "status", "max_agents", "max_storage_mb", "max_msgs_per_min", "retention_days"]
+    .some((k) => before[k] !== after[k]);
+}
+
 /** 当前项目 DO 里的任务横幅；Worker 侧只用它做口径复核，不改状态。 */
 async function taskListFromDo(stub: any): Promise<any[]> {
   try {
@@ -988,6 +1024,7 @@ async function artifact(req: Request, env: Env, project: string, action: string)
   const sha = action.replace(/^artifact\//, "");
   if (!/^[a-f0-9]{64}$/.test(sha)) return err(400, "bad_sha");
   if (auth.projectStatus === "paused" && req.method === "PUT") return err(423, "project_paused");
+  if (auth.projectStatus === "archived" && req.method === "PUT") return err(423, "project_archived");
 
   if (req.method === "PUT" && !canWrite)
     return err(403, "insufficient_scope", { required_scope: "artifact.write",
@@ -1037,25 +1074,29 @@ async function admin(req: Request, env: Env, url: URL) {
   let identityEmail = "";
   let viaSession = false;
   let sessionWho = "";
+  let actor = "admin";
 
   if (bearer) {
     const sha = await sha256(bearer);
     const row = await env.DB.prepare(
-      `SELECT role FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL
+      `SELECT project, agent_id, role FROM agents WHERE token_sha = ? AND role = 'admin' AND revoked_at IS NULL
          AND (expires_at IS NULL OR expires_at > ?)`
     ).bind(sha, Date.now()).first<any>();
     authorized = !!row;
+    // Bearer admin token 没有邮箱；审计里至少留下 token 所属项目和 agent_id。
+    if (row) actor = `token:${row.project ?? "-"}/${row.agent_id ?? "admin"}`;
+    else actor = "admin-token";
   } else {
     // 浏览器：Access JWT（验签）/ Access cookie 身份 / HttpOnly 会话 cookie
     const jwt = await verifyAccessJwt(req, env);
-    if (jwt) { authorized = true; identityEmail = String(jwt.email ?? ""); }
+    if (jwt) { authorized = true; identityEmail = String(jwt.email ?? ""); actor = identityEmail || "access"; }
     if (!authorized) {
       const cookieEmail = await accessIdentityFromCookie(req);
-      if (cookieEmail) { authorized = true; identityEmail = cookieEmail; }
+      if (cookieEmail) { authorized = true; identityEmail = cookieEmail; actor = cookieEmail; }
     }
     if (!authorized) {
       const sess = await readSession(req, env);
-      if (sess) { authorized = true; viaSession = true; sessionWho = sess; }
+      if (sess) { authorized = true; viaSession = true; sessionWho = sess; actor = sess || "session"; }
     }
   }
   if (authorized && !bearer) {
@@ -1424,7 +1465,11 @@ async function admin(req: Request, env: Env, url: URL) {
     const policy = await loadPolicy(env);
     const rows = (await env.DB.prepare("SELECT * FROM projects ORDER BY created_at").all<any>()).results;
     const visible = policy.mode === "all" ? rows : rows.filter((r) => policy.projects.includes(r.project));
-    return Response.json({ policy, projects: visible, hidden: rows.length - visible.length });
+    // 可见性编辑器需要看到被策略隐藏的项目，否则无法把隐藏项目加回白名单。
+    // 只有通过 admin 鉴权才会走到这里；普通管理列表仍只返回 visible。
+    const includeHidden = url.searchParams.get("include_hidden") === "1";
+    return Response.json({ policy, projects: visible, hidden: rows.length - visible.length,
+                           ...(includeHidden ? { all_projects: rows } : {}) });
   }
 
   if (p === "/admin/projects" && req.method === "POST") {
@@ -1443,26 +1488,113 @@ async function admin(req: Request, env: Env, url: URL) {
     // 重复创建不能静默成功：控制台需要知道“已有项目、配额没改”，否则
     // 用户会以为新建的配额已经生效。
     const existing = await env.DB.prepare(
-      "SELECT display_name, status, max_agents, max_storage_mb, max_msgs_per_min, retention_days FROM projects WHERE project = ?"
+      "SELECT * FROM projects WHERE project = ?"
     ).bind(project).first<any>();
     if (existing) {
       return Response.json({
         ok: true, created: false, existing: true, project,
+        display_name: existing.display_name,
+        status: existing.status,
         quotas: { max_agents: existing.max_agents, max_storage_mb: existing.max_storage_mb,
                   max_msgs_per_min: existing.max_msgs_per_min, retention_days: existing.retention_days },
       });
     }
+    const now = Date.now();
     const inserted = await env.DB.prepare(
       `INSERT OR IGNORE INTO projects
          (project, display_name, status, max_agents, max_storage_mb, max_msgs_per_min,
-          retention_days, created_at)
-       VALUES (?,?, 'active', ?,?,?,?,?)`
-    ).bind(project, displayName, maxAgents, maxStorage, maxMsgs, retention, Date.now()).run();
+          retention_days, created_at, created_by, updated_by, updated_at)
+       VALUES (?,?, 'active', ?,?,?,?,?,?,?,?)`
+    ).bind(project, displayName, maxAgents, maxStorage, maxMsgs, retention, now, actor, actor, now).run();
+    const created = Number(inserted.meta.changes ?? 0) > 0;
+    if (created) {
+      await auditProjectChange(env, project, "create", actor, {}, {
+        project, display_name: displayName, status: "active", max_agents: maxAgents,
+        max_storage_mb: maxStorage, max_msgs_per_min: maxMsgs, retention_days: retention,
+      });
+    }
     return Response.json({
-      ok: true, created: Number(inserted.meta.changes ?? 0) > 0, project, display_name: displayName,
+      ok: true, created, project, display_name: displayName, status: "active",
+      created_by: actor, updated_by: actor, updated_at: now,
       quotas: { max_agents: maxAgents, max_storage_mb: maxStorage, max_msgs_per_min: maxMsgs,
                 retention_days: retention },
     });
+  }
+
+  // 修改已有项目的显示名/状态/四项配额；项目 ID 不可改，避免 token/产物路径换根。
+  const projectUpdate = p.match(/^\/admin\/projects\/([a-z0-9-]{2,40})$/);
+  if (projectUpdate && req.method === "PATCH") {
+    const project = projectUpdate[1];
+    const row = await env.DB.prepare("SELECT * FROM projects WHERE project = ?")
+      .bind(project).first<any>();
+    if (!row) return err(404, "project_not_found");
+    const b: any = await req.json().catch(() => ({}));
+    const status = b.status === undefined ? String(row.status ?? "active") : String(b.status ?? "").toLowerCase();
+    if (!["active", "paused", "archived"].includes(status))
+      return err(422, "bad_project_status", { hint: "status 只能是 active / paused / archived" });
+    const displayName = b.display_name === undefined
+      ? String(row.display_name ?? project)
+      : String(b.display_name ?? "").trim().slice(0, 80) || project;
+    const badQuota = (key: string) => err(422, "bad_project_quota", {
+      hint: `${key} 必须是范围内的整数`,
+    });
+    const quotaFields: Array<[string, number, number, number]> = [
+      ["max_agents", Number(row.max_agents ?? 200), 1, 1000],
+      ["max_storage_mb", Number(row.max_storage_mb ?? 2048), 1, 10240],
+      ["max_msgs_per_min", Number(row.max_msgs_per_min ?? 60), 1, 1000],
+      ["retention_days", Number(row.retention_days ?? 30), 1, 3650],
+    ];
+    const next: any = {};
+    for (const [key, fallback, min, max] of quotaFields) {
+      if (b[key] === undefined) { next[key] = fallback; continue; }
+      const n = Number(b[key]);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max)
+        return badQuota(key);
+      next[key] = n;
+    }
+    const before = projectConfigOf(row);
+    const after = { project, display_name: displayName, status,
+                    max_agents: next.max_agents, max_storage_mb: next.max_storage_mb,
+                    max_msgs_per_min: next.max_msgs_per_min, retention_days: next.retention_days };
+    if (!projectConfigChanged(before, after)) {
+      return Response.json({ ok: true, changed: false, project, before, after,
+                             updated_by: row.updated_by ?? null, updated_at: row.updated_at ?? null });
+    }
+    const now = Date.now();
+    await env.DB.prepare(
+      `UPDATE projects SET display_name = ?, status = ?, max_agents = ?, max_storage_mb = ?,
+         max_msgs_per_min = ?, retention_days = ?, updated_by = ?, updated_at = ?
+       WHERE project = ?`
+    ).bind(displayName, status, next.max_agents, next.max_storage_mb, next.max_msgs_per_min,
+           next.retention_days, actor, now, project).run();
+    await auditProjectChange(env, project, "update", actor, before, after);
+    return Response.json({ ok: true, changed: true, project, before, after,
+                           updated_by: actor, updated_at: now });
+  }
+
+  // 项目变更审计：默认只回最近 20 条，管理台编辑器展开时读取。
+  const projectAudit = p.match(/^\/admin\/projects\/([a-z0-9-]{2,40})\/audit$/);
+  if (projectAudit && req.method === "GET") {
+    const project = projectAudit[1];
+    const rawLimit = Number(url.searchParams.get("limit") ?? 20);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.floor(rawLimit))) : 20;
+    let rows: any[] = [];
+    let migrationRequired = false;
+    try {
+      const result = await env.DB.prepare(
+        "SELECT id, action, actor, at, before_json, after_json FROM project_audit " +
+        "WHERE project = ? ORDER BY at DESC, id DESC LIMIT ?"
+      ).bind(project, limit).all<any>();
+      rows = result.results ?? [];
+    } catch {
+      migrationRequired = true;
+    }
+    const entries = rows.map((r: any) => {
+      const parse = (v: any) => { try { return JSON.parse(String(v ?? "{}")); } catch { return {}; } };
+      return { id: r.id, action: r.action, actor: r.actor, at: r.at,
+               before: parse(r.before_json), after: parse(r.after_json) };
+    });
+    return json({ ok: true, project, entries, migration_required: migrationRequired });
   }
 
   if (p === "/ver") return json({ ...(await versionPayload()), at: Date.now() });
@@ -4591,6 +4723,7 @@ const ERROR_HINTS: Record<string, string> = {
   not_authenticated: "缺少 Bearer token 或有效会话。节点请带 Authorization: Bearer <token>；不要用 query/cookie 传递节点 token。",
   insufficient_scope: "当前 token 的 scope 不足。先 GET /p/{project}/whoami 查看 scopes，再找管理员换发/扩权；不要改用 /x/admin 绕过权限。",
   project_paused: "项目 status=paused，写操作被 423 拒绝；读接口仍可用。联系管理员恢复项目状态后重试。",
+  project_archived: "项目 status=archived，写操作被 423 拒绝；读接口仍可用。联系管理员在项目配置里恢复为 active。",
   unknown_action: "当前服务端没有这个 action。先读 GET /capabilities 和 GET /skill；节点给管理员发消息用 POST /p/{project}/publish，不要用 /send。",
   wrong_endpoint: "接口层级或方向用错了。先读本响应里的 hint/use，再按 /skill 的对应章节调用；不要靠猜 endpoint。",
   no_task_available: "当前没有可领取任务。先 GET /p/{project}/tasks?mine=1 看名下任务；公共池 GET /p/{project}/tasks；还在 queued 的任务等系统下发。",

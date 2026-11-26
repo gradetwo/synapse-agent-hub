@@ -555,15 +555,75 @@ if (location.search.includes("reset=1")) {
   .projFoot{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:28px}
   .projFoot .muted{font-size:10.5px}
   .projFoot .mini{flex:0 0 auto}
+  .projBtns{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
   .inlineCheck{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--dim);
     min-height:38px;cursor:pointer}
   .inlineCheck[hidden]{display:none!important}
   .inlineCheck input{width:auto;min-height:0;margin:0}
   #projCreateForm .projAction{grid-template-columns:220px minmax(0,1fr);align-items:center}
+  .projEditor{margin:0 14px 12px;padding:12px;border:1px solid var(--accent-border);
+    border-radius:10px;background:var(--surface-accent)}
+  .projEditor[hidden]{display:none!important}
+  .projEditorHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+  .projEditorHead b{font-size:13px;color:var(--fg-strong)}
+  .projEditorHead .mono{color:var(--dim-2);font-size:10.5px}
+  .projEditorHead .spacer{margin-left:auto}
+  .projEditor .form{padding:10px 0 0}
+  .projEditor .row{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .projEditor .projAction{grid-template-columns:220px auto minmax(160px,1fr);align-items:center}
+  .projEditor .projAction .scopeHint{margin:0}
+  .projAudit{margin-top:8px;border-top:1px solid var(--line-soft);padding-top:8px}
+  .projAuditHead{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--dim)}
+  .projAuditHead b{color:var(--fg-chip)}
+  .projAuditHead .spacer{margin-left:auto}
+  .projAuditRows{display:grid;gap:5px;max-height:150px;overflow:auto;margin-top:6px}
+  .projAuditRow{display:flex;gap:7px;flex-wrap:wrap;align-items:baseline;padding:5px 0;
+    border-bottom:1px solid var(--line-faint);font-size:11px;color:var(--dim-2)}
+  .projAuditRow b{color:var(--fg-soft);font-weight:500}
+  .projAuditRow .diff{color:var(--fg-chip);overflow-wrap:anywhere}
+  .visBox{margin:0 14px 12px;padding:12px;border:1px solid var(--line-soft);
+    border-radius:10px;background:var(--surface-1)}
+  .visHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .visHead b{font-size:12.5px;color:var(--fg-strong)}
+  .visHead .muted{margin-left:auto;font-size:10.5px}
+  .visModes{display:flex;flex-wrap:wrap;gap:8px 16px;margin:8px 0 2px;font-size:12px;color:var(--dim)}
+  .visModes label{display:flex;align-items:center;gap:6px;min-height:32px;cursor:pointer}
+  .visModes input{width:auto;min-height:0;margin:0}
+  .visProjects{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px 12px;
+    max-height:190px;overflow:auto;padding:4px 0}
+  .visProjects[hidden]{display:none!important}
+  .visItem{display:flex;align-items:center;gap:6px;min-width:0;min-height:34px;font-size:11.5px;
+    color:var(--dim);cursor:pointer}
+  .visItem input{width:auto;min-height:0;margin:0;flex:0 0 auto}
+  .visItem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .visItem code{font-size:10px;color:var(--dim-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .visItem.hiddenProj code{text-decoration:line-through;opacity:.65}
+  .visActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px}
+  .visActions .scopeHint{margin:0}
+  .healthGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:0 14px 10px}
+  .healthTile{min-width:0;padding:10px 11px;border:1px solid var(--line-soft);border-radius:10px;
+    background:var(--surface-1)}
+  .healthTile .cap{font-size:10.5px;color:var(--dim-2);display:flex;align-items:center;gap:6px}
+  .healthTile b{display:block;margin:5px 0 2px;font-size:13px;color:var(--fg-strong);overflow-wrap:anywhere}
+  .healthTile .sub{font-size:10.5px;color:var(--dim-2);overflow-wrap:anywhere}
+  .healthTile .warnv,.healthTile .badv{color:var(--warn-soft)}
+  .healthActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 14px 12px}
+  .healthActions .scopeHint{margin:0}
+  @media(max-width:1000px){.healthGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media(max-width:700px){
+    .card>h2{flex-wrap:wrap;row-gap:5px}
+    .cardTools{gap:4px}
+    #projMgrStat{display:none}
     .projGrid{grid-template-columns:1fr;padding:0 10px 12px}
     .projFoot .mini{min-height:38px}
     #projCreateForm .row,#projCreateForm .projAction{grid-template-columns:1fr}
+    .projEditor{margin:0 10px 10px;padding:10px}
+    .projEditor .row,.projEditor .projAction{grid-template-columns:1fr}
+    .visBox{margin:0 10px 10px;padding:10px}
+    .visProjects{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .healthGrid{grid-template-columns:1fr;padding:0 10px 8px}
+    .healthActions{padding:0 10px 10px}
+    .projAuditRows{max-height:180px}
   }
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
 .dashTile.clickable{cursor:pointer}
@@ -923,7 +983,67 @@ if (location.search.includes("reset=1")) {
       </div>
       <div class="scopeHint" id="npHint">创建后会出现在顶部项目下拉；重复创建不会覆盖已有配额。配额目前只能在创建时设定。</div>
     </div>
+    <div class="projEditor" id="projEditForm" hidden>
+      <div class="projEditorHead"><b>编辑项目</b><span id="peTitle"></span>
+        <span class="mono" id="peId"></span><span class="spacer"></span>
+        <button class="ghost mini" type="button" id="peClose">收起</button></div>
+      <div class="form">
+        <div class="row">
+          <label>显示名称<input id="peName" maxlength="80" autocomplete="off"></label>
+          <label>状态<select id="peStatus">
+            <option value="active">运行中（active）</option>
+            <option value="paused">已暂停（paused）</option>
+            <option value="archived">已归档（archived）</option>
+          </select></label>
+        </div>
+        <div class="row">
+          <label>Agent 上限<input id="peAgents" type="number" min="1" max="1000" step="1"></label>
+          <label>存储上限（MB）<input id="peStorage" type="number" min="1" max="10240" step="1"></label>
+        </div>
+        <div class="row">
+          <label>消息上限（条/分钟）<input id="peMsgs" type="number" min="1" max="1000" step="1"></label>
+          <label>数据保留（天）<input id="peRetention" type="number" min="1" max="3650" step="1"></label>
+        </div>
+        <div class="row projAction">
+          <button class="primary" type="button" id="peSave">保存修改</button>
+          <button class="ghost" type="button" id="peCancel">取消</button>
+          <span class="scopeHint" id="peHint">项目 ID 不可改；暂停会拒绝写请求，归档只保留只读入口。</span>
+        </div>
+      </div>
+      <div class="projAudit">
+        <div class="projAuditHead"><b>最近变更</b><span class="muted" id="peAuditStat"></span>
+          <span class="spacer"></span><button class="ghost mini" type="button" id="peAuditReload">刷新</button></div>
+        <div class="projAuditRows" id="projAuditRows"><div class="muted">打开项目后加载</div></div>
+      </div>
+    </div>
+
+    <div class="visBox" id="visBox">
+      <div class="visHead"><b>可见性策略</b><span class="muted" id="visStat"></span></div>
+      <div class="scopeHint">决定管理台能看到哪些项目。白名单模式下，未勾选的项目不会出现在顶部下拉和项目台账里。</div>
+      <div class="visModes">
+        <label><input type="radio" name="visMode" id="visAll" value="all"> 全部项目</label>
+        <label><input type="radio" name="visMode" id="visList" value="list"> 仅白名单</label>
+      </div>
+      <div class="visProjects" id="visProjects"></div>
+      <div class="visActions">
+        <button class="primary" type="button" id="visSave">保存可见性</button>
+        <button class="ghost" type="button" id="visReset">重置</button>
+        <span class="scopeHint" id="visHint"></span>
+      </div>
+    </div>
+
     <div class="projGrid" id="projRows"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>项目健康 <span class="muted" id="healthStat"></span></h2>
+    <div class="scopeHint" style="margin:-2px 0 8px">当前项目：<b id="healthProject">—</b>
+      <button class="ghost mini" type="button" id="healthReload" style="margin-left:8px">刷新</button></div>
+    <div class="healthGrid" id="healthGrid"><div class="empty" style="grid-column:1/-1">选择具体项目后加载</div></div>
+    <div class="healthActions">
+      <button class="ghost" type="button" id="healthApply">检查当前 main 适用性</button>
+      <span class="scopeHint" id="healthHint">适用性会检查当前项目已交付的 patch/bundle，可能耗时。</span>
+    </div>
   </div>
 
   <div class="card">
@@ -1412,8 +1532,11 @@ const deepEsc = (v) => Array.isArray(v) ? v.map(deepEsc)
   : (typeof v === "string" ? esc(v) : v);
 let policy = { mode: "all", projects: [] };
 let current = "";
-let allProjects = [];
+let allProjects = [];             // 当前可见项目（台账/下拉）
+let ALL_PROJECTS = [];            // 包含被可见性策略隐藏的项目（仅供可见性编辑器）
 let PROJECTS_HIDDEN = 0;
+let editingProject = "";          // 正在编辑的项目 ID
+let PROJECT_HEALTH = null;        // 项目健康缓存
 let refreshEpoch = 0;              // 切换项目/并发刷新时，旧请求只能静默丢弃
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
@@ -1622,28 +1745,34 @@ const ago = (s) => {
 const pct = (v, bad) => v == null ? "—" : `<span class="${v >= bad ? "badv" : ""}">${v}%</span>`;
 
 async function loadProjects() {
-  const d = await api("/admin/projects");
+  // include_hidden=1 只用于可见性编辑器；普通项目台账仍按 policy 过滤。
+  const d = await api("/admin/projects?include_hidden=1");
   policy = d.policy;
   allProjects = d.projects || [];
+  ALL_PROJECTS = d.all_projects || d.projects || [];
   PROJECTS_HIDDEN = Math.max(0, Number(d.hidden ?? 0) || 0);
   syncProjectVisibilityOption();
+  // 顶部下拉只放 active 项目：paused 会让统计/观测为空，archived 已经不可切。
+  const choosable = allProjects.filter((x) => String(x.status || "active").toLowerCase() === "active");
   const sel = $("proj");
-  sel.innerHTML = `<option value="*">全部项目</option>` + d.projects.map(p =>
+  sel.innerHTML = `<option value="*">全部项目</option>` + choosable.map(p =>
     `<option value="${esc(p.project)}">${esc(decEsc(p.display_name))}</option>`).join("");
   // 记住上次选的项目；否则刷新后总是回到最早创建的项目，容易把新项目里的 agent 看漏。
   let saved = "";
   try { saved = localStorage.getItem("hub.project") || ""; } catch {}
-  if (!current || (current !== "*" && !d.projects.some((p) => p.project === current))) {
+  if (!current || (current !== "*" && !choosable.some((p) => p.project === current))) {
     current = saved === "*"
       ? "*"
-      : (d.projects.some((p) => p.project === saved) ? saved : (d.projects[0]?.project || "*"));
+      : (choosable.some((p) => p.project === saved) ? saved : (choosable[0]?.project || "*"));
   }
   sel.value = current;
   try { localStorage.setItem("hub.project", current); } catch {}
   renderProjectList();
+  renderVisibilityEditor();
   updateScopeLabel();
   fillDetailProjects();
   connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
+  if (ACTIVE_TAB === "project") loadProjectHealth();
 }
 
 function projectStatusMeta(status) {
@@ -1686,10 +1815,11 @@ function renderProjectList() {
         ${p.project === current ? '<span class="badge approved">当前</span>' : ''}
         <span class="mono spacer">${pid}</span></div>
       <div class="projQuota">${quota}</div>
-      <div class="projFoot"><span class="muted">创建 ${esc(created)}</span>
-        ${String(p.status || "").toLowerCase() === "archived"
-          ? '<span class="muted">只读存档</span>'
-          : `<button class="mini" type="button" data-goto-project="${pid}" title="切到该项目">切到项目</button>`}</div>
+      <div class="projFoot"><span class="muted">创建 ${esc(created)}${p.created_by ? ` · ${esc(String(p.created_by).slice(0, 40))}` : ""}</span>
+        <span class="projBtns"><button class="ghost mini" type="button" data-proj-edit="${pid}" title="修改名称、状态和配额">配置</button>
+        ${["paused", "archived"].includes(String(p.status || "").toLowerCase())
+          ? `<span class="muted">${String(p.status).toLowerCase() === "archived" ? "只读存档" : "暂停中"}</span>`
+          : `<button class="mini" type="button" data-goto-project="${pid}" title="切到该项目">切到项目</button>`}</span></div>
     </article>`;
   }).join("");
 }
@@ -1769,7 +1899,7 @@ async function createProject() {
       $("npName").value = "";
       hint.textContent = `已创建 ${id}。下一步：到“接入”页签发 token，或让 agent 自助注册。`;
     } else {
-      hint.textContent = `项目 ${id} 已存在；如需修改配额，请先在项目台账里确认。`;
+      hint.textContent = `项目 ${id} 已存在；可点项目卡片里的“配置”修改配额。`;
     }
   } catch (e) {
     if (!(e instanceof AuthError)) {
@@ -1783,6 +1913,363 @@ async function createProject() {
 }
 
 $("npCreate").onclick = createProject;
+
+$("peSave").onclick = saveProject;
+$("peClose").onclick = closeProjectEditor;
+$("peCancel").onclick = closeProjectEditor;
+$("peAuditReload").onclick = () => { if (editingProject) loadProjectAudit(editingProject); };
+$("visSave").onclick = saveVisibility;
+$("visReset").onclick = renderVisibilityEditor;
+for (const id of ["visAll", "visList"]) {
+  $(id).onchange = () => { $("visProjects").hidden = !$("visList").checked; };
+}
+$("healthReload").onclick = () => loadProjectHealth(true);
+$("healthApply").onclick = checkApplicability;
+
+function projectById(id) {
+  return (ALL_PROJECTS || []).find((p) => p.project === id)
+    || (allProjects || []).find((p) => p.project === id) || null;
+}
+
+function projectStatusLabel(status) {
+  const s = String(status || "").toLowerCase();
+  return s === "paused" ? "已暂停" : s === "archived" ? "已归档" : "运行中";
+}
+
+function openProjectEditor(id) {
+  const p = projectById(id);
+  if (!p) return;
+  editingProject = p.project;
+  $("peTitle").textContent = decEsc(p.display_name || p.project);
+  $("peId").textContent = p.project;
+  $("peName").value = decEsc(p.display_name || p.project);
+  $("peStatus").value = String(p.status || "active").toLowerCase();
+  $("peAgents").value = hasNum(p.max_agents) ? p.max_agents : 200;
+  $("peStorage").value = hasNum(p.max_storage_mb) ? p.max_storage_mb : 2048;
+  $("peMsgs").value = hasNum(p.max_msgs_per_min) ? p.max_msgs_per_min : 60;
+  $("peRetention").value = hasNum(p.retention_days) ? p.retention_days : 30;
+  $("peHint").textContent = "项目 ID 不可改；暂停会拒绝写请求，归档只保留只读入口。";
+  $("projEditForm").hidden = false;
+  loadProjectAudit(p.project);
+  setTimeout(() => {
+    if (editingProject !== p.project) return;
+    $("projEditForm").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, 30);
+}
+
+function closeProjectEditor() {
+  editingProject = "";
+  $("projEditForm").hidden = true;
+}
+
+function auditTime(at) {
+  let n = Number(at);
+  if (!Number.isFinite(n) && typeof at === "string") n = Date.parse(at);
+  if (!Number.isFinite(n)) return "—";
+  const d = new Date(n);
+  if (!Number.isFinite(d.getTime())) return "—";
+  return d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function auditOneLine(entry) {
+  const changed = ["display_name", "status", "max_agents", "max_storage_mb", "max_msgs_per_min", "retention_days"]
+    .filter((k) => String((entry.before || {})[k] ?? "") !== String((entry.after || {})[k] ?? ""));
+  const labels = {
+    display_name: "名称", status: "状态", max_agents: "Agent",
+    max_storage_mb: "存储 MB", max_msgs_per_min: "消息/分", retention_days: "保留天",
+  };
+  const val = (k, v) => {
+    if (v === undefined || v === null || v === "") return "—";
+    if (k === "status") return projectStatusLabel(v);
+    return String(v).slice(0, 80);
+  };
+  if (!changed.length) return entry.action === "create" ? "创建项目" : "无字段变化";
+  return changed.map((k) => `${labels[k] || k}: ${val(k, (entry.before || {})[k])} → ${val(k, (entry.after || {})[k])}`).join(" · ");
+}
+
+function renderProjectAudit(entries) {
+  const host = $("projAuditRows");
+  const stat = $("peAuditStat");
+  if (!host) return;
+  const list = Array.isArray(entries) ? entries : [];
+  if (stat) stat.textContent = list.length ? `${list.length} 条` : "";
+  if (!list.length) {
+    host.innerHTML = `<div class="muted">暂无变更记录</div>`;
+    return;
+  }
+  host.innerHTML = list.map((e) => `<div class="projAuditRow">
+    <span>${esc(auditTime(e.at))}</span><b>${esc(decEsc(e.actor || "admin"))}</b>
+    <span class="diff">${esc(decEsc(auditOneLine(e)))}</span></div>`).join("");
+}
+
+async function loadProjectAudit(id) {
+  if (!id) return;
+  $("peAuditStat").textContent = "加载中…";
+  $("projAuditRows").innerHTML = `<div class="muted">加载中…</div>`;
+  try {
+    const d = await api(`/admin/projects/${encodeURIComponent(id)}/audit?limit=20`);
+    if (editingProject !== id) return;
+    if (d && d.migration_required) {
+      $("projAuditRows").innerHTML = `<div class="muted">审计表未迁移，暂不能记录变更；请执行 worker/migrations 下的项目审计迁移。</div>`;
+      return;
+    }
+    renderProjectAudit(d && d.entries);
+  } catch (e) {
+    if (editingProject !== id) return;
+    $("projAuditRows").innerHTML = `<div class="muted">读取变更记录失败：${esc(e.message || e)}</div>`;
+  }
+}
+
+async function saveProject() {
+  const id = editingProject;
+  if (!id) return;
+  const hint = $("peHint");
+  let agents, storage, msgs, retention;
+  try {
+    agents = projectIntField("peAgents", "Agent 上限", 1, 1000);
+    storage = projectIntField("peStorage", "存储上限", 1, 10240);
+    msgs = projectIntField("peMsgs", "消息上限", 1, 1000);
+    retention = projectIntField("peRetention", "保留天数", 1, 3650);
+  } catch (e) {
+    hint.textContent = e.message;
+    return;
+  }
+  const status = $("peStatus").value;
+  if (!["active", "paused", "archived"].includes(status)) {
+    hint.textContent = "状态不合法";
+    return;
+  }
+  const btn = $("peSave");
+  btn.disabled = true;
+  btn.textContent = "保存中…";
+  hint.textContent = "正在保存…";
+  try {
+    const r = await api(`/admin/projects/${encodeURIComponent(id)}`, "PATCH", {
+      display_name: ($("peName").value || "").trim() || id,
+      status, max_agents: agents, max_storage_mb: storage,
+      max_msgs_per_min: msgs, retention_days: retention,
+    });
+    PROJECT_HEALTH = null;
+    await loadProjects();
+    await loadProjectAudit(id);
+    if (current === id) await refresh();
+    const p = projectById(id);
+    if (p) {
+      $("peTitle").textContent = decEsc(p.display_name || p.project);
+      $("peId").textContent = p.project;
+    }
+    if (r && r.changed === false) {
+      hint.textContent = "配置没有变化。";
+      showToast("项目配置没有变化", 4000);
+    } else {
+      hint.textContent = `已保存：${id} · ${projectStatusLabel(status)}`;
+      showToast(`项目 ${id} 已更新`, 5000);
+    }
+  } catch (e) {
+    if (!(e instanceof AuthError)) {
+      hint.textContent = `保存失败：${e.message || e}`;
+      showToast(`保存项目失败：${e.message || e}`, 9000);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "保存修改";
+  }
+}
+
+function renderVisibilityEditor() {
+  const host = $("visProjects");
+  if (!host) return;
+  const mode = policy.mode === "list" ? "list" : "all";
+  const projects = ALL_PROJECTS || [];
+  const picked = new Set(policy.projects || []);
+  $("visAll").checked = mode === "all";
+  $("visList").checked = mode === "list";
+  $("visProjects").hidden = mode !== "list";
+  $("visStat").textContent = `${allProjects.length} 个可见 / ${projects.length} 个全量`;
+  if (!projects.length) {
+    host.innerHTML = `<div class="muted">还没有项目</div>`;
+    return;
+  }
+  host.innerHTML = projects.map((p) => {
+    const pid = esc(decEsc(p.project));
+    const name = esc(decEsc(p.display_name || p.project));
+    const checked = mode === "list" ? picked.has(p.project) : true;
+    const hiddenProj = mode === "list" && !picked.has(p.project);
+    return `<label class="visItem ${hiddenProj ? "hiddenProj" : ""}" title="${pid}">
+      <input type="checkbox" data-vis-project="${pid}" ${checked ? "checked" : ""}>
+      <span>${name}</span><code>${pid}</code></label>`;
+  }).join("");
+}
+
+async function saveVisibility() {
+  const mode = $("visList").checked ? "list" : "all";
+  const projects = mode === "list"
+    ? [...document.querySelectorAll("[data-vis-project]:checked")].map((x) => x.getAttribute("data-vis-project"))
+    : [];
+  if (mode === "list" && !projects.length && !confirm("白名单为空：保存后管理台将看不到任何项目，确定继续？")) return;
+  const btn = $("visSave");
+  btn.disabled = true;
+  $("visHint").textContent = "正在保存…";
+  try {
+    await api("/admin/visibility", "POST", { mode, projects });
+    await loadProjects();
+    $("visHint").textContent = mode === "all" ? "已设为全部项目可见。" : `已保存 ${projects.length} 个可见项目。`;
+    showToast(mode === "all" ? "可见性已设为全部项目" : `可见性已更新：${projects.length} 个项目`, 5000);
+  } catch (e) {
+    if (!(e instanceof AuthError)) {
+      $("visHint").textContent = `保存失败：${e.message || e}`;
+      showToast(`保存可见性失败：${e.message || e}`, 8000);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function settings() {
+  const box = $("visBox");
+  if (!box) return;
+  // 顶部“可见性”按钮在任意 tab 可用；先切到项目页并展开项目卡。
+  if (ACTIVE_TAB !== "project") {
+    const tab = document.querySelector('[data-tab="project"]');
+    if (tab) tab.click();
+  }
+  setCardOpen("项目管理", true);
+  setTimeout(() => box.scrollIntoView({ block: "center", behavior: "smooth" }), 30);
+  $("visHint").textContent = "在下面勾选可见项目，再点“保存可见性”。";
+  showToast("可见性编辑器已展开", 3500);
+}
+
+function shortSha(v) {
+  const s = String(v || "");
+  return s ? (s.length > 12 ? s.slice(0, 12) : s) : "—";
+}
+
+function latestCiEvent() {
+  const rows = (MSG_ROWS || []).filter((m) => m && m.topic === "ci" && m.payload
+    && (m.kind === "status" || m.payload.status));
+  rows.sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+  const m = rows[rows.length - 1];
+  if (!m) return null;
+  const p = m.payload || {};
+  return { status: String(p.status || "pending"), sha: p.sha, at: m.ts || m.at || null,
+           url: p.url || "", summary: p.summary || "", branch: p.branch || "" };
+}
+
+function renderProjectHealth() {
+  const host = $("healthGrid");
+  if (!host) return;
+  const h = PROJECT_HEALTH;
+  const p = current && current !== "*" ? projectById(current) : null;
+  $("healthProject").textContent = p ? decEsc(p.display_name || p.project) : "—";
+  if (!current || current === "*") {
+    $("healthStat").textContent = "选择具体项目";
+    host.innerHTML = `<div class="empty" style="grid-column:1/-1">选择具体项目后查看基线、CI、错误码和运行时快照。</div>`;
+    $("healthHint").textContent = "项目健康只显示具体项目；全部项目视图不聚合。";
+    $("healthApply").disabled = true;
+    return;
+  }
+  $("healthApply").disabled = !!h?.loading;
+  if (!h || h.project !== current) {
+    $("healthStat").textContent = "尚未加载";
+    host.innerHTML = `<div class="empty" style="grid-column:1/-1">加载中…</div>`;
+    return;
+  }
+  $("healthStat").textContent = h.loading ? "加载中…" : `更新于 ${new Date(h.at).toLocaleTimeString("zh-CN", { hour12: false })}`;
+  const repo = h.repo || {};
+  const repoError = h.repoError || repo.error;
+  const err = h.err || {};
+  const errError = h.errError || "";
+  const counts = err.counts || {};
+  const topCodes = Object.entries(counts).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 3)
+    .map(([code, n]) => `${code} ×${n}`).join(" · ") || "无错误码";
+  const lastErr = err.last ? `${err.last.code || "?"} · ${auditTime(err.last.at)}` : "无最近错误";
+  const snap = h.snap || {};
+  const agents = Array.isArray(snap.agents) ? snap.agents : [];
+  const tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+  const alive = agents.filter((a) => String(a.alive || "") === "alive").length;
+  const ci = latestCiEvent();
+  const ciLabel = ci ? ({ green: "通过", red: "失败", pending: "等待" }[ci.status] || ci.status) : "暂无事件";
+  const tiles = [
+    { cap: "基线仓库", value: repoError ? "读取失败" : (repo.target_sha ? shortSha(repo.target_sha) : "—"),
+      sub: repoError ? String(repoError) : `${repo.branch || "main"} · ${repo.last_project_check_at ? auditTime(repo.last_project_check_at) : "未检查"}`,
+      warn: !!repoError },
+    { cap: "CI 状态", value: ciLabel,
+      sub: ci ? `${ci.branch || "main"} · ${shortSha(ci.sha)} · ${auditTime(ci.at)}` : "消息流里没有 CI 事件",
+      warn: ci?.status === "red" },
+    { cap: "错误码 · 7 天", value: errError ? "读取失败" : (err.total ?? "—"),
+      sub: errError ? String(errError) : `${topCodes} · 最近 ${lastErr}`, warn: !!(err.last || errError) },
+    { cap: "运行时快照", value: h.snapError ? "读取失败" : (snap.seq !== undefined ? `seq ${snap.seq}` : "—"),
+      sub: h.snapError ? String(h.snapError) : `${agents.length} agents · ${alive} alive · ${tasks.length} tasks`,
+      warn: !!h.snapError },
+  ];
+  host.innerHTML = tiles.map((t) => `<div class="healthTile ${t.warn ? "warnv" : ""}">
+    <div class="cap">${esc(t.cap)}</div><b>${esc(String(t.value))}</b><div class="sub">${esc(String(t.sub))}</div></div>`).join("");
+  const apply = h.apply;
+  $("healthHint").textContent = apply
+    ? `适用性：target ${shortSha(apply.target_sha)} · 检查 ${apply.checked ?? 0} · 冲突 ${apply.conflicts ?? 0} · 错误 ${apply.errors ?? 0} · 跳过 ${apply.skipped ?? 0}`
+    : (h.applyError ? `适用性检查失败：${h.applyError}` : "点下面按钮检查当前项目交付对当前 main 的适用性。");
+}
+
+async function loadProjectHealth(force = false) {
+  const project = current;
+  if (!project || project === "*") {
+    PROJECT_HEALTH = null;
+    renderProjectHealth();
+    return;
+  }
+  const h = PROJECT_HEALTH;
+  if (!force && h && h.project === project && !h.loading && Date.now() - Number(h.at || 0) < 45_000) {
+    renderProjectHealth();
+    return;
+  }
+  const prevApply = h && h.project === project ? h.apply : null;
+  PROJECT_HEALTH = { project, at: Date.now(), loading: true, repo: null, err: null, snap: null, apply: prevApply };
+  renderProjectHealth();
+  const results = await Promise.allSettled([
+    api(`/admin/p/${project}/repo/status`),
+    api(`/admin/p/${project}/error-stats`),
+    api(`/admin/p/${project}/snapshot`),
+  ]);
+  if (current !== project) return;
+  const [repo, err, snap] = results;
+  PROJECT_HEALTH = {
+    project, at: Date.now(), loading: false,
+    repo: repo.status === "fulfilled" ? repo.value : null,
+    repoError: repo.status === "rejected" ? (repo.reason?.message || String(repo.reason)) : "",
+    err: err.status === "fulfilled" ? err.value : null,
+    errError: err.status === "rejected" ? (err.reason?.message || String(err.reason)) : "",
+    snap: snap.status === "fulfilled" ? snap.value : null,
+    snapError: snap.status === "rejected" ? (snap.reason?.message || String(snap.reason)) : "",
+    apply: prevApply,
+  };
+  renderProjectHealth();
+}
+
+async function checkApplicability() {
+  if (!current || current === "*") {
+    showToast("先选择具体项目", 4000);
+    return;
+  }
+  const project = current;
+  const btn = $("healthApply");
+  btn.disabled = true;
+  $("healthHint").textContent = "正在检查当前 main 适用性…";
+  try {
+    const r = await api(`/admin/p/${project}/repo/applicability`, "POST", {});
+    if (current !== project) return;
+    if (PROJECT_HEALTH && PROJECT_HEALTH.project === project) PROJECT_HEALTH.apply = r;
+    renderProjectHealth();
+    showToast(`适用性检查完成：冲突 ${r.conflicts ?? 0}，错误 ${r.errors ?? 0}`, 6000);
+  } catch (e) {
+    if (!(e instanceof AuthError)) {
+      if (PROJECT_HEALTH && PROJECT_HEALTH.project === project) PROJECT_HEALTH.applyError = e.message || String(e);
+      renderProjectHealth();
+      showToast(`适用性检查失败：${e.message || e}`, 9000);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 function updateScopeLabel() {
   const el = $("scope");
@@ -1798,7 +2285,8 @@ function updateScopeLabel() {
 function fillDetailProjects() {
   const sel = $("dMoveTo");
   if (!sel) return;
-  const list = (allProjects || []).filter((p) => p.project !== current);
+  const list = (allProjects || []).filter((p) => p.project !== current
+    && String(p.status || "active").toLowerCase() === "active");
   sel.innerHTML = list.length
     ? list.map((p) => `<option value="${esc(p.project)}">${esc(decEsc(p.display_name))}</option>`).join("")
     : `<option value="">无可选项目</option>`;
@@ -1824,6 +2312,8 @@ function activateProject(project) {
   TASK_ROWS = [];
   ISSUE_ROWS = [];
   ISSUE_COUNTS = {};
+  MSG_ROWS = [];
+  PROJECT_HEALTH = null;
   window._agents = [];
   AGENTS_LOADED = false;
   AGENTS_PARTIAL = 0;
@@ -3296,23 +3786,6 @@ async function broadcast() {
     $("bTitle").value = ""; $("bBody").value = "";
   } catch (e) {
     if (!(e instanceof AuthError)) $("bHint").textContent = "发布失败：" + (e.message || e);
-  }
-}
-
-async function settings() {
-  const mode = prompt(`可见性当前：${policy.mode}\n输入 all 或 list`, policy.mode);
-  if (!mode) return;
-  if (mode !== "all" && mode !== "list") { alert("可见性只能是 all 或 list"); return; }
-  let projects = [];
-  if (mode === "list") {
-    const csv = prompt("要可见的项目（逗号分隔）", policy.projects.join(",") || current);
-    projects = (csv || "").split(",").map(s => s.trim()).filter(Boolean);
-  }
-  try {
-    await api("/admin/visibility", "POST", { mode, projects });
-    await loadProjects();
-  } catch (e) {
-    if (!(e instanceof AuthError)) alert("保存可见性失败：" + (e.message || e));
   }
 }
 
@@ -4945,7 +5418,7 @@ function decorateCards() {
     // 标题只取 h2 的首个文本节点，避免把动态状态/计数带进 localStorage 的折叠 key。
     const title = ((h.firstChild && h.firstChild.nodeType === 3 ? h.firstChild.textContent : h.textContent) || "")
       .trim().replace(/[▸▾⤢⤡]/g, "").trim();
-    const keep = /^(概览|项目管理|名册|注册审批|签发 token|效率观测)/.test(title);
+    const keep = /^(概览|项目管理|项目健康|名册|注册审批|签发 token|效率观测)/.test(title);
     const key = `hub.fold2.${title}`;
     let folded = !keep;
     try {
@@ -5188,7 +5661,7 @@ function bindFilters() {
 
 const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "效率观测", "名册"] },
-  { id: "project",  label: "项目", cards: ["项目管理"] },
+  { id: "project",  label: "项目", cards: ["项目管理", "项目健康"] },
   { id: "task",     label: "任务", cards: ["任务", "效率观测"] },
   { id: "issue",    label: "Issue", cards: ["Issue"] },
   { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
@@ -5209,6 +5682,7 @@ function setCardOpen(title, open) {
 
 const BADGES = { access: 0, deli: 0, msg: 0, task: 0, issue: 0 };
 let MSG_MAX = 0;
+let MSG_ROWS = [];
 let ACTIVE_TAB = "overview";
 function markMsgSeen() {
   if (MSG_MAX) { try { localStorage.setItem("hub.lastSeq", String(MSG_MAX)); } catch {} }
@@ -5249,6 +5723,7 @@ function bindTabs() {
       b.classList.toggle("on", b.dataset.tab === g.id));
     localStorage.setItem("hub.tab", g.id);
     if (g.id === "msg") markMsgSeen();
+    if (g.id === "project") loadProjectHealth();
     // 切到某页时如果该页所有卡片都是收起的，自动展开第一张；否则用户只会看到一排标题。
     const groupCards = cardsAll().filter((c) => {
       const t = titleOf(c);
@@ -5412,6 +5887,7 @@ async function loadMsgs() {
   }
   if (current !== project) return;
   const rows = (d.messages || []).slice().reverse();
+  MSG_ROWS = rows;
   MSG_MAX = rows.reduce((a, m) => Math.max(a, m.seq || 0), 0);
   const lastSeen = Number(localStorage.getItem("hub.lastSeq") || 0);
   BADGES.msg = rows.filter((m) => (m.seq || 0) > lastSeen).length;
@@ -5625,6 +6101,12 @@ async function refresh(forceFresh = false) {
   try { await loadMsgs(); } catch (e) {
     if (e instanceof AuthError) throw e;
     console.warn("[hub] loadMsgs failed", e);
+  }
+  if (current !== "*" && ACTIVE_TAB === "project") {
+    try { await loadProjectHealth(); } catch (e) {
+      if (e instanceof AuthError) throw e;
+      console.warn("[hub] loadProjectHealth failed", e);
+    }
   }
 }
 
@@ -6029,7 +6511,7 @@ document.addEventListener("click", async (e) => {
     const issueState = dash.getAttribute("data-dash-issue");
     if (issueState) return showCardFilter("Issue", "issue", issueState);
   }
-  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-task-retry],[data-task-timeline],[data-task-merge],[data-task-requeue],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
+  const btn = el.closest && el.closest("[data-revoke],[data-detail],[data-idle-remind],[data-dl],[data-collect],[data-sub-approve],[data-sub-reject],[data-unblock],[data-collect-all],[data-goto-delivery],[data-goto-project],[data-proj-edit],[data-task-close],[data-task-reclaim],[data-task-reassign],[data-task-retry],[data-task-timeline],[data-task-merge],[data-task-requeue],[data-issue-close],[data-issue-reopen],[data-issue-merge],[data-issue-dispatch],[data-issue-view]");
   // 先认按钮：否则行内按钮会被"整行点开详情"吞掉（吊销按钮就点不动了）
   if (btn) {
     const iv = btn.getAttribute("data-issue-view");
@@ -6043,6 +6525,8 @@ document.addEventListener("click", async (e) => {
     }
     const gp = btn.getAttribute("data-goto-project");
     if (gp) { activateProject(gp); refresh(); return; }
+    const pe = btn.getAttribute("data-proj-edit");
+    if (pe) { openProjectEditor(pe); return; }
     const ic = btn.getAttribute("data-issue-close");
     if (ic) {
       if (current === "*") return alert("先选择具体项目再操作 Issue");

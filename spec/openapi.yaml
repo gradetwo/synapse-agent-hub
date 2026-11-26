@@ -662,8 +662,13 @@ paths:
   /admin/projects:
     get:
       summary: 按可见性策略返回项目
+      parameters:
+        - name: include_hidden
+          in: query
+          schema: { type: string, enum: ['1'] }
+          description: 传 1 时额外返回 all_projects（含被可见性策略隐藏的项目，仅供可见性编辑器）
       responses:
-        '200': { description: '{ policy, projects, hidden }' }
+        '200': { description: '{ policy, projects, hidden }；include_hidden=1 时追加 all_projects' }
     post:
       summary: 新建项目
       requestBody:
@@ -680,6 +685,43 @@ paths:
                 max_msgs_per_min: { type: integer, default: 60 }
                 retention_days: { type: integer, default: 30 }
       responses: { '200': { description: ok + created + quotas；重复创建返回 created=false，不改已有配额 } }
+  /admin/projects/{project}:
+    patch:
+      summary: 修改已有项目的显示名、状态和四项配额（项目 ID 不可改）
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z0-9-]{2,40}$' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string, maxLength: 80 }
+                status: { type: string, enum: [active, paused, archived] }
+                max_agents: { type: integer, minimum: 1, maximum: 1000 }
+                max_storage_mb: { type: integer, minimum: 1, maximum: 10240 }
+                max_msgs_per_min: { type: integer, minimum: 1, maximum: 1000 }
+                retention_days: { type: integer, minimum: 1, maximum: 3650 }
+      responses:
+        '200': { description: '{ ok, changed, before, after, updated_by, updated_at }' }
+        '404': { description: project_not_found }
+        '422': { description: bad_project_status | bad_project_quota }
+  /admin/projects/{project}/audit:
+    get:
+      summary: 项目配置变更审计（最近 N 条，按时间倒序）
+      parameters:
+        - name: project
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z0-9-]{2,40}$' }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200': { description: '{ ok, project, entries: [{ action, actor, at, before, after }], migration_required? }' }
   /admin/visibility:
     get:
       summary: 读取可见性策略

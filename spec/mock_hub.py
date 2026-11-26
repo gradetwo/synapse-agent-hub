@@ -23,7 +23,10 @@ HB_PERIOD = 60
 LOCK = threading.RLock()
 PROJECTS = {"yanshi": {"project": "yanshi", "display_name": "偃师", "status": "active",
                         "max_agents": 200, "max_storage_mb": 2048, "max_msgs_per_min": 60,
-                        "retention_days": 30, "created_at": int(time.time() * 1000)}}
+                        "retention_days": 30, "created_at": int(time.time() * 1000),
+                        "created_by": "admin", "updated_by": "admin",
+                        "updated_at": int(time.time() * 1000)}}
+PROJECT_AUDIT = []
 POLICY = {"mode": "all", "projects": []}
 STATE = {}          # project -> dict(seq, msgs, dedupe, hb, tasks, acks, bc, superseded)
 SUBS = {}           # (project, sid) -> dict
@@ -114,10 +117,31 @@ class H(BaseHTTPRequestHandler):
             if seg == ["admin", "projects"]:
                 rows = [p for p in PROJECTS.values()
                         if POLICY["mode"] == "all" or p["project"] in POLICY["projects"]]
-                return self._out({"policy": POLICY, "projects": rows,
-                                  "hidden": len(PROJECTS) - len(rows)})
+                q = parse_qs(urlparse(self.path).query)
+                payload = {"policy": POLICY, "projects": rows,
+                           "hidden": len(PROJECTS) - len(rows)}
+                if q.get("include_hidden", ["0"])[0] == "1":
+                    payload["all_projects"] = list(PROJECTS.values())
+                return self._out(payload)
             if seg == ["admin", "visibility"]:
                 return self._out(POLICY)
+            if len(seg) == 4 and seg[1] == "projects" and seg[3] == "audit":
+                project = seg[2]
+                entries = [a for a in PROJECT_AUDIT if a["project"] == project][-20:]
+                return self._out({"ok": True, "project": project, "entries": entries})
+            if len(seg) == 4 and seg[1] == "p" and seg[3] == "error-stats":
+                return self._out({"ok": True, "days": 7, "total": 3,
+                                  "counts": {"insufficient_scope": 2, "bad_request": 1},
+                                  "last": {"code": "insufficient_scope", "at": int(time.time() * 1000),
+                                           "path": "/p/demo", "status": 403}})
+            if len(seg) == 4 and seg[1] == "p" and seg[3] == "snapshot":
+                s = st(seg[2])
+                return self._out({"seq": s["seq"], "agents": [], "tasks": []})
+            if len(seg) == 5 and seg[1] == "p" and seg[3] == "repo" and seg[4] == "status":
+                return self._out({"repo": "gradetwo/synapse-agent-hub", "branch": "main",
+                                  "target_sha": "abcdef1234567890", "error": None,
+                                  "last_project_check": "abcdef1234567890",
+                                  "last_project_check_at": int(time.time() * 1000)})
             if len(seg) == 4 and seg[1] == "p" and seg[3] == "agents":
                 project = seg[2]
                 s = st(project)
@@ -146,6 +170,41 @@ class H(BaseHTTPRequestHandler):
                 return self._out({"error": "sha_mismatch"}, 422)
             BLOBS[(project, sha)] = data
             return self._out({"stored": True, "sha256": sha})
+        return self._out({"error": "not_found"}, 404)
+
+    def do_PATCH(self):
+        seg, _ = self._parts()
+        auth = self._auth()
+        if not auth["ok"]:
+            return self._out({"error": "missing_token"}, 401)
+        b = self._body()
+        if len(seg) == 3 and seg[1] == "projects":
+            project = seg[2]
+            p = PROJECTS.get(project)
+            if not p:
+                return self._out({"error": "project_not_found"}, 404)
+            before = dict(p)
+            p["display_name"] = b.get("display_name", p.get("display_name", project)) or project
+            status = str(b.get("status", p.get("status", "active"))).lower()
+            if status not in ("active", "paused", "archived"):
+                return self._out({"error": "bad_project_status"}, 422)
+            p["status"] = status
+            for k, lo, hi in (("max_agents", 1, 1000), ("max_storage_mb", 1, 10240),
+                              ("max_msgs_per_min", 1, 1000), ("retention_days", 1, 3650)):
+                if k in b:
+                    n = int(b[k])
+                    if n < lo or n > hi:
+                        return self._out({"error": "bad_project_quota", "field": k}, 422)
+                    p[k] = n
+            p["updated_by"] = "admin"
+            p["updated_at"] = int(time.time() * 1000)
+            PROJECT_AUDIT.append({"id": len(PROJECT_AUDIT) + 1, "project": project,
+                                  "action": "update", "actor": "admin",
+                                  "at": p["updated_at"], "before": before,
+                                  "after": dict(p)})
+            return self._out({"ok": True, "changed": True, "project": project,
+                              "before": before, "after": dict(p),
+                              "updated_by": "admin", "updated_at": p["updated_at"]})
         return self._out({"error": "not_found"}, 404)
 
     def do_POST(self):
@@ -238,6 +297,7 @@ class H(BaseHTTPRequestHandler):
                 project = b["project"]
                 if project in PROJECTS:
                     return self._out({"ok": True, "created": False, "existing": True, "project": project})
+                now = int(time.time() * 1000)
                 PROJECTS[project] = {
                     "project": project,
                     "display_name": b.get("display_name", project),
@@ -246,9 +306,43 @@ class H(BaseHTTPRequestHandler):
                     "max_storage_mb": b.get("max_storage_mb", 2048),
                     "max_msgs_per_min": b.get("max_msgs_per_min", 60),
                     "retention_days": b.get("retention_days", 30),
-                    "created_at": int(time.time() * 1000),
+                    "created_at": now, "created_by": "admin", "updated_by": "admin",
+                    "updated_at": now,
                 }
+                PROJECT_AUDIT.append({"id": len(PROJECT_AUDIT) + 1, "project": project,
+                                      "action": "create", "actor": "admin", "at": now,
+                                      "before": {}, "after": dict(PROJECTS[project])})
                 return self._out({"ok": True, "created": True, "project": project})
+            if len(seg) == 3 and seg[1] == "projects":
+                project = seg[2]
+                p = PROJECTS.get(project)
+                if not p:
+                    return self._out({"error": "project_not_found"}, 404)
+                before = dict(p)
+                p["display_name"] = b.get("display_name", p.get("display_name", project)) or project
+                status = str(b.get("status", p.get("status", "active"))).lower()
+                if status not in ("active", "paused", "archived"):
+                    return self._out({"error": "bad_project_status"}, 422)
+                p["status"] = status
+                for k, lo, hi in (("max_agents", 1, 1000), ("max_storage_mb", 1, 10240),
+                                  ("max_msgs_per_min", 1, 1000), ("retention_days", 1, 3650)):
+                    if k in b:
+                        n = int(b[k])
+                        if n < lo or n > hi:
+                            return self._out({"error": "bad_project_quota", "field": k}, 422)
+                        p[k] = n
+                p["updated_by"] = "admin"
+                p["updated_at"] = int(time.time() * 1000)
+                PROJECT_AUDIT.append({"id": len(PROJECT_AUDIT) + 1, "project": project,
+                                      "action": "update", "actor": "admin",
+                                      "at": p["updated_at"], "before": before,
+                                      "after": dict(p)})
+                return self._out({"ok": True, "changed": True, "project": project,
+                                  "before": before, "after": dict(p),
+                                  "updated_by": "admin", "updated_at": p["updated_at"]})
+            if len(seg) == 5 and seg[1] == "p" and seg[3] == "repo" and seg[4] == "applicability":
+                return self._out({"ok": True, "target_sha": "abcdef1234567890",
+                                  "checked": 2, "conflicts": 1, "errors": 0, "skipped": 0})
             if seg == ["admin", "visibility"]:
                 POLICY.update(mode=b.get("mode", "all"), projects=b.get("projects", []))
                 return self._out({"ok": True})

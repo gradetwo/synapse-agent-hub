@@ -9,8 +9,24 @@ CREATE TABLE IF NOT EXISTS projects (
   max_storage_mb  INTEGER NOT NULL DEFAULT 2048,
   max_msgs_per_min INTEGER NOT NULL DEFAULT 60,
   retention_days  INTEGER NOT NULL DEFAULT 30,
-  created_at      INTEGER NOT NULL
+  created_at      INTEGER NOT NULL,
+  created_by      TEXT NOT NULL DEFAULT 'admin',
+  updated_by      TEXT,
+  updated_at      INTEGER
 );
+
+-- 项目变更审计：只记录管理员对项目配置/状态的修改，不记录业务数据。
+CREATE TABLE IF NOT EXISTS project_audit (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project     TEXT NOT NULL,
+  action      TEXT NOT NULL,                   -- create | update
+  actor       TEXT NOT NULL DEFAULT 'admin',
+  at          INTEGER NOT NULL,
+  before_json TEXT NOT NULL DEFAULT '{}',
+  after_json  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_project_audit_project_at
+  ON project_audit(project, at DESC);
 
 -- 令牌：只存 sha256，明文仅在签发时返回一次
 CREATE TABLE IF NOT EXISTS agents (
