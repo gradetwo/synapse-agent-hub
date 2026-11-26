@@ -42,7 +42,7 @@ if (location.search.includes("reset=1")) {
     document.documentElement.dataset.themePref = preference;
     document.documentElement.style.colorScheme = theme;
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", theme === "light" ? "#f5f7fb" : "#0e1116");
+    if (meta) meta.setAttribute("content", theme === "light" ? "#f6f7f9" : "#0e1116");
     const status = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
     if (status) status.setAttribute("content", theme === "light" ? "default" : "black-translucent");
     if (notify) document.dispatchEvent(new CustomEvent("synapse:themechange", { detail: { preference, theme } }));
@@ -106,66 +106,83 @@ if (location.search.includes("reset=1")) {
     --chart-task-open:#8b98a9; --chart-task-claimed:#6aa9ff; --chart-task-released:#ffd58a;
     --chart-task-blocked:#ff9b9b; --chart-task-done:#86d99e; --chart-task-failed:#ff7b72;
     --chart-task-other:#8b98a9; --chart-purple:#a78bfa;
+    /* 按钮单独取色：避免主按钮与图表/状态色互相绑架 */
+    --btn-bg:#1b222b; --btn-bg-hover:#222b36; --btn-border:#232a33;
+    --btn-primary-bg:#4c8dff; --btn-primary-hover:#6aa9ff; --btn-primary-fg:#0b0f14;
+    --shell-max:1440px; --shell-pad:18px;
   }
   :root[data-theme="light"]{
     color-scheme:light;
-    --bg:#f5f7fb; --panel:#ffffff; --line:#e3e8f0; --fg:#172033; --dim:#667085;
-    --ok:#15803d; --warn:#b45309; --bad:#dc2626; --accent:#2563eb;
-    --canvas:#ffffff; --surface-input:#ffffff; --surface-1:#f8fafc;
-    --surface-sheet:#ffffff; --surface-sheet-head:#f8fafc; --surface-tabs:#f8fafc;
-    --surface-2:#ffffff; --surface-hover:#f3f6fa;
-    --surface-accent-hover:#eef5ff; --surface-accent:#eff6ff; --surface-accent-strong:#dbeafe;
-    --surface-ok:#f0fdf4; --surface-ok-2:#dcfce7; --surface-ok-3:#bbf7d0;
-    --surface-warn:#fffbeb; --surface-warn-2:#fef3c7;
-    --surface-bad:#fef2f2; --surface-bad-2:#fee2e2; --surface-bad-3:#fee2e2;
-    --line-soft:#e8ecf2; --line-strong:#d8e0eb; --line-faint:#edf1f6;
+    --bg:#f6f7f9; --panel:#ffffff; --line:#e4e7ec; --fg:#1f2937; --dim:#667085;
+    --ok:#2f855a; --warn:#9a6700; --bad:#c53030; --accent:#3b5f8a;
+    --canvas:#ffffff; --surface-input:#ffffff; --surface-1:#f9fafb;
+    --surface-sheet:#ffffff; --surface-sheet-head:#f8fafb; --surface-tabs:#f8fafb;
+    --surface-2:#ffffff; --surface-hover:#f2f4f7;
+    --surface-accent-hover:#f4f7fa; --surface-accent:#eff3f7; --surface-accent-strong:#e2e9f0;
+    --surface-ok:#eff9f3; --surface-ok-2:#e3f4ea; --surface-ok-3:#d2ecdf;
+    --surface-warn:#fff8ec; --surface-warn-2:#fdf2df;
+    --surface-bad:#fdf1f0; --surface-bad-2:#fbe4e2; --surface-bad-3:#f8d6d3;
+    --line-soft:#eceff3; --line-strong:#d6dce5; --line-faint:#f0f2f5;
     --fg-strong:#111827; --fg-soft:#334155; --fg-code:#475569; --fg-chip:#475569;
     --dim-2:#667085; --dim-3:#6b7280;
-    --accent-text:#2563eb; --accent-border:#93c5fd; --accent-border-soft:#bfdbfe;
-    --ok-text:#15803d; --ok-soft:#15803d; --ok-border:#bbf7d0; --ok-border-strong:#86efac;
-    --warn-text:#b45309; --warn-bright:#92400e; --warn-dim:#92400e; --warn-soft:#b45309;
-    --warn-border:#fcd34d; --warn-border-strong:#f59e0b; --on-warn:#78350f;
-    --bad-text:#b91c1c; --bad-soft:#7f1d1d; --bad-border:#fecaca;
-    --purple:#7c3aed; --unknown:#94a3b8;
-    --warn-glow:rgba(180,83,9,.08); --gate-bg:rgba(248,250,252,.96); --overlay:rgba(15,23,42,.28); --shadow-soft:rgba(15,23,42,.12); --shadow-strong:rgba(15,23,42,.18);
-    --chart-msg:#2563eb; --chart-sub:#16a34a; --chart-issue:#b45309;
-    --chart-grid:#e2e8f0; --chart-empty:#6b7280; --chart-fg:#111827; --chart-dim:#667085;
-    --chart-cpu:#2563eb; --chart-mem:#16a34a; --chart-disk:#b45309;
-    --chart-task-open:#64748b; --chart-task-claimed:#2563eb; --chart-task-released:#b45309;
-    --chart-task-blocked:#dc2626; --chart-task-done:#15803d; --chart-task-failed:#dc2626;
-    --chart-task-other:#64748b; --chart-purple:#7c3aed;
+    --accent-text:#2f5378; --accent-border:#b9cadb; --accent-border-soft:#d4dfe9;
+    --ok-text:#16794c; --ok-soft:#2f855a; --ok-border:#c6e3d3; --ok-border-strong:#9ed1b5;
+    --warn-text:#8a5a17; --warn-bright:#6f4710; --warn-dim:#8a5a17; --warn-soft:#9a6700;
+    --warn-border:#e8d5b5; --warn-border-strong:#d1b083; --on-warn:#ffffff;
+    --bad-text:#b42318; --bad-soft:#c53030; --bad-border:#f3c7c4;
+    --purple:#6b46c1; --unknown:#94a3b8;
+    --warn-glow:rgba(154,103,0,.05); --gate-bg:rgba(246,247,249,.96); --overlay:rgba(15,23,42,.22); --shadow-soft:rgba(15,23,42,.08); --shadow-strong:rgba(15,23,42,.14);
+    --chart-msg:#3b6ea5; --chart-sub:#2f855a; --chart-issue:#a16207;
+    --chart-grid:#e4e7ec; --chart-empty:#6b7280; --chart-fg:#111827; --chart-dim:#667085;
+    --chart-cpu:#3b6ea5; --chart-mem:#2f855a; --chart-disk:#a16207;
+    --chart-task-open:#64748b; --chart-task-claimed:#3b6ea5; --chart-task-released:#a16207;
+    --chart-task-blocked:#c53030; --chart-task-done:#2f855a; --chart-task-failed:#c53030;
+    --chart-task-other:#64748b; --chart-purple:#6b46c1;
+    --btn-bg:#f6f7f9; --btn-bg-hover:#eceff3; --btn-border:#d6dce5;
+    --btn-primary-bg:#35577f; --btn-primary-hover:#2b4868; --btn-primary-fg:#ffffff;
   }
-  :root[data-theme="light"] .alertbar button.primary{background:#f59e0b;border-color:#f59e0b;color:#451a03}
   :root[data-theme="light"] .gate{background:var(--gate-bg)}
   :root[data-theme="light"] .overlay{background:var(--overlay)}
+  :root[data-theme="light"] .alertbar button.primary{background:var(--btn-primary-bg);border-color:var(--btn-primary-bg);color:var(--btn-primary-fg)}
+  :root[data-theme="light"] .tabs button{background:transparent;border-color:transparent;color:var(--dim)}
+  :root[data-theme="light"] .tabs button:hover{background:var(--surface-hover);color:var(--fg)}
+  :root[data-theme="light"] .tabs button.on{background:var(--panel);border-color:var(--line-strong);color:var(--accent-text);box-shadow:0 1px 2px rgba(15,23,42,.06)}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
-  .bar{display:flex;align-items:center;gap:14px;padding:10px 18px;border-bottom:1px solid var(--line);
-       background:var(--panel);position:sticky;top:0;z-index:9}
+  .bar{display:flex;align-items:center;gap:14px;border-bottom:1px solid var(--line);
+       background:var(--panel);position:sticky;top:0;z-index:9;
+       padding:10px max(var(--shell-pad),calc((100vw - var(--shell-max))/2 + var(--shell-pad)))}
   .bar h1{font-size:14px;font-weight:600;margin:0;display:flex;align-items:center;gap:8px}
   .bar h1::before{content:"";width:7px;height:7px;border-radius:2px;background:var(--accent);flex:0 0 auto;vertical-align:1px}
   #build{max-width:290px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #scope{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #btnMore{display:none}
-  #btnTheme{display:flex;align-items:center;height:34px;width:auto;min-width:76px;padding:0 9px;gap:5px;justify-content:center;font-size:12px;line-height:1;border-color:var(--line-strong);background:var(--surface-input)}
+  #btnTheme{display:flex;align-items:center;height:34px;width:auto;min-width:76px;padding:0 9px;gap:5px;justify-content:center;font-size:12px;line-height:1;border-color:var(--line-strong);background:var(--btn-bg)}
   #btnTheme .themeIcon{font-size:16px;line-height:1}
   #btnTheme:hover{border-color:var(--accent-border);color:var(--accent-text)}
   .muted{color:var(--dim);font-size:12px}
   .seg{margin-left:auto;display:flex;gap:8px;align-items:center}
-  select,button,input,textarea{font:inherit;color:var(--fg);background:var(--surface-input);
+  select,input,textarea{font:inherit;color:var(--fg);background:var(--surface-input);
        border:1px solid var(--line);border-radius:8px;padding:7px 10px}
-  button{cursor:pointer;transition:border-color .15s ease,color .15s ease,background .15s ease,opacity .15s ease}
+  button{font:inherit;color:var(--fg);background:var(--btn-bg);border:1px solid var(--btn-border);
+       border-radius:8px;padding:7px 10px;cursor:pointer;
+       transition:border-color .15s ease,color .15s ease,background .15s ease,opacity .15s ease}
+  button:hover{background:var(--btn-bg-hover);border-color:var(--line-strong)}
   button:disabled{opacity:.45;cursor:not-allowed}
   button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent-border);outline-offset:2px}
-  button.primary{background:var(--accent);border-color:var(--accent);color:var(--canvas);font-weight:600}
+  button.primary{background:var(--btn-primary-bg);border-color:var(--btn-primary-bg);color:var(--btn-primary-fg);font-weight:600}
+  button.primary:hover{background:var(--btn-primary-hover);border-color:var(--btn-primary-hover)}
   button.ghost{background:transparent}
-  .wrap{padding:16px 18px;display:grid;gap:16px;max-width:1280px}
+  .wrap{padding:16px 18px;display:grid;gap:16px;max-width:var(--shell-max);margin:0 auto;width:100%}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
   .card>h2{margin:0;padding:10px 14px;font-size:12px;letter-spacing:.4px;text-transform:uppercase;
            color:var(--dim);border-bottom:1px solid var(--line);font-weight:500;display:flex;gap:10px}
   .card>h2 span{margin-left:auto;text-transform:none;letter-spacing:0}
   table{width:100%;border-collapse:collapse}
+  #subs td:nth-child(1),#subs td:nth-child(2),#tasks td:nth-child(1),#issues td:nth-child(1),#issues td:nth-child(5){
+    white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+  #subs td:nth-child(1),#tasks td:nth-child(1){max-width:340px}
   th,td{padding:9px 14px;text-align:left;border-bottom:1px solid var(--line-soft);white-space:nowrap}
   th{font-size:11px;color:var(--dim);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
   tr:hover td{background:var(--surface-hover)}
@@ -174,7 +191,7 @@ if (location.search.includes("reset=1")) {
   .idle td{opacity:.5}
   .num{text-align:right;font-variant-numeric:tabular-nums}
   .warnv{color:var(--warn)} .badv{color:var(--bad)}
-  .badge{font-size:11px;padding:1px 8px;border-radius:20px;border:1px solid var(--line);color:var(--dim)}
+  .badge{font-size:11px;padding:1px 8px;border-radius:20px;border:1px solid var(--line);color:var(--dim);white-space:nowrap}
   .badge.delivered{color:var(--accent);border-color:var(--accent-border-soft)}
   .badge.collected{color:var(--ok);border-color:var(--ok-border)}
   .badge.archived{opacity:.55}
@@ -238,7 +255,7 @@ if (location.search.includes("reset=1")) {
   .gate .box{position:relative;width:min(420px,90vw);background:var(--panel);border:1px solid var(--line);
         border-radius:12px;padding:22px;display:grid;gap:12px}
   .gate .gateTheme{position:absolute;top:10px;right:10px;width:32px;height:32px;min-width:32px!important;
-        padding:0;border-color:var(--line-strong);background:var(--surface-1);font-size:16px}
+        padding:0;border-color:var(--line-strong);background:var(--btn-bg);font-size:16px}
   .gate h2{margin:0;font-size:15px;font-weight:600}
   .gate p{margin:0;color:var(--dim);font-size:12px;line-height:1.6}
   .gate input{width:100%;padding:9px 11px;font-family:ui-monospace,Menlo,monospace}
@@ -266,6 +283,8 @@ if (location.search.includes("reset=1")) {
   .tabs .cnt{color:var(--dim-2);font-size:11px;margin-left:4px}
   .sndForm{display:grid;gap:10px;padding:12px 14px 14px}
   .quick{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}
+  .detailQuick .ghost{background:var(--btn-bg);border-color:var(--btn-border)}
+  .detailQuick .ghost:hover{background:var(--btn-bg-hover)}
   .sndTop{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(120px,.75fr) auto;gap:8px;align-items:center}
   .sndTop select,.sndTop button{width:100%;min-height:38px}
   .sndTop button{min-width:74px}
@@ -575,12 +594,13 @@ if (location.search.includes("reset=1")) {
   /* ===== 手机触控优先 ===== */
   @media(max-width:640px){
     #scope{display:none}
-    .bar{position:static;flex-wrap:wrap;gap:8px;padding:10px 0}
+    .bar{position:static;flex-wrap:wrap;gap:8px;padding:calc(8px + env(safe-area-inset-top)) 8px 10px}
     .seg{width:100%;display:grid;grid-template-columns:minmax(0,1fr) 44px 64px 46px;gap:8px}
     .seg #liveDot{grid-column:1/-1;justify-self:start;padding:5px 9px!important;grid-row:1}
     .seg #proj{grid-column:1;min-width:0;grid-row:2}
     .seg #btnTheme{grid-column:2;grid-row:2;justify-self:stretch;width:100%!important;min-width:0!important;height:44px!important;padding:0}
     .seg #btnTheme .themeText{display:none}
+    .seg #btnTheme .themeIcon{font-size:20px}
     .seg #btnReload{grid-column:3;grid-row:2}
     .seg #btnMore{grid-column:4;display:block;padding:0;font-size:20px;line-height:1;grid-row:2}
     .seg #btnSettings,.seg #btnPurge,.seg #foldAll,.seg #autoRef{display:none}
@@ -588,12 +608,34 @@ if (location.search.includes("reset=1")) {
       display:block;grid-column:1/-1;width:100%
     }
     .seg select,.seg button{min-height:44px;width:100%}
-    .wrap{padding:0 8px}
+    .tabs{gap:3px;padding:6px 0}
+    .tabs button{padding:8px;font-size:13px;line-height:1.2;min-height:40px;font-weight:500}
+    @media(max-width:380px){
+      .tabs{gap:2px}
+      .tabs button{padding:7px;font-size:12px}
+    }
+    @media(max-width:340px){
+      .tabs{gap:1px}
+      .tabs button{padding:5px;font-size:11px}
+    }
+    .wrap{padding:0 8px calc(24px + env(safe-area-inset-bottom))}
     .card{padding:12px}
     /* 16px 以上：否则 iOS 聚焦输入框会自动放大整页 */
     input,select,textarea,button{font-size:16px}
     button{min-height:42px;padding:0 12px}
-    .mini{min-height:34px;padding:0 10px;font-size:14px}
+    .mini{min-height:36px;padding:0 10px;font-size:14px}
+    .actIcon{width:38px;height:38px;min-width:38px!important;font-size:18px}
+    .quick{grid-template-columns:repeat(2,minmax(0,1fr))}
+    /* 派单表单在手机上压缩两处：指派+按钮同一行，优先级+尝试同一行，截止独占一行 */
+    .taskForm .row3:nth-child(2){grid-template-columns:minmax(0,1fr) 104px;align-items:end}
+    .taskForm .row3:nth-child(3){grid-template-columns:minmax(0,1fr) 92px;align-items:end}
+    .taskForm .row3:nth-child(3) label:nth-child(2){grid-column:1/-1;grid-row:2}
+    .taskForm .row3:nth-child(3) label:nth-child(3){grid-column:2;grid-row:1}
+    .filterbar{flex-wrap:wrap;gap:6px}
+    .filterbar select{flex:1 1 100%;max-width:100%}
+    .filterbar input{flex:1 1 0;min-width:0}
+    .filterbar .muted{flex:0 0 auto;margin-left:auto}
+    .toast{left:12px;right:12px;bottom:calc(16px + env(safe-area-inset-bottom));transform:none;max-width:none;text-align:center}
     .filterbar input{min-height:42px}
     /* 名册：9 列在手机上太挤，收掉"在做什么""基线"两列，保留操作面 */
     table:has(tbody#agents) th:nth-child(3),
@@ -607,11 +649,57 @@ if (location.search.includes("reset=1")) {
     .ovBody{padding:0 0 2px}
     .charts canvas{height:40px}
     .charts{gap:6px}
-    .sheet{padding:12px}
+    /* 任务/交付/Issue：手机端改成卡片行，避免宽表把首列挤成一列字又要横向拖 */
+    table:has(tbody#tasks) thead,table:has(tbody#subs) thead,table:has(tbody#issues) thead{display:none}
+    #tasks,#subs,#issues,#tasks tbody,#subs tbody,#issues tbody{display:block;width:100%;overflow:visible}
+    #tasks tr,#subs tr,#issues tr{display:grid;grid-template-columns:minmax(0,1fr) auto;
+      gap:4px 10px;padding:10px 0;border-bottom:1px solid var(--line-soft);white-space:normal}
+    #tasks td,#subs td,#issues td{display:block;padding:0;border:0;white-space:normal;min-width:0}
+    #tasks td.empty,#subs td.empty,#issues td.empty{grid-column:1/-1;padding:16px 0;text-align:center}
+    #tasks td:nth-child(1){grid-column:1;grid-row:1 / span 2;overflow-wrap:anywhere}
+    #tasks td:nth-child(2){grid-column:2;grid-row:1;justify-self:end;text-align:right;max-width:46%}
+    #tasks td:nth-child(3){grid-column:2;grid-row:2;justify-self:end;text-align:right;font-size:11px;color:var(--dim)}
+    #tasks td:nth-child(4){display:none}
+    #tasks td:nth-child(5){grid-column:1;grid-row:3;font-size:11px;color:var(--dim)}
+    #tasks td:nth-child(5)::before{content:"待取 ";color:var(--dim-2)}
+    #tasks td:nth-child(6){grid-column:2;grid-row:3;justify-self:end;text-align:right;font-size:11px;color:var(--dim)}
+    #tasks td:nth-child(6)::before{content:"裁决 ";color:var(--dim-2)}
+    #tasks td:nth-child(7){grid-column:1/-1;grid-row:4;font-size:11px;color:var(--dim-2)}
+    #tasks td:nth-child(8){grid-column:1/-1;grid-row:5;display:flex;flex-wrap:wrap;gap:6px;margin-top:5px;white-space:normal!important}
+    #tasks td:nth-child(8) button,#tasks td:nth-child(8) select{min-height:36px;width:auto;flex:0 1 auto;font-size:14px;padding:0 10px}
+    #tasks td:nth-child(8) select{max-width:100%}
+
+    #subs td:nth-child(1){grid-column:1/-1;grid-row:1;overflow-wrap:anywhere;font-size:12px}
+    #subs td:nth-child(2){grid-column:1;grid-row:2;overflow-wrap:anywhere;font-size:11px}
+    #subs td:nth-child(3){grid-column:2;grid-row:2;justify-self:end;text-align:right;font-size:11px}
+    #subs td:nth-child(4){grid-column:2;grid-row:1;justify-self:end;align-self:start;font-size:11px;color:var(--dim)}
+    #subs td:nth-child(5){grid-column:1;grid-row:3}
+    #subs td:nth-child(6){grid-column:2;grid-row:3;justify-self:end;text-align:right}
+    #subs td:nth-child(7){grid-column:1/-1;grid-row:4;font-size:11px;color:var(--dim-2)}
+    #subs td:nth-child(8){grid-column:1/-1;grid-row:5;display:flex;flex-wrap:wrap;gap:6px;margin-top:5px;white-space:normal!important}
+    #subs td:nth-child(8) button{min-height:36px;font-size:14px;padding:0 10px}
+
+    #issues td:nth-child(1){grid-column:1/-1;grid-row:1;overflow-wrap:anywhere}
+    #issues td:nth-child(1) div{max-width:none!important}
+    #issues td:nth-child(2){grid-column:1;grid-row:2}
+    #issues td:nth-child(3){grid-column:2;grid-row:2;justify-self:end;text-align:right}
+    #issues td:nth-child(4){grid-column:1;grid-row:3;font-size:11px;color:var(--dim)}
+    #issues td:nth-child(4)::before{content:"报告 ";color:var(--dim-2)}
+    #issues td:nth-child(5){grid-column:1/-1;grid-row:4;font-size:11px}
+    #issues td:nth-child(5)::before{content:"任务 ";color:var(--dim-2)}
+    #issues td:nth-child(6){grid-column:1/-1;grid-row:5;font-size:11px;color:var(--dim-2)}
+    #issues td:nth-child(7){grid-column:1/-1;grid-row:6;display:flex;flex-wrap:wrap;gap:6px;margin-top:5px;white-space:normal!important}
+    #issues td:nth-child(7) button,#issues td:nth-child(7) select{min-height:36px;width:auto;font-size:14px;padding:0 10px}
+
+    .sheet{padding:0}
+    .sheetHead{padding:10px 14px;display:grid;grid-template-columns:minmax(0,1fr) auto;
+      grid-template-areas:"title close" "meta close";gap:2px 10px;align-items:center}
+    .sheetHead b{grid-area:title;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .sheetHead .muted{grid-area:meta;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+    .sheetHead .iconBtn{grid-area:close;min-width:40px!important;width:40px;height:40px;padding:0;justify-self:end}
     .list .row{flex-wrap:wrap}
     .list .row .subsha{display:none}
     .list .row .subid{overflow-wrap:anywhere}
-    .sheetHead button{min-width:72px}
     /* 触控反馈 */
     tr.clickable:active{background:var(--surface-hover)}
     button:active{transform:scale(.98)}
@@ -1033,6 +1121,13 @@ if (location.search.includes("reset=1")) {
       <button class="ghost iconBtn" id="dClose" aria-label="关闭" title="关闭">×</button></div>
     <div class="sheetBody">
     <div class="agentStats" id="dStats"></div>
+    <div class="quick detailQuick" style="margin-top:10px">
+      <button class="ghost" data-dq="sync" data-da="__AGENT__">同步代码</button>
+      <button class="ghost" data-dq="status" data-da="__AGENT__">汇报状态</button>
+      <button class="ghost" data-dq="pause" data-da="__AGENT__">暂停任务</button>
+      <button class="ghost" id="dIdleRemind" hidden>重发提醒</button>
+      <button class="ghost" id="dNotice">发提醒（非任务）</button>
+    </div>
     <div class="launchCard" id="dLaunch"><div class="scopeHint">客户端启动参数加载中…</div></div>
     <div class="launchCard" id="dControl"><div class="scopeHint">远程运行控制加载中…</div></div>
     <div class="launchCard" id="dDiag"><div class="scopeHint">客户端诊断日志加载中…</div></div>
@@ -1073,13 +1168,6 @@ if (location.search.includes("reset=1")) {
       <div><div class="cap">CPU %</div><canvas id="cCpu"></canvas></div>
       <div><div class="cap">内存 MB</div><canvas id="cMem"></canvas></div>
       <div><div class="cap">磁盘占用 %</div><canvas id="cDisk"></canvas></div>
-    </div>
-    <div class="quick" style="margin-top:10px">
-      <button class="ghost" data-dq="sync" data-da="__AGENT__">同步代码</button>
-      <button class="ghost" data-dq="status" data-da="__AGENT__">汇报状态</button>
-      <button class="ghost" data-dq="pause" data-da="__AGENT__">暂停任务</button>
-      <button class="ghost" id="dIdleRemind" hidden>重发提醒</button>
-      <button class="ghost" id="dNotice">发提醒（非任务）</button>
     </div>
     <div class="permBar" style="margin-top:8px">
       <label class="permTtl">定向并发上限
@@ -4677,7 +4765,7 @@ const GROUPS = [
   { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
   { id: "msg",      label: "消息", cards: ["消息流", "定向指令", "广播"] },
   { id: "deli",     label: "交付", cards: ["交付箱"] },
-  { id: "access",   label: "接入", cards: ["签发 token", "注册审批", "登录封禁"] },
+  { id: "access",   label: "接入", cards: ["签发 token", "注册审批", "实时推送", "登录封禁"] },
 ];
 
 function setCardOpen(title, open) {
