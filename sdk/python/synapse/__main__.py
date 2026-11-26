@@ -14,7 +14,7 @@ from .client import Client
 
 
 def cmd_init(a):
-    c = Client.init(a.endpoint, a.project, a.token, a.agent)
+    c = Client.init(a.endpoint, a.project, a.token, a.agent, force=a.force)
     print(f"✓ 已初始化 project={c.project} agent={c.agent_id}")
     print(f"  配置：{c.state_dir / 'config.json'}（600）")
     return 0
@@ -94,6 +94,7 @@ def main(argv=None):
     i.add_argument("--project", required=True)
     i.add_argument("--token", required=True)
     i.add_argument("--agent", default=None)
+    i.add_argument("--force", action="store_true")
     i.set_defaults(fn=cmd_init)
 
     d = sub.add_parser("daemon"); d.set_defaults(fn=cmd_daemon)

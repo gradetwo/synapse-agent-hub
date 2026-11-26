@@ -610,6 +610,44 @@ fn write_private_json(path: &std::path::Path, body: &Value) -> Result<(), String
     Ok(())
 }
 
+/// init 时拒绝明显的文档模板身份；返回命中的字段名。
+fn init_template_field(endpoint: &str, project: &str, agent: &str, token: &str) -> Option<&'static str> {
+    let ep = endpoint.trim().to_ascii_lowercase();
+    if ep.contains("example.com") || ep.contains("example.org") || ep.contains("<endpoint>") {
+        return Some("endpoint");
+    }
+    if matches!(project.trim(), "p" | "<project>" | "project" | "your-project") {
+        return Some("project");
+    }
+    if matches!(agent.trim(), "a" | "<agent>" | "agent" | "your-agent") {
+        return Some("agent");
+    }
+    if matches!(token.trim(), "t" | "<t>" | "<token>" | "token" | "your-token" | "...") {
+        return Some("token");
+    }
+    None
+}
+
+/// 覆盖 config.json 前做一份同目录、600 的备份；返回备份路径。
+fn backup_private_config(path: &std::path::Path) -> Result<PathBuf, String> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let base = format!("{}.bak-{}", path.display(), stamp);
+    let mut backup = PathBuf::from(base);
+    let mut n = 1;
+    while backup.exists() {
+        backup = PathBuf::from(format!("{}.bak-{}-{}", path.display(), stamp, n));
+        n += 1;
+    }
+    fs::copy(path, &backup).map_err(|e| format!("{}: {e}", backup.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&backup, fs::Permissions::from_mode(0o600));
+    }
+    Ok(backup)
+}
+
 fn journal_path(dir: &PathBuf) -> PathBuf { dir.join("inflight.json") }
 
 /// 已投递但尚未“处理完”的消息（收到即落盘，处理完才删）。
@@ -1497,8 +1535,8 @@ fn write_ws_state(dir: &PathBuf, connected: bool, queue: usize,
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
-        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>]\n  synapse-agent run  [--exec \"cmd\"] [--event-cmd \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status\n  synapse-agent wait | peek | profile | subs | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
-  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查；升级后首次 run 自动刷新 /ver → /capabilities → /skill\n\n单机多身份（同一用户同时跑两个 synapse-agent 身份）:\n  所有子命令都可用 --config-dir <路径> 指定状态目录（config.json / cursor.json / run.lock /\n  run.state.json / 本机总线套接字都在该目录下）；也可用环境变量 SYNAPSE_AGENT_DIR 指定。\n  优先级：--config-dir > SYNAPSE_AGENT_DIR > 缺省 ~/.synapse-agent。\n  例：synapse-agent init --config-dir ~/.synapse-agent-2 --endpoint <url> --project <p> --token <t> --agent <id2>\n      synapse-agent run  --config-dir ~/.synapse-agent-2\n  不传覆盖时行为与旧版完全一致；不同目录的实例互不影响，同目录仍只允许一个 run 常驻。\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
+        println!("synapse-agent {}\n\n基础用法:\n  synapse-agent init --endpoint <url> --project <p> --token <t> [--agent <id>] [--force 1]\n  synapse-agent run  [--exec \"cmd\"] [--event-cmd \"cmd\"] [--window 1 | --tmux <target|1|0>] [--proxy <url>|off]\n        --window 1：Windows 收件后先切到 window_conversation 会话再注入 window_app 窗口，UIA/剪贴板验证成功才 ACK。\n        --conversation <标题>：临时指定目标会话标题（特殊标记）；默认用 config.json 的 window_conversation。\n        --tmux <target|1|0>：Linux/macOS 收件后注入 tmux pane（如 %3 或 agent:0.0），看到 [Synapse #seq] 才 ACK；\n                          --tmux 1 使用 tmux-config 保存的目标，--tmux 0 关闭本次投递。\n        代理：默认先探测直连，直连不可用才使用 HTTPS_PROXY/ALL_PROXY 环境代理；--proxy <url> 强制代理，--proxy off 强制直连；NO_PROXY 命中直连。\n  synapse-agent status | whoami | restore [--backup <file>]\n  synapse-agent wait | peek | profile | subs [--mine] | sub-withdraw --submission <id> | get\n  synapse-agent agents | send | broadcast                  # 需 admin token\n  synapse-agent issue --title <t> [--body <s>|--body-file <path>] [--priority low|normal|high|urgent] [--labels <s>] [--self]\n        --self：上报的同时转成 reporter 自己的任务；也可稍后用 issue-take --issue <id> 转换。\n  synapse-agent issue-take --issue <id>                      # reporter 把本人 open Issue 转成自己的任务\n  synapse-agent issues [--status open|closed|merged] [--limit N]  # 需 admin token
+  synapse-agent upgrade [--apply 1] [--platform <tag>]   # 按当前平台选包；默认只检查；升级后首次 run 自动刷新 /ver → /capabilities → /skill\n  init 覆盖已有 config.json 时先写 config.json.bak-<时间>（600）；文档模板值直接拒绝；换 token 需 --force 1。\n\n单机多身份（同一用户同时跑两个 synapse-agent 身份）:\n  所有子命令都可用 --config-dir <路径> 指定状态目录（config.json / cursor.json / run.lock /\n  run.state.json / 本机总线套接字都在该目录下）；也可用环境变量 SYNAPSE_AGENT_DIR 指定。\n  优先级：--config-dir > SYNAPSE_AGENT_DIR > 缺省 ~/.synapse-agent。\n  例：synapse-agent init --config-dir ~/.synapse-agent-2 --endpoint <url> --project <p> --token <t> --agent <id2>\n      synapse-agent run  --config-dir ~/.synapse-agent-2\n  不传覆盖时行为与旧版完全一致；不同目录的实例互不影响，同目录仍只允许一个 run 常驻。\n\n交付（upload/submit 已补齐，deliver 为回合制 agent 一次调用完成）:\n  synapse-agent upload --file <path>                       # 直传 R2，输出 ref\n  synapse-agent submit --kind patch --title <t> --ref <sha>[:<name>] [--ref ...] \\\n                        [--base-sha <sha>] [--checks <json字符串>] [--notes <s>]\n  synapse-agent deliver --file <path> --kind patch --title <t> [--base-sha <sha>]\n\nLinux/macOS tmux 投递（TUI）:\n  synapse-agent tmux-config --target <session:window.pane>  ★设置默认 pane 并开启（如 %3 或 agent:0.0）\n        tmux-config [--show|--clear] 查看/清除；tmux-config --enable 0 只关开关。\n        tmux-config --verify 0 关闭标记验证：alternate-screen TUI（CodeBuddy/Claude）不回显注入文字，\n                           用 0 改为注入即 ACK，避免标记读不到导致 WAL 每 5 秒重投、同一条消息反复粘贴。\n        也可用环境变量 SYNAPSE_TMUX_TARGET / SYNAPSE_TMUX_FORWARD=1 / SYNAPSE_TMUX_VERIFY=0 临时覆盖。\n  synapse-agent tmux-list                                     # 列出所有 pane，找 TUI 目标\n  synapse-agent tmux-send --target <...> (--text <文字>|--file <文件>|--stdin) [--enter 1] [--verify 1]\n        向 pane 注入文字并回车；--verify 1 用正文里的 [Synapse #seq] 标记验证。\n  synapse-agent run --tmux <target|1|0>                       # 收件后注入配置的 TUI pane，成功才 ACK\n\n本地窗口桥（Windows）:\n  synapse-agent win-config --app <应用名> --conversation <特殊标题标记>\n        ★设置默认目标与会话，写入 config.json（如 win-config --app 豆包 --conversation “◆dou-win-133”）\n        win-config [--show|--clear] 查看/清除默认目标与会话。设置后 win-send/win-read/bridge/run --window 1 自动使用。\n        也可用环境变量 SYNAPSE_WINDOW_APP / SYNAPSE_WINDOW_CONVERSATION 临时覆盖。\n  synapse-agent win-list [--app <应用名>] [--match <标题子串>]\n  synapse-agent uia-dump [--app <应用名>]    # 输出 UIA 控件树，用于排查 composer/输入框定位\n        发现窗口。--app 豆包 会按进程名自动找到豆包窗口（推荐，无需手输标题）。\n  synapse-agent win-send (--app <应用名> | --title <子串>) (--text <文字> | --file <UTF-8文件> | --stdin) [--enter 1] [--verify 1] [--method click|paste|copy|both]\n        向目标窗口发送文字。--app 时自动发现进程与窗口；默认 click=点击输入框再粘贴（对 Electron 豆包最稳，支持中文）。\n        ★发代码 / patch 请用 --file <文件> 或 --stdin（type p.patch | ... --stdin）：整段读 UTF-8，绕开命令行 32767 字符上限与转义。\n        --text / --file / --stdin 三选一（同时给时按此优先级取非空）。\n  synapse-agent win-read (--app <应用名> | --title <子串>) [--diff] [--no-restore]\n        读取目标窗口文本；--diff 输出相对上次的新增行（用于提取“新消息”）。\n  synapse-agent win-bridge --title <子串> --mode in|out [--name <管道名>]\n        把窗口对接到本机消息总线：in=窗口新消息读入总线；out=总线消息写入窗口。\n\n本机消息总线:\n  synapse-agent bus-serve [--name <管道名>]\n        常驻监听命名管道，逐条打印收到的 JSON Lines 消息（供配置程序/agent 读取）。\n  synapse-agent bus-send (--text <文字> | --file <UTF-8文件> | --stdin) [--dir in|out] [--topic <t>] [--sender <s>] [--name <管道名>]\n        向本机消息总线投递一条消息。发长文本同样推荐 --file / --stdin。\n  synapse-agent bridge --title <子串> [--name <管道名>] [--poll 3] [--hub 1|0]\n        一站式桥接：窗口↔总线↔Hub（需已 init）。--hub 1 时窗口新消息会 publish 到 Hub。", env!("CARGO_PKG_VERSION"));
         return;
     }
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -1591,31 +1629,93 @@ fn main() {
     match cfg.cmd.as_str() {
         "init" => {
             if cfg.token.is_empty() { eprintln!("init 需要 --token"); std::process::exit(2); }
+            let path = cfg.dir.join("config.json");
+            let force = args_map.get("force").map(|v| cfg_truthy(v)).unwrap_or(false)
+                || flags.contains("force");
+            // 模板值一旦落盘就是不可逆的身份丢失：服务端只存 token_sha，本地没有明文。
+            // 因此 example.com / p / a / t 这组文档示例直接拒绝，--force 也不放行。
+            if let Some(field) = init_template_field(&cfg.endpoint, &cfg.project, &cfg.agent_id, &cfg.token) {
+                eprintln!("✗ 检测到 init 模板值（{field}）；拒绝覆盖配置。请填入真实 endpoint/project/agent/token。");
+                std::process::exit(2);
+            }
+            let old: Value = fs::read_to_string(&path).ok()
+                .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({}));
+            let old_token = old["token"].as_str().unwrap_or("").trim().to_string();
+            if !old_token.is_empty() && old_token != cfg.token && !force {
+                eprintln!("✗ 已存在 {} 的配置（token 与本次不同）；为避免误覆盖，需显式加 --force 1。", cfg.agent_id);
+                eprintln!("  旧配置不会被改写；确认要轮换请重跑并加 --force 1（会先自动备份）。");
+                std::process::exit(2);
+            }
+            let backup = if path.exists() {
+                match backup_private_config(&path) {
+                    Ok(p) => Some(p),
+                    Err(e) => { eprintln!("✗ 覆盖前备份失败，已中止：{e}"); std::process::exit(1); }
+                }
+            } else { None };
             let prof = crate::profile::detect();
             let hb = args_map.get("heartbeat").and_then(|s| s.parse::<u64>().ok())
                 .or_else(|| prof["heartbeat_s"].as_u64()).unwrap_or(cfg.heartbeat_s);
-            let body = json!({
-                "endpoint": cfg.endpoint, "project": cfg.project, "agent_id": cfg.agent_id,
-                "token": cfg.token, "role": cfg.role, "heartbeat_s": hb,
-                "runtime": prof["runtime"], "host": prof["host"], "transport": prof["transport"],
-            });
-            let path = cfg.dir.join("config.json");
-            let tmp = cfg.dir.join("config.json.tmp");
-            if let Err(e) = fs::write(&tmp, serde_json::to_vec_pretty(&body).unwrap_or_default()) {
-                eprintln!("写配置失败：{e}"); std::process::exit(1);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-            }
-            if let Err(e) = fs::rename(&tmp, &path) {
+            // 保留 notify_cmd/tmux/window 等本地配置，不能因为一次 init 把投递面清空。
+            let mut body = old.as_object().cloned().unwrap_or_default();
+            body.insert("endpoint".into(), json!(cfg.endpoint));
+            body.insert("project".into(), json!(cfg.project));
+            body.insert("agent_id".into(), json!(cfg.agent_id));
+            body.insert("token".into(), json!(cfg.token));
+            body.insert("role".into(), json!(cfg.role));
+            body.insert("heartbeat_s".into(), json!(hb));
+            body.insert("runtime".into(), prof["runtime"].clone());
+            body.insert("host".into(), prof["host"].clone());
+            body.insert("transport".into(), prof["transport"].clone());
+            let body = Value::Object(body);
+            if let Err(e) = write_private_json(&path, &body) {
                 eprintln!("落盘配置失败：{e}"); std::process::exit(1);
             }
             println!("✓ 已初始化 project={} agent={}", cfg.project, cfg.agent_id);
             println!("  运行环境：{}/{}，默认传输 {}，心跳 {}s", prof["runtime"].as_str().unwrap_or("generic"),
                      prof["host"].as_str().unwrap_or("local"), prof["transport"].as_str().unwrap_or("ws"), hb);
+            if let Some(p) = backup {
+                println!("  覆盖前备份：{}（600）", p.display());
+            }
             println!("  配置：{}（600）", path.display());
+            return;
+        }
+        "restore" | "restore-config" => {
+            let file = args_map.get("backup").cloned().map(PathBuf::from).or_else(|| {
+                fs::read_dir(&cfg.dir).ok().into_iter().flatten().flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        let name = p.file_name()?.to_string_lossy().to_string();
+                        name.starts_with("config.json.bak-").then_some(p)
+                    })
+                    .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+            });
+            let Some(src) = file else { eprintln!("没有可恢复的 config.json.bak-* 备份"); std::process::exit(2); };
+            let body: Value = fs::read_to_string(&src).ok().and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({}));
+            if body["token"].as_str().unwrap_or("").trim().is_empty() {
+                eprintln!("✗ 备份没有 token：{}", src.display()); std::process::exit(2);
+            }
+            let path = cfg.dir.join("config.json");
+            if path.exists() {
+                match backup_private_config(&path) {
+                    Ok(p) => println!("  当前配置已备份：{}", p.display()),
+                    Err(e) => { eprintln!("✗ 恢复前备份失败，已中止：{e}"); std::process::exit(1); }
+                }
+            }
+            if let Err(e) = write_private_json(&path, &body) {
+                eprintln!("✗ 恢复失败：{e}"); std::process::exit(1);
+            }
+            println!("✓ 已恢复 {} -> {}", src.display(), path.display());
+            println!("  project={} agent={}", body["project"].as_str().unwrap_or("?"),
+                     body["agent_id"].as_str().unwrap_or("?"));
+            println!("  下一步：synapse-agent whoami  # 核 token 真身");
+            return;
+        }
+        "whoami" => {
+            match admin_get(&cfg, &agent, &base, &format!("/p/{}/whoami", cfg.project)) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+                Err(e) => { eprintln!("whoami 失败：{e}"); std::process::exit(1); }
+            }
             return;
         }
         "status" => {
@@ -1835,12 +1935,27 @@ fn main() {
         }
         "subs" => {
             let state = args_map.get("state").cloned().unwrap_or_default();
-            let q = if state.is_empty() { String::from("") } else { format!("?state={state}") };
+            let mine = flags.contains("mine") || args_map.get("mine").map(|v| cfg_truthy(v)).unwrap_or(false);
+            let mut qs: Vec<String> = Vec::new();
+            if !state.is_empty() { qs.push(format!("state={state}")); }
+            if mine { qs.push("mine=1".into()); }
+            let q = if qs.is_empty() { String::new() } else { format!("?{}", qs.join("&")) };
             // 交付只读走数据面：/x/admin 只认 admin token，普通 agent 永远 403
             // （ISS-MWSZPB49-B96120）；服务端已对项目 agent 开放 GET /p/<proj>/submissions。
             match admin_get(&cfg, &agent, &base, &format!("/p/{}/submissions{}", cfg.project, q)) {
                 Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
                 Err(e) => { eprintln!("subs 失败：{e}"); std::process::exit(1); }
+            }
+            return;
+        }
+        "sub-withdraw" | "submission-withdraw" => {
+            let sid = args_map.get("submission").or_else(|| args_map.get("sid"))
+                .cloned().unwrap_or_default().trim().to_string();
+            if sid.is_empty() { eprintln!("sub-withdraw 需要 --submission <id>"); std::process::exit(2); }
+            match admin_post(&cfg, &agent, &base,
+                             &format!("/p/{}/submissions/{}/withdraw", cfg.project, urlencode(&sid)), json!({})) {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+                Err(e) => { eprintln!("sub-withdraw 失败：{e}"); std::process::exit(1); }
             }
             return;
         }
@@ -4610,5 +4725,14 @@ mod discovery_tests {
     fn sha256_hex_matches_known_vector() {
         assert_eq!(sha256_hex(b"abc"),
                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn init_rejects_doc_template_identity() {
+        assert_eq!(init_template_field("https://example.com", "p", "a", "t"), Some("endpoint"));
+        assert_eq!(init_template_field("https://synapse.wangda.today", "p", "a", "t"), Some("project"));
+        assert_eq!(init_template_field("https://synapse.wangda.today", "yeban", "a", "t"), Some("agent"));
+        assert_eq!(init_template_field("https://synapse.wangda.today", "yeban", "doubao-dev-003", "..."), Some("token"));
+        assert_eq!(init_template_field("https://synapse.wangda.today", "yeban", "doubao-dev-003", "real"), None);
     }
 }

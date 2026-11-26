@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Synapse Agent Hub
-  version: 0.5.10
+  version: 0.5.11
   description: |
     多项目 agent 协作中枢。data plane 使用 agent token；control plane 使用 admin token
     或 Cloudflare Access 会话。`/admin/*` 的浏览器别名是 `/console/admin/*`，CLI 别名是
@@ -501,7 +501,8 @@ paths:
         - $ref: '#/components/parameters/Project'
         - { name: state, in: query, schema: { type: string, enum: [delivered, collected, archived] } }
         - { name: task_id, in: query, schema: { type: string } }
-        - { name: review_state, in: query, schema: { type: string, enum: [pending, accepted, approved, rejected] } }
+        - { name: mine, in: query, schema: { type: boolean }, description: 只看当前 token 的交付 }
+        - { name: review_state, in: query, schema: { type: string, enum: [pending, accepted, approved, rejected, withdrawn] } }
       responses:
         '200': { description: 交付数组（最多 100 条，按创建时间倒序） }
         '403': { description: 缺少 submissions.read / submissions.create }
@@ -528,6 +529,25 @@ paths:
         '200': { description: application/zip }
         '404': { description: submission_not_found }
         '413': { description: bundle_too_large / bundle_too_many_files }
+  /p/{project}/submissions/{id}/withdraw:
+    post:
+      summary: 撤回自己尚未被取走的交付
+      description: 误绑/错单自救；仅提交人可撤回 delivered 且未 approved 的交付。撤回后任务回到 open，可重新 claim 修正。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: '{ ok, submission_id, state: archived, review_state: withdrawn, task_link }' }
+        '403': { description: not_submission_owner }
+        '409': { description: not_withdrawable / already_approved }
+  /p/{project}/whoami:
+    get:
+      summary: 用 token 回查服务端身份
+      description: 配置被模板/他人覆盖后，本地 status 不可信；此端点返回 token 对应的 agent_id、role、scopes。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+      responses:
+        '200': { description: '{ agent_id, project, role, scopes, server_version }' }
   /p/{project}/issues:
     get:
       summary: 普通 agent 查询 open 未指派 Issue

@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 import requests
 
-__version__ = "0.5.10"
+__version__ = "0.5.11"
 def _state_dir() -> Path:
     new = os.environ.get("SYNAPSE_STATE_DIR") or os.environ.get("YANSHI_STATE_DIR")
     if new: return Path(new)
@@ -161,16 +161,47 @@ class Client:
         return c
 
     @classmethod
-    def init(cls, endpoint: str, project: str, token: str, agent_id: str | None = None) -> "Client":
-        """安装时调用一次：写入配置（chmod 600）+ 发首拍心跳验证。"""
+    def init(cls, endpoint: str, project: str, token: str, agent_id: str | None = None,
+             force: bool = False) -> "Client":
+        """安装时调用一次：写入配置（chmod 600）+ 发首拍心跳验证。
+
+        已有 config.json 先备份；文档模板身份直接拒绝；换 token 需 force=True，
+        避免示例命令静默覆盖唯一明文 token（服务端只存 token_sha，无法找回）。
+        """
+        ep = endpoint.rstrip("/")
+        if "example.com" in ep.lower() or "example.org" in ep.lower() or "<endpoint>" in ep.lower():
+            raise ValueError("refuse init template endpoint")
+        if project.strip() in {"p", "<project>", "project", "your-project"}:
+            raise ValueError("refuse init template project")
+        if (agent_id or "").strip() in {"a", "<agent>", "agent", "your-agent"}:
+            raise ValueError("refuse init template agent")
+        if token.strip() in {"t", "<t>", "<token>", "token", "your-token", "..."}:
+            raise ValueError("refuse init template token")
         agent_id = agent_id or f"agent-{uuid.uuid4().hex[:6]}"
         d = CONFIG_DIR
         d.mkdir(parents=True, exist_ok=True)
         from .profile import detect
         prof = detect(agent_id)
-        cfg = {"endpoint": endpoint.rstrip("/"), "project": project, "agent_id": agent_id,
-               "token": token, "heartbeat_s": int(prof["heartbeat_s"]), "state_dir": str(d)}
         cfg_path = d / "config.json"
+        old: dict[str, Any] = {}
+        if cfg_path.exists():
+            try:
+                old = json.loads(cfg_path.read_text())
+            except Exception:
+                old = {}
+            old_token = str(old.get("token") or "")
+            if old_token and old_token != token and not force:
+                raise ValueError("config.json exists with a different token; pass force=True to rotate (backup is kept)")
+            backup = cfg_path.with_name(f"{cfg_path.name}.bak-{int(time.time())}")
+            n = 1
+            while backup.exists():
+                backup = cfg_path.with_name(f"{cfg_path.name}.bak-{int(time.time())}-{n}")
+                n += 1
+            backup.write_bytes(cfg_path.read_bytes())
+            os.chmod(backup, 0o600)
+        # 保留 notify_cmd/tmux/window 等已有键，只覆盖身份字段。
+        cfg = {**old, "endpoint": ep, "project": project, "agent_id": agent_id,
+               "token": token, "heartbeat_s": int(prof["heartbeat_s"]), "state_dir": str(d)}
         # 先以 600 建文件再写：避免默认 umask 下的明文窗口
         cfg_tmp = cfg_path.with_suffix(".tmp")
         old_umask = os.umask(0o077)
@@ -469,41 +500,57 @@ class Client:
         """从独立事件游标拉一批事件；不阻塞、不 ACK。
 
         大页经出口代理时可能被截断成 ChunkedEncodingError。服务端单页上限 200，
-        客户端遇到截断/解码失败时自动把本页降到 20 条再拉；drain=True 时
-        继续翻页直到游标不再前进，供 WS 重连后的离线补拉使用。
+        客户端遇到截断/解码/连接重置时自动降页（100→50→20→10），epoch 分支的
+        重取也在同一保护内；到最小页仍失败则带退避重试，drain 已取到的部分不丢。
         """
+        import http.client
         since = self._event_cursor_load()
         page_limit = max(1, min(200, int(limit)))
         out: list[dict] = []
         pages = 0
-        while True:
+        floor_retries = 0
+
+        def build_q() -> str:
             q = f"/p/{self.project}/events?since={since}&limit={page_limit}"
             if topics:
                 q += f"&topics={quote(str(topics), safe='')}"
+            return q
+
+        while True:
             try:
-                r = self._get(q)
+                r = self._get(build_q())
+                ep = r.get("epoch")
+                if ep and ep != self._event_epoch_load():
+                    # 房间重建：seq 归零，旧事件游标不能继续用。
+                    # 重取必须在 try 内，否则这里的截断会绕过降页保护。
+                    self._event_cursor_save(0, ep)
+                    since = 0
+                    r = self._get(build_q())
             except (requests.exceptions.ChunkedEncodingError,
                     requests.exceptions.ContentDecodingError,
-                    requests.ConnectionError) as e:
-                # 大页被代理截断时，同页重试再多次也没用；先降页长再拉。
-                if page_limit > 20 and not isinstance(e, requests.ConnectionError):
-                    page_limit = 20
-                    continue
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    http.client.IncompleteRead,
+                    ConnectionResetError,
+                    json.JSONDecodeError) as e:
+                # 先降页；到 10 条后仍失败则做有上限的退避重试。
                 if page_limit > 10:
-                    page_limit = 10
+                    page_limit = max(10, page_limit // 2)
+                    floor_retries = 0
                     continue
+                if floor_retries < 8:
+                    floor_retries += 1
+                    time.sleep(min(4.0, 0.3 * floor_retries))
+                    continue
+                # 连续在最小页失败：返回已取到的部分，游标停在最后成功页；
+                # 下一轮 drain 会从该游标继续，不让一次坏窗口把整个循环打死。
+                if out:
+                    print(f"[events] drain paused after {len(out)} events: {e}", file=sys.stderr)
+                    break
                 raise
-            ep = r.get("epoch")
-            if ep and ep != self._event_epoch_load():
-                # 房间重建：seq 归零，旧事件游标不能继续用
-                self._event_cursor_save(0, ep)
-                since = 0
-                q = f"/p/{self.project}/events?since=0&limit={page_limit}"
-                if topics:
-                    q += f"&topics={quote(str(topics), safe='')}"
-                r = self._get(q)
+            floor_retries = 0
             events = list(r.get("events") or [])
-            next_cursor = int(r.get("next_cursor") or since)
+            next_cursor = int(r.get("next_event_cursor") or r.get("next_cursor") or since)
             if events:
                 self._event_cursor_save(max(next_cursor, int(events[-1].get("seq") or 0)))
             elif next_cursor > since:

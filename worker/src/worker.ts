@@ -18,7 +18,7 @@ const OBSERVER_SCOPES = ["poll", "heartbeat", "tasks.read", "issues.read", "subm
 // 公开版本探针：只看构建标记，不含任何项目数据/凭据
 const BUILD_TAG = "events-visibility-20261125";
 // SDK 发版号：客户端据此判断是否需要自我升级（与二进制 sha 一起下发，防中间人换包）
-const SDK_VERSION = "0.5.10";
+const SDK_VERSION = "0.5.11";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -308,6 +308,10 @@ export default {
 
     const auth = await authenticate(req, env, project);
     if (!auth.ok) return err(auth.status, auth.reason!);
+    // 身份自检：配置被模板/别人覆盖时，本地 status 看不出来；这里以 token_sha 回查服务端真身。
+    if (action === "whoami" && req.method === "GET")
+      return json({ agent_id: auth.agentId, project, role: auth.role, scopes: auth.scopes,
+                    server_version: { sdk: SDK_VERSION, build: BUILD_TAG } });
     // 观察员是只读身份：可心跳、可 GET 事件/任务/Issue/交付，但不能 claim/report/写 artifact。
     if (auth.role === "observer" && req.method !== "GET" && !action.startsWith("heartbeat"))
       return err(403, "observer_read_only");
@@ -357,10 +361,14 @@ export default {
     // 交付只读在 Worker 侧查 D1 / 拼 bundle，不转发给 DO（DO 没有 submissions 动作，
     // 此前 GET /p/<proj>/submissions 只会得到 404 unknown_action）。
     if (action === "submissions" && req.method === "GET")
-      return listSubmissions(env, project, url, auth.role === "admin");
+      return listSubmissions(env, project, url, auth.role === "admin", auth.agentId ?? "");
     const subBundle = action.match(/^submissions\/([^/]+)\/bundle$/);
     if (subBundle && req.method === "GET")
       return bundleSubmission(env, project, subBundle[1]);
+    // 误绑/错单自救：交付人可撤回自己尚未被管理侧取走的 delivered 交付。
+    const subWithdraw = action.match(/^submissions\/([^/]+)\/withdraw$/);
+    if (subWithdraw && req.method === "POST")
+      return withdrawSubmission(env, project, subWithdraw[1], auth.agentId ?? "", auth.role === "admin");
 
     // Issue 上报同样在 Worker 侧写 D1；权限对所有 agent 默认放行（见 inScope）。
     if (action === "issues" && req.method === "POST")
@@ -397,10 +405,11 @@ export default {
     }
     const doUrl = `https://do/${action}${doSearch}`;
     const init: RequestInit = { method: req.method, headers: { "content-type": "application/json" } };
+    let doBody: any = null;
     if (req.method !== "GET") {
-      const body: any = await req.json().catch(() => ({}));
+      doBody = await req.json().catch(() => ({}));
       // sender 必须由服务端注入：否则 agent 可以自称 admin 或别的 agent（身份伪造）
-      init.body = JSON.stringify({ ...body, project, agent_id: auth.agentId,
+      init.body = JSON.stringify({ ...doBody, project, agent_id: auth.agentId,
                                    sender: auth.agentId, role: auth.role,
                                    ...(action.startsWith("heartbeat") ? { latest_sdk_version: SDK_VERSION } : {}),
                                    ...(pubMaxPerMin ? { max_per_min: pubMaxPerMin } : {}) });
@@ -412,6 +421,8 @@ export default {
       return json({ ...ed, server_version: { sdk: SDK_VERSION, build: BUILD_TAG } }, er.status);
     }
     // DO 的响应统一在边界处补安全头（DO 内部不感知 HTTP 语义）
+    if (action === "tasks/claim" && req.method === "POST" && doBody)
+      return forwardClaimWithQuotaFallback(stub, doUrl, init, env, project, auth.agentId ?? "", doBody);
     const dr = await stub.fetch(new Request(doUrl, init));
     const out = new Response(dr.body, dr);
     for (const [k, v] of Object.entries(SEC_HEADERS)) out.headers.set(k, v);
@@ -652,6 +663,11 @@ const inScope = (s: string[], n: string) => {
   // 用 create 作为兼容别名，避免升级后返工节点突然看不到补丁。
   if (n === "submissions.read")
     return s.includes("submissions.read") || s.includes("submissions.create") || s.includes("admin");
+  // 任务只读：0.5.8 之前签发的 token 没有 tasks.read，但都有 poll/publish；
+  // 空闲提醒与公共池发现都依赖它，不能把存量节点永久挡在 403（ISS-MWVSYHEA-EE3B5B）。
+  if (n === "tasks.read")
+    return s.includes("tasks.read") || s.includes("tasks.claim") || s.includes("tasks.release")
+      || s.includes("poll") || s.includes("publish") || s.includes("heartbeat") || s.includes("admin");
   return s.includes(n) || s.includes("admin") ||
     // 兼容：存量 token 只有 publish，给它们继续走 claim/release 的过渡期。
     ((n === "tasks.claim" || n === "tasks.release") && s.includes("publish"));
@@ -666,6 +682,87 @@ async function projectQuota(env: Env, project: string) {
     maxStorageMb: Number(r?.max_storage_mb ?? 2048),
     maxMsgsPerMin: Number(r?.max_msgs_per_min ?? 60),
   };
+}
+
+/** 当前项目 DO 里的任务横幅；Worker 侧只用它做口径复核，不改状态。 */
+async function taskListFromDo(stub: any): Promise<any[]> {
+  try {
+    const r = await stub.fetch(new Request("https://do/tasks/list"));
+    if (!r.ok) return [];
+    const d: any = await r.json().catch(() => ({}));
+    return Array.isArray(d?.tasks) ? d.tasks : [];
+  } catch { return []; }
+}
+
+/**
+ * 新旧 DO 版本过渡期兜底：老 DO 实例可能仍按“open+blocked”旧口径拒绝 claim。
+ * Worker 先用同一份 tasks/list 复核新口径；确实未超限且是公共任务时，先由服务端
+ * 做一次定向派发（老 DO 对定向任务不查配额），随后立即 claim，避免节点被旧实例锁死。
+ * 一旦 DO 升到 0.5.10，这个分支自然只会出现在异常/回滚场景。
+ */
+async function forwardClaimWithQuotaFallback(
+  stub: any, doUrl: string, init: RequestInit, env: Env, project: string,
+  agentId: string, body: any,
+): Promise<Response> {
+  const first = await stub.fetch(new Request(doUrl, init));
+  const d: any = await first.json().catch(() => ({}));
+  if (first.ok) return json(d, first.status);
+
+  const taskId = String(body?.task_id ?? "").trim();
+  const tasks = await taskListFromDo(stub);
+  const current = tasks.find((t: any) => String(t.task_id ?? t.id ?? "") === taskId);
+  // 误绑自救的第二条旧 DO 兼容：老 claim 对 released/空 owner 直接报 locked，且
+  // 老 settle 不会把任务重开。这里先按“交付人本人”做定向派发，再立即 claim。
+  if (d.error === "released_pending_collection" || d.error === "locked") {
+    if (current && current.state === "released" && current.released_by === agentId) {
+      try {
+        const rr = await stub.fetch(new Request("https://do/tasks/admin-reassign", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project, task_id: taskId, to: agentId, force: true,
+                                 reason: "self_reclaim_released", sender: "system" }),
+        }));
+        if (rr.ok) {
+          const cr = await stub.fetch(new Request(doUrl, init));
+          const cd: any = await cr.json().catch(() => ({}));
+          return json({ ...cd, quota_fallback: true, release_reclaim: true }, cr.status);
+        }
+      } catch { /* 保底返回原始错误 */ }
+    }
+    return json(d, first.status);
+  }
+  if (d.error !== "agent_task_limit_exceeded") return json(d, first.status);
+  const actualIds = tasks
+    .filter((t: any) => t.state === "claimed" && t.owner === agentId
+      && String(t.task_id ?? t.id ?? "") !== taskId) // 重领自己过期任务时排除自身
+    .map((t: any) => String(t.task_id ?? t.id ?? ""))
+    .filter(Boolean);
+  const actual = actualIds.length;
+  const consistent = {
+    error: "agent_task_limit_exceeded", active_tasks: actual, limit: ACTIVE_TASK_LIMIT,
+    task_ids: actualIds.slice(0, 20),
+    message: `你当前名下已 claim 未完成任务 ${actual} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再领取公共任务。`,
+  };
+  if (actual >= ACTIVE_TASK_LIMIT)
+    return json({ ...consistent, quota_consistency: "worker_recount" }, 409);
+  // 只对“公共 open 任务”做兜底；定向/已终结任务不能被这里改写语义。
+  if (!current || current.to || !["open", "claimed"].includes(String(current.state)))
+    return json({ ...consistent, quota_consistency: "stale_do",
+                  detail: "DO 返回的旧口径计数与 Worker 复核不一致，但当前任务不适合自动派发" }, 409);
+
+  try {
+    const rr = await stub.fetch(new Request("https://do/tasks/admin-reassign", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, task_id: taskId, to: agentId, force: true,
+                             reason: "quota_consistency_fallback", sender: "system" }),
+    }));
+    if (!rr.ok) return json({ ...consistent, quota_consistency: "stale_do",
+                              detail: `reassign_${rr.status}` }, 409);
+    const cr = await stub.fetch(new Request(doUrl, init));
+    const cd: any = await cr.json().catch(() => ({}));
+    return json({ ...cd, quota_fallback: true, quota_consistency: "stale_do" }, cr.status);
+  } catch {
+    return json({ ...consistent, quota_consistency: "stale_do", detail: "fallback_unreachable" }, 409);
+  }
 }
 
 /** 管理侧派单提醒：只提醒，不阻断。读取 DO 的 active-load，按同一口径统计。 */
@@ -1043,7 +1140,7 @@ async function admin(req: Request, env: Env, url: URL) {
     const failedProjects: string[] = [];
     for (const project of visible) {
       try {
-        const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.IDFromName("v9:" + project));
+        const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
         const r = await stub.fetch(new Request("https://do/agent/list"));
         const d = await r.json<any>().catch(() => null);
         if (!r.ok) throw new Error(`agent_list_${r.status}`);
@@ -2298,18 +2395,70 @@ async function listOpenIssues(env: Env, project: string, url: URL) {
   return json({ issues: rows.results ?? [], count: (rows.results ?? []).length, limit });
 }
 
+/** 撤回自己尚未被取走的交付；错绑任务时不必等管理员驳回，也不锁死 claim。 */
+async function withdrawSubmission(env: Env, project: string, sid: string, agentId: string, isAdmin: boolean) {
+  if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(sid)) return err(422, "bad_submission_id");
+  const row = await env.DB.prepare(
+    `SELECT submission_id, agent_id, task_id, state, review_state
+       FROM submissions WHERE project = ? AND submission_id = ?`
+  ).bind(project, sid).first<any>();
+  if (!row) return err(404, "submission_not_found");
+  if (!isAdmin && row.agent_id !== agentId) return err(403, "not_submission_owner");
+  if (row.state !== "delivered")
+    return err(409, `not_withdrawable:${row.state}`);
+  if (row.review_state === "approved")
+    return err(409, "already_approved");
+  const now = Date.now();
+  const upd: any = await env.DB.prepare(
+    `UPDATE submissions SET state = 'archived', review_state = 'withdrawn',
+       reviewed_at = ?, reviewed_by = ?, updated_at = ?
+     WHERE project = ? AND submission_id = ? AND state = 'delivered'`
+  ).bind(now, isAdmin ? "admin" : agentId, now, project, sid).run();
+  if (Number(upd?.meta?.changes ?? 0) === 0)
+    return err(409, "not_withdrawable:raced");
+  let taskLink: any = null;
+  if (row.task_id) {
+    const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+    // 老 DO 的 submission-settled 没有 reopen_on_withdraw：它会把 released 直接收成 done，
+    // 反而让撤回后无法再 claim。先显式把任务转回该 agent 的定向 open，再让 DO 重算待取数。
+    if (!isAdmin) {
+      const tasks = await taskListFromDo(stub);
+      const t = tasks.find((x: any) => String(x.task_id ?? x.id ?? "") === String(row.task_id));
+      if (t && t.state !== "done") {
+        await stub.fetch(new Request("https://do/tasks/admin-reassign", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project, task_id: row.task_id, to: agentId, force: true,
+                                 reason: "submission_withdrawn", sender: "system" }),
+        })).catch(() => null);
+      }
+    }
+    const r = await stub.fetch(new Request("https://do/tasks/submission-settled", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, task_id: row.task_id, sender: isAdmin ? "admin" : agentId,
+                             reopen_on_withdraw: true, closed_by: "withdraw" }),
+    })).catch(() => null);
+    taskLink = r ? await r.json().catch(() => ({ error: "settle_bad_payload" }))
+                 : { error: "settle_unreachable" };
+  }
+  return json({ ok: true, submission_id: sid, state: "archived",
+                review_state: "withdrawn", task_id: row.task_id ?? null, task_link: taskLink });
+}
+
 /** 交付列表（只读）：管理面与数据面共用查询；数据面只返回返工需要的字段。
  *  `result`、`reviewed_by`、`reviewed_at`、`overtake_reason` 属于管理侧审计信息，
  *  不返回给普通 agent。 */
-async function listSubmissions(env: Env, project: string, url: URL, full = false) {
+async function listSubmissions(env: Env, project: string, url: URL, full = false, agentId = "") {
   const state = url.searchParams.get("state") ?? "";
   const taskId = url.searchParams.get("task_id") ?? "";
   const review = url.searchParams.get("review_state") ?? "";
   const withCounts = url.searchParams.get("counts") === "1";
+  // 普通 agent 的 “我的交付” 只返回自己的记录；管理侧显式传 all=1 才看全项目。
+  const mine = !full && url.searchParams.get("mine") === "1" && !!agentId;
   const valid = ["delivered", "collected", "archived"].includes(state);
-  const validReview = ["pending", "accepted", "approved", "rejected"].includes(review);
+  const validReview = ["pending", "accepted", "approved", "rejected", "withdrawn"].includes(review);
   const cond = ["project = ?"];
   const vals: any[] = [project];
+  if (mine) { cond.push("agent_id = ?"); vals.push(agentId); }
   if (valid) { cond.push("state = ?"); vals.push(state); }
   if (taskId && /^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) { cond.push("task_id = ?"); vals.push(taskId); }
   if (validReview) { cond.push("review_state = ?"); vals.push(review); }
@@ -3098,6 +3247,8 @@ async function createIssue(req: Request, env: Env, project: string, agentId: str
 // ── 会话（HttpOnly cookie + HMAC 签名）─────────────────────
 const SEC_HEADERS: Record<string, string> = {
   "cache-control": "no-store, no-cache, must-revalidate",
+  // 部署指纹：同一域名的 Worker/DO 可能短暂跨版本，客户端与排查脚本可据此定位。
+  "x-synapse-version": `${SDK_VERSION}+${BUILD_TAG}`,
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
   "referrer-policy": "no-referrer",
@@ -3379,7 +3530,8 @@ function jsonBody(value: unknown): string {
     key === "stack" || key === "stackTrace" ? undefined : val);
 }
 const json = (o: unknown, status = 200) =>
-  new Response(jsonBody(o), { status, headers: { "content-type": "application/json", "x-hub": "1" } });
+  new Response(jsonBody(o), { status, headers: { "content-type": "application/json",
+    "x-hub": "1", "x-synapse-version": `${SDK_VERSION}+${BUILD_TAG}` } });
 const err = (status: number, reason: string) => {
   const r = json({ error: reason }, status);
   if (status === 503) r.headers.set("retry-after", "30");

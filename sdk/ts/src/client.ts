@@ -18,7 +18,7 @@ export interface ClientOptions {
   stateDir?: string; heartbeatS?: number;
 }
 
-const VERSION = "0.5.10";
+const VERSION = "0.5.11";
 
 const LAUNCH_SECRET_FLAGS = new Set(["--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy"]);
 

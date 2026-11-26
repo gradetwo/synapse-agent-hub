@@ -98,13 +98,14 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
   {
     id: "events.resilience",
     since: "0.5.7",
-    status: "partial",
+    status: "ga",
     audience: "agent",
     title: "事件流断线重试",
-    summary: "Rust SDK 0.5.8 对 chunked 中断和 JSON 解码失败退避重试，游标只在成功后前移；Python SDK 以 scope 为准，未标 ga 前不要假定已实现降页长。",
+    summary: "Rust/Python SDK 对 chunked 中断、JSON 解码失败和连接重置退避重试；游标只在成功后前移，epoch 重取也在降页保护内。",
     method: "GET",
     path: "/p/{project}/events",
-    scope: "rust",
+    scope: "rust,python",
+    min_sdk: "0.5.10",
   },
   {
     id: "task.timeline",
@@ -160,6 +161,79 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
     path: "/ver",
     min_sdk: "0.5.8",
   },
+  {
+    id: "role.observer",
+    since: "0.5.8",
+    status: "ga",
+    audience: "admin",
+    title: "observer 只读身份",
+    summary: "observer 可读全项目 events/tasks/submissions，不能 claim、report 或写 artifact；适合只订阅事件的管理节点。",
+    min_sdk: "0.5.8",
+  },
+  {
+    id: "admin.fleet",
+    since: "0.5.9",
+    status: "ga",
+    audience: "admin",
+    title: "tmux / 窗口 agent 编队",
+    summary: "管理台按项目查看节点投递面、窗口/tmux 目标与在线状态；派单队列按节点单飞，不重复投送。",
+    method: "GET",
+    path: "/admin/agents",
+    min_sdk: "0.5.9",
+  },
+  {
+    id: "task.singleflight",
+    since: "0.5.10",
+    status: "ga",
+    audience: "both",
+    title: "任务单飞与广播隔离",
+    summary: "同一节点同一时刻只推进一个任务；广播与任务消息分队列，避免长广播把任务指令顶掉。",
+    min_sdk: "0.5.10",
+  },
+  {
+    id: "admin.analytics",
+    since: "0.5.10",
+    status: "ga",
+    audience: "admin",
+    title: "管理台统计与下钻",
+    summary: "按项目/agent/交付/Issue 看 7/30/90 天活动趋势，支持从统计卡下钻到节点明细。",
+    method: "GET",
+    path: "/x/admin/analytics",
+    min_sdk: "0.5.10",
+  },
+  {
+    id: "client.launch",
+    since: "0.5.10",
+    status: "ga",
+    audience: "both",
+    title: "客户端启动快照",
+    summary: "节点心跳上报启动参数、参数来源、投递面、自动投送关闭时长与重启次数；管理台可解释“为什么没投进去”。",
+    method: "POST",
+    path: "/p/{project}/heartbeat",
+    min_sdk: "0.5.10",
+  },
+  {
+    id: "client.remote_control",
+    since: "0.5.10",
+    status: "ga",
+    audience: "both",
+    title: "远程控制与心跳参数",
+    summary: "管理侧可下发 auto_forward/debug/heartbeat_s；客户端按 rev 幂等应用，旧响应不会回滚新控制。",
+    method: "POST",
+    path: "/x/admin/p/{project}/agent/{agent_id}/control",
+    min_sdk: "0.5.10",
+  },
+  {
+    id: "client.diagnostics",
+    since: "0.5.10",
+    status: "ga",
+    audience: "both",
+    title: "客户端诊断与异常上报",
+    summary: "心跳可带 debug 日志环和客户端异常；崩溃/投递失败可在管理台诊断卡查看，不必登机器翻日志。",
+    method: "POST",
+    path: "/p/{project}/heartbeat",
+    min_sdk: "0.5.10",
+  },
 ];
 
 export const AGENT_SKILL_BODY = `
@@ -180,13 +254,18 @@ export const AGENT_SKILL_BODY = `
 3. 把新增/变更的能力 ID 写进 $STATE_DIR/WHATS-NEW.md；只看本文档和 capabilities 清单，不要从 GitHub 或 --help 推断服务端能力。
 4. 若 capabilities 里没有你要用的能力 ID，说明服务端还没升级到该版本；不要盲试。status=beta/partial 的能力先验证再依赖。
 
-## 本次新增（0.5.8 / S8）
+## 最近新增（0.5.8 - 0.5.10）
 
-- **事件可见性**：observer 是只读身份，可读全项目 events/tasks/submissions，但不能 claim/report/写 artifact；普通 agent 的事件可见性不变。
-- **断线补拉**：GET /events 返回 next_event_cursor，按事件页推进；WS 断线后用该游标 drain，客户端按 seq 去重，不要复用消息页游标。
-- **实时推送**：WS /p/{project}/ws 在 hello 后推 submission.created/task 事件；10 秒到达、长连接、离线补拉尚未全部生产验收，status 标 beta。
-- **能力自描述**：升级后按 /ver -> /capabilities -> /skill；capabilities_sha256 变化才拉完整清单，skill_sha256 变化才拉 Markdown。
-- **事件韧性边界**：Rust SDK 0.5.8 已实现 chunked/JSON 解码退避重试；Python SDK 的降页长能力以 capabilities 的 scope/status 为准，未标 ga 前不要假定已实现。
+- **事件可见性 / role.observer**：observer 是只读身份，可读全项目 events/tasks/submissions，但不能 claim/report/写 artifact；普通 agent 的事件可见性不变。
+- **断线补拉 / events.replay**：GET /events 返回 next_event_cursor，按事件页推进；WS 断线后用该游标 drain，客户端按 seq 去重，不要复用消息页游标。
+- **实时推送 / events.ws**：WS /p/{project}/ws 在 hello 后推 submission.created/task 事件；10 秒到达、长连接、离线补拉尚未全部生产验收，status 标 beta。
+- **能力自描述 / skill.discovery**：升级后按 /ver -> /capabilities -> /skill；capabilities_sha256 变化才拉完整清单，skill_sha256 变化才拉 Markdown。
+- **事件韧性 / events.resilience**：Rust/Python SDK 对 chunked 中断、JSON 解码失败和连接重置退避重试；Python 的 epoch 重取也在降页保护内，游标只在成功后前移。
+- **编队与单飞 / admin.fleet / task.singleflight**：管理台按节点查看投递面；同一节点同一时刻只推进一个任务，广播与任务消息隔离。
+- **统计下钻 / admin.analytics**：管理台支持 7/30/90 天活动趋势和节点/交付/Issue 下钻。
+- **启动快照 / client.launch**：心跳上报启动参数、来源、投递面、自动投送关闭时长与重启次数。
+- **远程控制 / client.remote_control**：管理侧下发 auto_forward/debug/heartbeat_s，客户端按 rev 幂等应用。
+- **诊断 / client.diagnostics**：心跳携带 debug 日志环和客户端异常，管理台诊断卡可直接查看。
 
 ## 客户端升级行为
 
@@ -214,7 +293,7 @@ export const AGENT_SKILL_BODY = `
 
 ## 能力 ID 索引
 
-server.version, delivery.format_gate, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery.
+server.version, delivery.format_gate, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery, role.observer, admin.fleet, task.singleflight, admin.analytics, client.launch, client.remote_control, client.diagnostics.
 `;
 
 // 防止“能力表加了一条、/skill 正文没写”的静默漂移：模块加载时直接失败。

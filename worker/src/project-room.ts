@@ -1526,13 +1526,21 @@ export class ProjectRoom implements DurableObject {
       return json({ error: "already_done", state: t.state }, 409);
     if (t.state === "blocked")
       return json({ error: "blocked", state: t.state }, 409);
-    if (t.state === "released")
-      return json({ error: "released_pending_collection", state: t.state,
-                    pending_submissions: Number(t.pending_submissions ?? 0) }, 409);
-    if (t.state !== "open" && !(t.state === "claimed" && t.lease_until < now))
+    if (t.state === "released") {
+      // 误绑/错单自救：交付人 release 后仍可重新 claim 自己刚放下的任务，修正交付；
+      // 仍待管理侧取件时不能把任务直接判 done，但也不该把 agent 永久锁在门外。
+      const pendingNow = await this.pendingDeliveries(b.project ?? t.project ?? this.projectName(),
+                                                      String(t.task_id ?? t.id ?? ""));
+      if (!(t.released_by === b.agent_id && pendingNow > 0))
+        return json({ error: "released_pending_collection", state: t.state,
+                      pending_submissions: Number(t.pending_submissions ?? pendingNow),
+                      released_by: t.released_by ?? null }, 409);
+    }
+    if (t.state !== "open" && t.state !== "released"
+        && !(t.state === "claimed" && Number(t.lease_until ?? 0) < now))
       return json({ error: "locked", state: t.state, owner: t.owner, lease_until: t.lease_until }, 409);
     const lease = now + this.taskLeaseMs();
-    const next = { ...t, state: "claimed", owner: b.agent_id,
+    const next = { ...t, state: "claimed", owner: b.agent_id, released_by: null,
                    ...(t.to ? { dispatch_state: "active" } : {}),
                    ...(t.state === "claimed" ? {} : { claimed_at: now }),
                    lease_until: lease, updated_at: now };
@@ -1701,6 +1709,25 @@ export class ProjectRoom implements DurableObject {
     const pendingReview = await this.pendingReview(project, b.task_id);
     const unapproved = await this.unapprovedReports(project, b.task_id);
     let state = t.state;
+    // 交付被本人撤回：任务回到 open，让错绑/错单的 agent 能重新 claim 修正；
+    // 不能走默认 canClose 分支把 released 直接收成 done，否则撤回反而关单。
+    if (b.reopen_on_withdraw === true) {
+      const now = Date.now();
+      const reopened = { ...t, state: "open", owner: null, lease_until: 0,
+        pending_submissions: pending, pending_review: pendingReview, updated_at: now,
+        closed_at: null, closed_by: null, reopened_at: now, reopened_by: "submission_withdraw",
+        ...(t.to ? { dispatch_state: "queued" } : {}) };
+      await this.st.put(`task:${b.task_id}`, reopened);
+      await this.reopenIssueForTask(reopened);
+      await this.append({ project, sender: b.sender ?? "system", topic: "task", kind: "open",
+                          to: t.released_by ?? t.to ?? undefined,
+                          payload: { task_id: b.task_id, reopened_by: "submission_withdraw",
+                                     reason: "delivery_withdrawn" },
+                          dedupe_key: `withdraw-reopen:${b.task_id}:${now}` });
+      const promoted = await this.promoteQueue(project, t.to);
+      return json({ ok: true, task_id: b.task_id, state: "open", pending_submissions: pending,
+                    pending_review: pendingReview, unapproved_reports: unapproved, promoted });
+    }
     // 已结任务被明确 rejected：重新打开，绝不让拒收留在 done。
     if (b.reopen_on_reject === true && t.state === "done") {
       state = "open";

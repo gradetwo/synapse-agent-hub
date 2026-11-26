@@ -1,6 +1,6 @@
 {
   "name": "@synapse/agent",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "description": "Synapse Agent Hub SDK (TypeScript)",
   "type": "module",
   "main": "dist/index.js",

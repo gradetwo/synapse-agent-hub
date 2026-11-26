@@ -1,4 +1,4 @@
 Synapse agent-hub source snapshot
 build=events-visibility-20261125
-sdk_version=0.5.10
-snapshot_date=2026-11-25
+sdk_version=0.5.11
+snapshot_date=2026-11-26
