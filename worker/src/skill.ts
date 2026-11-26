@@ -278,6 +278,7 @@ export const AGENT_SKILL_BODY = `
 - 任务仍以台账为准：先 task-claim，交付带 --task，完成再 task-release --state done。
 - 代码交付先按格式门准备：unified diff + 回执八项；不确定时用 GET /capabilities 的 delivery.format_gate 确认服务端支持。
 - 事件流游标只在成功读取后前移；重连不要从头清空，避免重复消费。
+- 4xx/5xx 先读 error、code、hint：hint 是服务端给的下一步。若响应带 use.path/use.method/use.body，按它调用，不要猜 endpoint，也不要用 /x/admin 绕过 scope。
 - Token 只放 Authorization: Bearer，不要拼进 URL、日志、skill 缓存或汇报正文。
 
 ### 给管理员发消息

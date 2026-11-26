@@ -315,6 +315,28 @@ export default {
     // 观察员是只读身份：可心跳、可 GET 事件/任务/Issue/交付，但不能 claim/report/写 artifact。
     if (auth.role === "observer" && req.method !== "GET" && !action.startsWith("heartbeat"))
       return err(403, "observer_read_only");
+    // /send、/messages 是管理侧方向（管理员 -> 节点）；节点给管理员发消息必须走 publish。
+    // 这里在鉴权后、scope 检查前直接给出可执行的替代调用，避免 agent 反复猜 endpoint。
+    if (action === "send" || action === "messages") {
+      const post = req.method === "POST";
+      return err(404, "wrong_endpoint", {
+        action,
+        method: req.method,
+        hint: post
+          ? "普通节点没有 /send 或 /messages POST 接口；/x/admin/.../send 是管理侧入口。节点给管理员发消息请用 POST /p/{project}/publish（scope publish），body 带 dedupe_key，to=admin。"
+          : "消息历史是管理台接口；节点收消息用 GET /p/{project}/inbox?since=<cursor> 或 GET /p/{project}/events。",
+        use: post ? {
+          method: "POST", path: `/p/${project}/publish`, required_scope: "publish",
+          body: { topic: "admin", kind: "notice", to: "admin",
+                  dedupe_key: "node-report-<unique>",
+                  payload: { title: "<title>", body: "<body>" } },
+        } : {
+          method: "GET", path: `/p/${project}/inbox`, params: { since: "<cursor>" },
+        },
+        docs: "/skill#给管理员发消息",
+        capabilities: "/capabilities",
+      });
+    }
     // 交付只读（仅精确的 list / bundle 两个 GET）走 submissions.read：
     // 返工节点要按真实补丁开工，不能要求 admin token（ISS-MWSZPB49-B96120）；
     // 写路径仍按 submissions.create 查，其它 submissions GET 不在这里放行。
@@ -331,7 +353,9 @@ export default {
       : issuePoolRead ? "issues.read"
       : subRead ? "submissions.read" : need(action);
     if (!inScope(auth.scopes!, requiredScope))
-      return err(403, `insufficient_scope: 需要 ${requiredScope}，当前 [${(auth.scopes || []).join(",")}]`);
+      return err(403, `insufficient_scope: 需要 ${requiredScope}，当前 [${(auth.scopes || []).join(",")}]`,
+        { required_scope: requiredScope, granted_scopes: auth.scopes ?? [],
+          hint: `当前 token 缺少 ${requiredScope} scope。先 GET /p/${project}/whoami 核对 scopes，再找管理员换发/扩权；不要改用 /x/admin 绕过权限。` });
     if (auth.projectStatus === "paused" && req.method !== "GET") return err(423, "project_paused");
 
     // 普通 agent 的主动调用记录：心跳/自动 ack/收件不算，其余接口都算“有动作”，
@@ -877,8 +901,12 @@ async function artifact(req: Request, env: Env, project: string, action: string)
   if (!/^[a-f0-9]{64}$/.test(sha)) return err(400, "bad_sha");
   if (auth.projectStatus === "paused" && req.method === "PUT") return err(423, "project_paused");
 
-  if (req.method === "PUT" && !canWrite) return err(403, "insufficient_scope");
-  if (req.method !== "PUT" && !canRead) return err(403, "insufficient_scope");
+  if (req.method === "PUT" && !canWrite)
+    return err(403, "insufficient_scope", { required_scope: "artifact.write",
+      hint: "上传 artifact 需要 artifact.write scope；先 GET /p/{project}/whoami 核对，再找管理员换发 token。" });
+  if (req.method !== "PUT" && !canRead)
+    return err(403, "insufficient_scope", { required_scope: "artifact.read 或 poll/publish",
+      hint: "读取 artifact 需要 artifact.read（或 poll/publish）scope；先 GET /p/{project}/whoami 核对。" });
   if (req.method === "PUT") {
     if (!/^[a-f0-9]{64}$/.test(sha)) return err(400, "bad_sha");
     const hard = Number(env.MAX_SUBMISSION_MB) * 1024 * 1024;
@@ -3532,8 +3560,32 @@ function jsonBody(value: unknown): string {
 const json = (o: unknown, status = 200) =>
   new Response(jsonBody(o), { status, headers: { "content-type": "application/json",
     "x-hub": "1", "x-synapse-version": `${SDK_VERSION}+${BUILD_TAG}` } });
-const err = (status: number, reason: string) => {
-  const r = json({ error: reason }, status);
+
+/** 稳定错误码对应的下一步动作；客户端/agent 先读 hint，不要靠猜或改用管理接口绕过。 */
+const ERROR_HINTS: Record<string, string> = {
+  admin_required: "这是管理侧接口（/admin 或 /x/admin），需要 admin token。普通节点不要调用；节点给管理员发消息请用 POST /p/{project}/publish（scope publish）。",
+  observer_read_only: "observer token 只读：可读事件/任务/Issue/交付，但不能 claim/report/写 artifact。需要写操作时换成普通 agent token，或让管理员执行。",
+  unauthorized: "token 无效、过期、被吊销或与 project 不匹配。先 GET /p/{project}/whoami 自检；仍 401 时重新 enroll 或找管理员换发 token。",
+  bad_credentials: "token 无效、过期、被吊销或与 project 不匹配。先 GET /p/{project}/whoami 自检；仍 401 时重新 enroll 或找管理员换发 token。",
+  not_authenticated: "缺少 Bearer token 或有效会话。节点请带 Authorization: Bearer <token>；不要用 query/cookie 传递节点 token。",
+  insufficient_scope: "当前 token 的 scope 不足。先 GET /p/{project}/whoami 查看 scopes，再找管理员换发/扩权；不要改用 /x/admin 绕过权限。",
+  project_paused: "项目 status=paused，写操作被 423 拒绝；读接口仍可用。联系管理员恢复项目状态后重试。",
+  unknown_action: "当前服务端没有这个 action。先读 GET /capabilities 和 GET /skill；节点给管理员发消息用 POST /p/{project}/publish，不要用 /send。",
+  wrong_endpoint: "接口层级或方向用错了。先读本响应里的 hint/use，再按 /skill 的对应章节调用；不要靠猜 endpoint。",
+  db_unavailable: "D1/DO 暂时不可用，30 秒后重试；保留本地任务/游标，不要重复 claim、重复建任务或反复换 token。",
+  bad_ticket: "WS ticket 一次性且约 90 秒有效；重新 GET /p/{project}/ws-ticket 换新票，不要复用旧票。",
+  upgrade_required: "这是 WebSocket 升级请求；普通 HTTP 请求不要打到 /console/ws。",
+};
+
+const err = (status: number, reason: string, extra: Record<string, unknown> = {}) => {
+  const code = reason.split(":")[0]?.trim() || reason;
+  let hint = ERROR_HINTS[code];
+  if (code === "insufficient_scope") {
+    const need = reason.match(/需要\s*([^，,\]]+)/)?.[1]?.trim();
+    if (need) hint = `当前 token 缺少 ${need} scope。先 GET /p/{project}/whoami 核对 scopes，再找管理员换发/扩权；不要改用 /x/admin 绕过权限。`;
+  }
+  const body: Record<string, unknown> = { error: reason, code, ...(hint ? { hint } : {}), ...extra };
+  const r = json(body, status);
   if (status === 503) r.headers.set("retry-after", "30");
   return r;
 };

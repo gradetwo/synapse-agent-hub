@@ -590,7 +590,9 @@ export class ProjectRoom implements DurableObject {
       }
       case "snapshot":     return this.snapshot();
       case "cron/tick":    return this.tick(body);
-      default:             return json({ error: "unknown_action", action }, 404);
+      default:             return json({ error: "unknown_action", code: "unknown_action", action,
+                                       hint: "当前服务端没有这个 action。先 GET /capabilities 和 GET /skill；节点给管理员发消息用 POST /p/{project}/publish，不要用 /send。",
+                                       capabilities: "/capabilities", docs: "/skill" }, 404);
     }
   }
 
