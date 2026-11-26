@@ -29,6 +29,9 @@
 #
 # 关闭：
 #   ./scripts/tmux-agent-fleet.sh down --session dev-fleet
+#   # down 只停 run/tmux，保留各 agent 的 config.json 与 token。
+#   # 重新拉起原来的配置（不重新 init，不需要 token 文件）：
+#   ./scripts/tmux-agent-fleet.sh up --session dev-fleet --reuse --command 'codex'
 #
 set -euo pipefail
 umask 077
@@ -51,6 +54,7 @@ TOKEN_TTL_DAYS=30
 LAYOUT="windows"
 TMUX_VERIFY=0
 STARTUP_WAIT=6
+BOOTSTRAP_DELAY=5
 READY_REGEX=""
 READY_TIMEOUT=30
 BOOTSTRAP=1
@@ -58,6 +62,7 @@ BOOTSTRAP_TEXT=""
 START_RUN=1
 ATTACH=0
 KEEP_SESSION=0
+REUSE=0
 BIN="${SYNAPSE_AGENT_BIN:-synapse-agent}"
 TMUX_BIN="${SYNAPSE_TMUX_BIN:-tmux}"
 
@@ -72,7 +77,7 @@ up 必填:
   --command CMD              每个 pane 启动的 TUI 命令，如 'codex' / 'claude' / 'bash -lc codex'
   --project NAME             项目，默认 $SYNAPSE_PROJECT 或 yeban
   --endpoint URL             默认 $SYNAPSE_ENDPOINT 或 https://synapse.wangda.today
-  token 来源（三选一）:
+  token 来源（三选一；--reuse 时可省略）:
     --tokens-file PATH       每行 agent_id=token，或按顺序只写 token
     --token TOKEN            仅 count=1 时可用
     --issue-tokens           用 admin token 现场签发（需要 --admin-token-file 或 SYNAPSE_ADMIN_TOKEN）
@@ -80,12 +85,14 @@ up 必填:
 常用:
   --session NAME             默认 synapse-fleet-<时间戳>
   --state-root DIR           默认 ~/.synapse-agent/fleet/<session>
+  --reuse                    复用状态目录里已有的 config.json；用于 down 后原地重启，不需要 token
   --agent-prefix NAME        默认 agent，生成 agent-1..N
   --agent-ids a,b,c          显式 ID；与 --count 二选一
   --layout windows|panes     默认 windows（每个 agent 一个 tmux window）
   --workdir DIR              TUI 工作目录，默认当前目录
   --tmux-verify 0|1          默认 0；alternate-screen TUI 用 0
   --startup-wait SEC         默认 6
+  --bootstrap-delay SEC      TUI ready 后、发送第一条 bootstrap/启动 run 前固定等待，默认 5
   --ready-regex REGEX        等待 pane 内容匹配后再投递 bootstrap
   --ready-timeout SEC        默认 30
   --no-bootstrap             不投递启动说明
@@ -109,6 +116,32 @@ warn() { printf '！%s\n' "$*" >&2; }
 
 trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 shellq() { printf '%q' "$1"; }
+
+# 只读 config.json 的指定字段；失败返回非零，不输出 token。
+cfg_value() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(2)
+v = cfg.get(sys.argv[2], "")
+print(v if isinstance(v, str) else "")
+PY
+}
+
+cfg_has_token() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(2)
+print(1 if str(cfg.get("token", "")).strip() else 0)
+PY
+}
 
 need_arg() {
   [ "$#" -ge 2 ] || die "选项 $1 需要参数"
@@ -134,6 +167,7 @@ while [ "$#" -gt 0 ]; do
     --layout) need_arg "$1" "$@"; LAYOUT="$2"; shift 2 ;;
     --tmux-verify) need_arg "$1" "$@"; TMUX_VERIFY="$2"; shift 2 ;;
     --startup-wait) need_arg "$1" "$@"; STARTUP_WAIT="$2"; shift 2 ;;
+    --bootstrap-delay) need_arg "$1" "$@"; BOOTSTRAP_DELAY="$2"; shift 2 ;;
     --ready-regex) need_arg "$1" "$@"; READY_REGEX="$2"; shift 2 ;;
     --ready-timeout) need_arg "$1" "$@"; READY_TIMEOUT="$2"; shift 2 ;;
     --no-bootstrap) BOOTSTRAP=0; shift ;;
@@ -141,6 +175,7 @@ while [ "$#" -gt 0 ]; do
     --no-run) START_RUN=0; shift ;;
     --attach) ATTACH=1; shift ;;
     --keep-session) KEEP_SESSION=1; shift ;;
+    --reuse) REUSE=1; shift ;;
     --bin) need_arg "$1" "$@"; BIN="$2"; shift 2 ;;
     --tmux-bin) need_arg "$1" "$@"; TMUX_BIN="$2"; shift 2 ;;
     -h|--help|help) usage; exit 0 ;;
@@ -187,6 +222,7 @@ ENDPOINT="${ENDPOINT%/}"
 [[ "$COUNT" =~ ^[0-9]+$ ]] || die "--count 必须是非负整数"
 [[ "$TMUX_VERIFY" == "0" || "$TMUX_VERIFY" == "1" ]] || die "--tmux-verify 只能是 0 或 1"
 [[ "$STARTUP_WAIT" =~ ^[0-9]+$ ]] || die "--startup-wait 必须是非负整数"
+[[ "$BOOTSTRAP_DELAY" =~ ^[0-9]+$ ]] || die "--bootstrap-delay 必须是非负整数"
 [[ "$READY_TIMEOUT" =~ ^[0-9]+$ ]] || die "--ready-timeout 必须是非负整数"
 [[ "$TOKEN_TTL_DAYS" =~ ^[0-9]+$ ]] || die "--token-ttl-days 必须是非负整数"
 [ "$LAYOUT" = "windows" ] || [ "$LAYOUT" = "panes" ] || die "--layout 只能是 windows 或 panes"
@@ -204,6 +240,12 @@ STATE_ROOT="$(cd "$STATE_ROOT" && pwd)"
 command -v "$BIN" >/dev/null 2>&1 || [ -x "$BIN" ] || die "找不到 synapse-agent 二进制：$BIN（用 --bin 指定）"
 command -v "$TMUX_BIN" >/dev/null 2>&1 || [ -x "$TMUX_BIN" ] || die "找不到 tmux：$TMUX_BIN"
 command -v curl >/dev/null 2>&1 || true
+if [ "$REUSE" -eq 1 ] && ! command -v python3 >/dev/null 2>&1; then
+  die "--reuse 需要 python3 读取已有 config.json"
+fi
+if [ "$REUSE" -eq 1 ] && [ "$ISSUE_TOKENS" -eq 1 ]; then
+  die "--reuse 与 --issue-tokens 不能同时使用"
+fi
 
 if "$TMUX_BIN" has-session -t "=$SESSION" 2>/dev/null; then
   die "tmux session 已存在：$SESSION；换一个 --session 或先执行 down"
@@ -254,6 +296,18 @@ if [ -n "$AGENT_IDS_CSV" ]; then
   for i in "${!AGENT_IDS[@]}"; do AGENT_IDS[$i]="$(trim "${AGENT_IDS[$i]}")"; done
 fi
 
+# --reuse 未显式给 ID 时，直接从原 state-root 的 config.json 目录发现 agent。
+if [ "$REUSE" -eq 1 ] && [ "${#AGENT_IDS[@]}" -eq 0 ] && [ "$FILE_HAS_IDS" -eq 0 ]; then
+  shopt -s nullglob
+  for cfg in "$STATE_ROOT"/*/config.json; do
+    id="$(basename "$(dirname "$cfg")")"
+    [[ "$id" =~ ^[A-Za-z0-9._-]{2,40}$ ]] || die "状态目录里有非法 agent-id：$id"
+    AGENT_IDS+=("$id")
+  done
+  shopt -u nullglob
+  [ "${#AGENT_IDS[@]}" -gt 0 ] || die "--reuse 在 $STATE_ROOT 下没有找到 */config.json"
+fi
+
 if [ "${#AGENT_IDS[@]}" -eq 0 ] && [ "$FILE_HAS_IDS" -eq 1 ]; then
   AGENT_IDS=("${FILE_IDS[@]}")
 fi
@@ -290,7 +344,9 @@ fi
 if [ -n "$ONE_TOKEN" ] && [ -n "$TOKENS_FILE" ]; then die "--token 与 --tokens-file 不能同时使用"; fi
 if [ -n "$ONE_TOKEN" ] && [ "$COUNT" -ne 1 ]; then die "--token 只适用于 count=1"; fi
 if [ -z "$TOKENS_FILE" ] && [ -z "$ONE_TOKEN" ] && [ "$ISSUE_TOKENS" -eq 0 ]; then
-  die "缺少 token：用 --tokens-file、--token（count=1），或 --issue-tokens"
+  if [ "$REUSE" -eq 0 ]; then
+    die "缺少 token：用 --tokens-file、--token（count=1），或 --issue-tokens；已有配置可用 --reuse"
+  fi
 fi
 
 # 组装 token
@@ -343,8 +399,29 @@ mkdir -p "$STATE_ROOT/logs"
 # 1) 每个 agent 独立 init（先于 run/TUI，保证状态目录和 SKILL.md 就绪）
 for id in "${AGENT_IDS[@]}"; do
   dir="$STATE_ROOT/$id"
+  if [ "$REUSE" -eq 1 ]; then
+    [ -s "$dir/config.json" ] || die "--reuse 找不到配置：$dir/config.json；先用普通 up 初始化"
+    cfg_agent="$(cfg_value "$dir/config.json" agent_id)" || die "无法解析 config.json：$dir"
+    cfg_endpoint="$(cfg_value "$dir/config.json" endpoint)" || die "无法解析 config.json：$dir"
+    cfg_project="$(cfg_value "$dir/config.json" project)" || die "无法解析 config.json：$dir"
+    cfg_endpoint="${cfg_endpoint%/}"
+    [ "$cfg_agent" = "$id" ] || die "config.json 里的 agent_id 不是 $id：$dir（实际 $cfg_agent）"
+    [ "$cfg_endpoint" = "$ENDPOINT" ] || die "已有配置 endpoint 不一致：$dir（配置 $cfg_endpoint；如需沿用请加 --endpoint $cfg_endpoint）"
+    [ "$cfg_project" = "$PROJECT" ] || die "已有配置 project 不一致：$dir（配置 $cfg_project；如需沿用请加 --project $cfg_project）"
+    [ "$(cfg_has_token "$dir/config.json")" = "1" ] || die "已有配置里没有 token，不能 --reuse：$dir"
+    if [ -f "$dir/run.pid" ]; then
+      old_pid="$(cat "$dir/run.pid" 2>/dev/null || true)"
+      if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        die "agent $id 的 run 仍在运行（pid=$old_pid）；先执行 down 或停止该进程"
+      fi
+      rm -f "$dir/run.pid"
+    fi
+    DIRS+=("$dir")
+    ok "reuse $id -> $dir"
+    continue
+  fi
   if [ -e "$dir/config.json" ]; then
-    die "状态目录已有配置：$dir；换 --session/--state-root，或手工清理后重试"
+    die "状态目录已有配置：$dir；down 后重启请加 --reuse，或换 --session/--state-root"
   fi
   mkdir -p "$dir"
   chmod 700 "$dir" 2>/dev/null || true
@@ -456,6 +533,12 @@ for idx in "${!PANES[@]}"; do
   fi
 done
 ok "TUI ready（startup-wait=${STARTUP_WAIT}s）"
+
+# 等 TUI 真正可输入后再投第一条消息；--ready-regex 命中也可能只是界面画出来了。
+if { [ "$BOOTSTRAP" -eq 1 ] || [ "$START_RUN" -eq 1 ]; } && [ "$BOOTSTRAP_DELAY" -gt 0 ]; then
+  info "等待 ${BOOTSTRAP_DELAY}s 再发送第一条消息"
+  sleep "$BOOTSTRAP_DELAY"
+fi
 
 # 6) 投递 bootstrap：先让 agent 知道自己的 ID 和 skill 位置，再启动 run。
 bootstrap_for() {

@@ -345,6 +345,19 @@ if (location.search.includes("reset=1")) {
   /* 头部关闭还原成 × 图标 */
   .iconBtn{width:34px;height:34px;min-width:34px!important;padding:0;display:flex;align-items:center;justify-content:center;
     font-size:18px;line-height:1;border-radius:9px}
+  /* 移动端详情始终保留一个可点的返回入口：头部滚出视口后不能把人困在详情里 */
+  #dBack{display:none}
+  @media(max-width:720px){
+    #dBack{display:flex;position:fixed;z-index:30;
+      top:calc(env(safe-area-inset-top) + 10px);left:12px;
+      height:42px;min-width:64px;padding:0 12px;border-radius:999px;
+      align-items:center;justify-content:center;gap:2px;
+      border:1px solid var(--line-strong);background:var(--surface-sheet-head);
+      color:var(--fg-strong);font-size:13px;font-weight:600;line-height:1;
+      box-shadow:0 6px 18px var(--shadow-soft)}
+    #dBack:active{background:var(--surface-hover)}
+    #detail .sheetHead{padding-left:88px;position:sticky;top:0;z-index:7;background:var(--surface-sheet-head)}
+  }
   /* 权限一行流：角色 + 有效期 + 三个动作，窄屏自动换行 */
   .permBar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
   .permBar .permRole{margin:0}
@@ -1246,6 +1259,7 @@ if (location.search.includes("reset=1")) {
     <div class="cap" style="margin-top:12px">提交历史</div><div id="dSubs" class="list"></div>
     </div>
   </div>
+  <button type="button" id="dBack" aria-label="返回 agent 列表" title="返回">‹ 返回</button>
 </div>
 <div id="toast" class="toast" hidden></div>
 <script>
@@ -4265,7 +4279,15 @@ function openAgent(id, project, days = detailDays) {
   const sameAgentRefresh = id === detailAgent && ov && !ov.hidden;
   detailAgent = id;
   if (!sameAgentRefresh) LAST_DETAIL = null;
-  if (ov) { ov.hidden = false; ov.style.display = "flex"; document.body.classList.add("has-sheet"); ov.scrollTop = 0; }
+  if (ov) {
+    ov.hidden = false; ov.style.display = "flex";
+    document.body.classList.add("has-sheet");
+    if (!sameAgentRefresh) {
+      const sheetBody = ov.querySelector(".sheetBody");
+      if (sheetBody) sheetBody.scrollTop = 0;
+    }
+    ov.scrollTop = 0;
+  }
   $("dName").textContent = id;
   $("dMeta").textContent = "加载中…";
   document.querySelectorAll("#detail [data-dq]").forEach((b) => { b.dataset.da = id; });
@@ -5352,8 +5374,18 @@ const btnSendEl = $("btnSend");
 if (btnSendEl) btnSendEl.onclick = sendTargeted;
 const btnQuickEl = $("btnQuick");
 if (btnQuickEl) btnQuickEl.onclick = quickRun;
+function closeAgentDetail() {
+  const d = $("detail");
+  if (!d) return;
+  d.hidden = true; d.style.display = "";
+  document.body.classList.remove("has-sheet");
+  const body = d.querySelector(".sheetBody");
+  if (body) body.scrollTop = 0;
+}
 const dCloseEl = $("dClose");
-if (dCloseEl) dCloseEl.onclick = () => { const d = $("detail"); if (d) { d.hidden = true; d.style.display = ""; document.body.classList.remove("has-sheet"); } };
+if (dCloseEl) dCloseEl.onclick = closeAgentDetail;
+const dBackEl = $("dBack");
+if (dBackEl) dBackEl.onclick = closeAgentDetail;
 const iCloseEl = $("issueDetailClose");
 if (iCloseEl) iCloseEl.onclick = () => { const d = $("issueDetail"); if (d) { d.hidden = true; document.body.classList.remove("has-sheet"); } };
 const iOv = $("issueDetail");
