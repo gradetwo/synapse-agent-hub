@@ -95,7 +95,53 @@ components:
             git_head: { type: [string, 'null'] }
             dirty: { type: [boolean, 'null'] }
         sdk_version: { type: string }
+        launch_hash: { type: string, description: 完整 launch 的稳定 SHA-256；用于增量上报 }
         launch: { $ref: '#/components/schemas/Launch' }
+        delivery_health:
+          type: object
+          properties:
+            last_attempt_ms: { type: integer, format: int64 }
+            last_ok_ms: { type: integer, format: int64 }
+            last_error: { type: [string, 'null'], maxLength: 500 }
+            consecutive_failures: { type: integer, minimum: 0 }
+        debug:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            logs:
+              type: array
+              maxItems: 80
+              items:
+                type: object
+                properties:
+                  ts: { type: integer, format: int64 }
+                  level: { type: string, enum: [debug, info, warn, error] }
+                  msg: { type: string, maxLength: 600 }
+        errors:
+          type: array
+          maxItems: 30
+          items: { $ref: '#/components/schemas/ClientError' }
+    ClientError:
+      type: object
+      required: [id, ts, kind, message]
+      properties:
+        id: { type: string, maxLength: 100 }
+        ts: { type: integer, format: int64 }
+        kind: { type: string, enum: [exception, heartbeat, delivery, ws, control, panic, other] }
+        message: { type: string, maxLength: 500 }
+        detail: { type: [string, 'null'], maxLength: 1200 }
+        count: { type: integer, minimum: 1 }
+    RemoteControl:
+      type: object
+      required: [rev, auto_forward, debug]
+      properties:
+        rev: { type: integer, minimum: 0 }
+        auto_forward: { type: string, enum: [inherit, on, off] }
+        debug: { type: boolean }
+        heartbeat_s: { type: [integer, 'null'], minimum: 15, maximum: 300 }
+        updated_at: { type: integer, format: int64 }
+        updated_by: { type: string, maxLength: 80 }
+        applied_rev: { type: integer, minimum: 0, readOnly: true }
     Launch:
       type: object
       description: 客户端启动现场；管理台只展示脱敏后的参数，不采集任意环境变量。
@@ -113,6 +159,20 @@ components:
         platform: { type: string }
         arch: { type: string }
         pid: { type: integer }
+        sources:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [cli, env, config, default, remote]
+          description: 生效参数来源；remote 表示服务端远程控制覆盖
+        control:
+          type: object
+          properties:
+            rev: { type: integer, minimum: 0 }
+            auto_forward: { type: string, enum: [inherit, on, off] }
+            debug: { type: boolean }
+            heartbeat_s: { type: integer, minimum: 15, maximum: 300 }
+            applied_at: { type: integer, format: int64 }
         delivery:
           type: object
           properties:
@@ -685,6 +745,39 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Project'
       responses: { '200': { description: '{ agents: [] }' } }
+  /admin/p/{project}/agent/{agent_id}/control:
+    post:
+      summary: 下发远程运行参数（自动投送 / debug / 心跳周期）
+      description: 只写 DO 的期望状态，由客户端下一次心跳读取并应用；不通过消息通道下发命令。
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - name: agent_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                auto_forward: { type: string, enum: [inherit, on, off] }
+                debug: { type: boolean }
+                heartbeat_s: { type: [integer, 'null'], minimum: 0, maximum: 300, description: '15–300 为有效值；0/null 清除覆盖' }
+      responses:
+        '200':
+          description: '{ ok, agent_id, remote_control }'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  agent_id: { type: string }
+                  remote_control: { $ref: '#/components/schemas/RemoteControl' }
+        '404': { description: agent_not_found }
+        '422': { description: control_field_required / bad_auto_forward / bad_debug / bad_heartbeat_s / delivery_target_missing }
   /admin/p/{project}/snapshot:
     get:
       summary: seq + agents + tasks

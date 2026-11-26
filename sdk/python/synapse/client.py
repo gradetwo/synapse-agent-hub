@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -122,6 +123,18 @@ class Client:
         # 事件订阅与消息订阅分离：事件只通知，不进入任务队列，不会误触 exec/窗口注入。
         self._event_handlers: list = []
         self._event_lock = threading.Lock()
+        # 服务端远程控制：只保存期望状态，真正生效在心跳响应解析后。
+        self._remote_control: dict | None = None
+        self._remote_rev = 0
+        self._remote_applied_ms = 0
+        self._need_launch = True
+        self._debug_logs: list[dict] = []
+        self._client_errors: list[dict] = []
+        self._delivery_health = {
+            "last_attempt_ms": 0, "last_ok_ms": 0, "last_error": "", "consecutive_failures": 0,
+        }
+        self._load_error_outbox()
+        self._install_exception_hooks()
         # 默认直连（NO_PROXY=* 这类环境里 requests 仍可能把 localhost 代理配置套上去）；
         # 需要走公司代理时显式设置 SYNAPSE_TRUST_ENV=1。
         self._sess = requests.Session()
@@ -185,7 +198,130 @@ class Client:
         return {
             "endpoint": self.endpoint, "project": self.project, "agent_id": self.agent_id,
             "token": self._mask(self._token), "cursor": self._cursor_load(), "outbox": self._outbox_count(),
+            "delivery_health": dict(self._delivery_health),
+            "remote_control": dict(self._remote_control) if self._remote_control else None,
+            "debug": self._debug_enabled(),
         }
+
+    # ── 客户端诊断与远程控制 ─────────────────────────────────
+    def _error_outbox_path(self) -> Path:
+        return self.state_dir / "error-outbox.json"
+
+    def _load_error_outbox(self) -> None:
+        try:
+            items = json.loads(self._error_outbox_path().read_text())
+            if isinstance(items, list):
+                self._client_errors = items[:20]
+        except Exception:
+            self._client_errors = []
+
+    def _save_error_outbox(self) -> None:
+        try:
+            self._error_outbox_path().write_text(
+                json.dumps(self._client_errors[-20:], ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _record_error(self, kind: str, message: str, detail: str | None = None) -> None:
+        now = int(time.time() * 1000)
+        self._client_errors.append({
+            "id": f"{now}-{uuid.uuid4().hex[:6]}",
+            "ts": now, "kind": kind,
+            "message": str(message)[:500],
+            "detail": (str(detail)[:1200] if detail else None),
+        })
+        self._client_errors = self._client_errors[-20:]
+        self._save_error_outbox()
+        self._debug_log("error", str(message))
+
+    def _debug_log(self, level: str, msg: str) -> None:
+        self._debug_logs.append({
+            "ts": int(time.time() * 1000), "level": level, "msg": str(msg)[:600],
+        })
+        self._debug_logs = self._debug_logs[-60:]
+
+    def _install_exception_hooks(self) -> None:
+        old_sys = sys.excepthook
+        def sys_hook(exc_type, exc, tb):
+            try:
+                self._record_error("exception", f"{exc_type.__name__}: {exc}",
+                                   "".join(traceback.format_exception(exc_type, exc, tb)))
+            finally:
+                old_sys(exc_type, exc, tb)
+        sys.excepthook = sys_hook
+
+        old_thread = threading.excepthook
+        def thread_hook(args):
+            try:
+                self._record_error("exception",
+                                   f"{args.exc_type.__name__}: {args.exc_value}",
+                                   "".join(traceback.format_exception(
+                                       args.exc_type, args.exc_value, args.exc_traceback)))
+            finally:
+                old_thread(args)
+        threading.excepthook = thread_hook
+
+    def _apply_remote_control(self, control: Any) -> None:
+        prev = self._remote_rev
+        prev_control = self._remote_control
+        if not isinstance(control, dict):
+            had_control = bool(prev or prev_control)
+            self._remote_control = None
+            self._remote_rev = 0
+            if had_control:
+                self._remote_applied_ms = int(time.time() * 1000)
+                self._need_launch = True
+                self._debug_log("info", "remote control cleared; follow local config")
+            return
+        try:
+            rev = int(control.get("rev") or 0)
+        except Exception:
+            rev = 0
+        if rev and rev < prev:
+            return
+        try:
+            hb_s = int(control.get("heartbeat_s") or 0)
+        except Exception:
+            hb_s = 0
+        next_control = {
+            "rev": rev,
+            "auto_forward": control.get("auto_forward") if control.get("auto_forward") in ("inherit", "on", "off") else "inherit",
+            "debug": bool(control.get("debug")),
+            "heartbeat_s": hb_s if 15 <= hb_s <= 300 else 0,
+        }
+        changed = next_control != prev_control
+        self._remote_control = next_control
+        self._remote_rev = rev
+        if changed:
+            self._remote_applied_ms = int(time.time() * 1000)
+            self._need_launch = True
+            self._debug_log("info", f"remote control applied rev={rev}")
+
+    def _auto_mode(self) -> str:
+        return (self._remote_control or {}).get("auto_forward", "inherit")
+
+    def _auto_enabled(self, notify: str | None = None) -> bool:
+        notify = self._notify_cmd() if notify is None else notify
+        if not notify:
+            return False
+        return self._auto_mode() != "off"
+
+    def _debug_enabled(self) -> bool:
+        return bool((self._remote_control or {}).get("debug"))
+
+    def _heartbeat_s(self) -> int:
+        remote = int((self._remote_control or {}).get("heartbeat_s") or 0)
+        return remote if 15 <= remote <= 300 else self.heartbeat_s
+
+    def _debug_payload(self) -> dict:
+        if not self._debug_enabled():
+            return {"enabled": False}
+        return {"enabled": True, "logs": self._debug_logs[-60:]}
+
+    def _launch_hash(self, launch: dict) -> str:
+        import hashlib
+        raw = json.dumps(launch, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     # ── 心跳 ─────────────────────────────────────────────────
     def _launch_snapshot(self) -> dict:
@@ -195,6 +331,21 @@ class Client:
             cwd = os.getcwd()
         except Exception:
             cwd = ""
+        mode = self._auto_mode()
+        enabled = self._auto_enabled(notify)
+        control = {
+            "rev": self._remote_rev,
+            "auto_forward": mode,
+            "debug": self._debug_enabled(),
+            "heartbeat_s": self._heartbeat_s(),
+            "applied_at": self._remote_applied_ms,
+        }
+        sources = {
+            "notify_cmd": "config" if notify else "default",
+            "auto_forward": "remote" if mode != "inherit" else ("config" if notify else "default"),
+            "debug": "remote" if self._remote_rev else "default",
+            "heartbeat_s": "remote" if (self._remote_control or {}).get("heartbeat_s") else "config",
+        }
         return {
             "schema": "synapse.launch.v1",
             "kind": "python",
@@ -206,9 +357,11 @@ class Client:
             "platform": platform.system().lower(),
             "arch": platform.machine(),
             "pid": os.getpid(),
+            "sources": sources,
+            "control": control,
             "delivery": {
-                "auto": bool(notify),
-                "kind": "notify_cmd" if notify else "none",
+                "auto": enabled,
+                "kind": "notify_cmd" if enabled else "none",
                 "target": "",
                 "window_forward": False,
                 "tmux_forward": False,
@@ -219,23 +372,41 @@ class Client:
                 "role": "agent",
                 "agent_id": self.agent_id,
                 "project": self.project,
-                "heartbeat_s": self.heartbeat_s,
+                "heartbeat_s": self._heartbeat_s(),
                 "config_dir": str(self.state_dir),
                 "notify_cmd": "configured" if notify else None,
+                "auto_forward": mode,
+                "debug": self._debug_enabled(),
             },
         }
 
     def heartbeat_once(self) -> dict:
         self._hb_seq += 1
+        launch = self._launch_snapshot()
+        enabled = bool(launch["delivery"]["auto"])
+        include_launch = self._need_launch
         payload = {"hb": self._hb_seq, "agent_id": self.agent_id, "work": asdict(self._work),
-                   "surface": {"kind": "none", "forward": False},
+                   "surface": {"kind": launch["delivery"]["kind"], "forward": enabled},
                    "max_parallel_tasks": 2,
                    "load": self._collect_load(), "env": self._collect_env(),
-                   "sdk_version": __version__, "launch": self._launch_snapshot()}
+                   "sdk_version": __version__,
+                   "launch_hash": self._launch_hash(launch),
+                   "delivery_health": dict(self._delivery_health),
+                   "debug": self._debug_payload(),
+                   "errors": self._client_errors[-20:]}
+        if include_launch:
+            payload["launch"] = launch
         try:
-            return self._post(f"/p/{self.project}/heartbeat", payload)
-        except requests.RequestException as e:
+            res = self._post(f"/p/{self.project}/heartbeat", payload)
+        except Exception as e:
+            self._record_error("heartbeat", "heartbeat request failed", str(e))
+            self._need_launch = True
             return {"ok": False, "error": str(e)}
+        prev_rev = self._remote_rev
+        self._apply_remote_control(res.get("control"))
+        self._need_launch = bool(res.get("launch_required")) or self._remote_rev != prev_rev
+        self._debug_log("debug", f"heartbeat ok control_rev={self._remote_rev}")
+        return res
 
     def start_heartbeat(self) -> None:
         if self._hb_thread and self._hb_thread.is_alive():
@@ -243,8 +414,13 @@ class Client:
 
         def loop():
             while not self._stop.is_set():
-                self.heartbeat_once()
-                self._stop.wait(self.heartbeat_s + random.uniform(0, 15))
+                try:
+                    self.heartbeat_once()
+                except Exception as e:
+                    self._record_error("heartbeat", "heartbeat loop crashed",
+                                       traceback.format_exc())
+                    self._debug_log("error", f"heartbeat loop: {e}")
+                self._stop.wait(self._heartbeat_s() + random.uniform(0, 15))
 
         self._hb_thread = threading.Thread(target=loop, daemon=True, name="yanshi-hb")
         self._hb_thread.start()
@@ -500,12 +676,18 @@ class Client:
                         pass
 
         cmd = self._notify_cmd()
-        if cmd:
+        if cmd and self._auto_enabled(cmd):
+            self._delivery_health["last_attempt_ms"] = int(time.time() * 1000)
             try:
                 subprocess.run(cmd, shell=True, timeout=10,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                self._delivery_health.update(
+                    last_ok_ms=int(time.time() * 1000), last_error="",
+                    consecutive_failures=0)
+            except Exception as e:
+                fails = int(self._delivery_health.get("consecutive_failures") or 0) + 1
+                self._delivery_health.update(last_error=str(e)[:300], consecutive_failures=fails)
+                self._debug_log("warn", f"notify_cmd failed: {e}")
         return delivered
 
     def _notify_cmd(self) -> str | None:

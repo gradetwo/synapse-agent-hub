@@ -3,13 +3,13 @@
 //!        synapse-agent run   --endpoint … --project … --token … [--heartbeat 60]
 
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicUsize, Ordering};
 mod profile;
 mod winmsg;
 mod tmux;
@@ -52,6 +52,8 @@ struct Cfg {
     tmux_target: String,
     /// `run --tmux ...` / config.json 的 tmux_forward：把收件消息注入 tmux 后才 ACK。
     tmux_forward: bool,
+    /// 每个生效字段的来源（cli/env/config/default），用于管理台解释“为什么是关闭”。
+    sources: HashMap<String, String>,
     /// tmux 投递是否要求 pane 回显 `[Synapse #seq]` 标记才 ACK。
     /// alternate-screen TUI（CodeBuddy/Claude 等）不回显注入文字，须设为 false，
     /// 否则 deliver() 永远读不到标记、WAL 每 5 秒重投造成同一条消息被反复粘贴。
@@ -65,6 +67,132 @@ fn cfg_truthy(v: &str) -> bool {
 
 fn cfg_falsey(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+}
+
+// 服务端下发的运行参数。只用原子变量，心跳线程写、投递线程读，不加锁。
+// -1=inherit（跟随本地 config/CLI），0=强制关，1=强制开。
+static REMOTE_AUTO: AtomicI8 = AtomicI8::new(-1);
+static REMOTE_DEBUG: AtomicBool = AtomicBool::new(false);
+static REMOTE_HB_S: AtomicU64 = AtomicU64::new(0);       // 0=跟随本地
+static REMOTE_REV: AtomicU64 = AtomicU64::new(0);
+static REMOTE_APPLIED_MS: AtomicU64 = AtomicU64::new(0);
+
+static DELIVERY_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+static DELIVERY_LAST_OK_MS: AtomicU64 = AtomicU64::new(0);
+static DELIVERY_FAILS: AtomicU64 = AtomicU64::new(0);
+static DELIVERY_LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn delivery_attempt() {
+    DELIVERY_LAST_ATTEMPT_MS.store(now_ms() as u64, Ordering::Relaxed);
+}
+
+fn delivery_result(ok: bool, error: Option<String>) {
+    if ok {
+        DELIVERY_LAST_OK_MS.store(now_ms() as u64, Ordering::Relaxed);
+        DELIVERY_FAILS.store(0, Ordering::Relaxed);
+        if let Ok(mut g) = DELIVERY_LAST_ERROR.get_or_init(|| Mutex::new(String::new())).lock() {
+            g.clear();
+        }
+    } else {
+        DELIVERY_FAILS.fetch_add(1, Ordering::Relaxed);
+        if let Some(e) = error {
+            if let Ok(mut g) = DELIVERY_LAST_ERROR.get_or_init(|| Mutex::new(String::new())).lock() {
+                *g = e.chars().take(300).collect();
+            }
+            record_client_error("delivery", "surface delivery failed", Some(e));
+        }
+    }
+}
+
+fn delivery_health_payload() -> Value {
+    let last_attempt = DELIVERY_LAST_ATTEMPT_MS.load(Ordering::Relaxed);
+    let last_ok = DELIVERY_LAST_OK_MS.load(Ordering::Relaxed);
+    let fails = DELIVERY_FAILS.load(Ordering::Relaxed);
+    let last_error = DELIVERY_LAST_ERROR.get_or_init(|| Mutex::new(String::new()))
+        .lock().map(|g| g.clone()).unwrap_or_default();
+    json!({
+        "last_attempt_ms": last_attempt,
+        "last_ok_ms": last_ok,
+        "last_error": last_error,
+        "consecutive_failures": fails,
+    })
+}
+
+fn remote_auto_state() -> &'static str {
+    match REMOTE_AUTO.load(Ordering::Relaxed) {
+        1 => "on",
+        0 => "off",
+        _ => "inherit",
+    }
+}
+
+fn remote_debug_enabled() -> bool {
+    REMOTE_DEBUG.load(Ordering::Relaxed)
+}
+
+fn runtime_heartbeat_s(cfg: &Cfg) -> u64 {
+    let remote = REMOTE_HB_S.load(Ordering::Relaxed);
+    if (15..=300).contains(&remote) { remote } else { cfg.heartbeat_s.max(1) }
+}
+
+/// 本地命令行/config 的投递面，不含远程覆盖。
+fn local_surfaces(cfg: &Cfg) -> (bool, bool) {
+    (cfg.window_forward, cfg.tmux_forward)
+}
+
+/// 远程覆盖后的实际投递面。开启自动投送但没有目标时返回 (false,false)，由调用方保留 WAL。
+fn effective_surfaces(cfg: &Cfg) -> (bool, bool) {
+    match REMOTE_AUTO.load(Ordering::Relaxed) {
+        1 => {
+            let window = cfg.window_forward || !cfg.window_app.trim().is_empty();
+            let tmux = !window && (cfg.tmux_forward || !cfg.tmux_target.trim().is_empty());
+            (window, tmux)
+        }
+        0 => (false, false),
+        _ => local_surfaces(cfg),
+    }
+}
+
+fn effective_surface_forward(cfg: &Cfg) -> bool {
+    let (w, t) = effective_surfaces(cfg);
+    w || t
+}
+
+fn apply_remote_control(control: &Value) {
+    let prev_rev = REMOTE_REV.load(Ordering::Relaxed);
+    let prev_state = remote_auto_state().to_string();
+    let prev_debug = remote_debug_enabled();
+    if control.is_null() || !control.is_object() {
+        let had_control = prev_rev > 0 || prev_state != "inherit" || prev_debug;
+        REMOTE_AUTO.store(-1, Ordering::Relaxed);
+        REMOTE_DEBUG.store(false, Ordering::Relaxed);
+        REMOTE_HB_S.store(0, Ordering::Relaxed);
+        REMOTE_REV.store(0, Ordering::Relaxed);
+        if had_control {
+            REMOTE_APPLIED_MS.store(now_ms() as u64, Ordering::Relaxed);
+            diag_log("info", "remote control cleared; follow local config");
+        }
+        return;
+    }
+    let rev = control["rev"].as_u64().unwrap_or(0);
+    if rev > 0 && rev < prev_rev {
+        // 乱序/旧响应不能把新控制回滚。
+        return;
+    }
+    let auto = match control["auto_forward"].as_str().unwrap_or("inherit") {
+        "on" => 1, "off" => 0, _ => -1,
+    };
+    let debug = control["debug"].as_bool().unwrap_or(false);
+    let hb = control["heartbeat_s"].as_u64().unwrap_or(0);
+    REMOTE_AUTO.store(auto, Ordering::Relaxed);
+    REMOTE_DEBUG.store(debug, Ordering::Relaxed);
+    REMOTE_HB_S.store(if (15..=300).contains(&hb) { hb } else { 0 }, Ordering::Relaxed);
+    REMOTE_REV.store(rev, Ordering::Relaxed);
+    let next_state = remote_auto_state();
+    if prev_state != next_state || prev_debug != debug || rev != prev_rev {
+        REMOTE_APPLIED_MS.store(now_ms() as u64, Ordering::Relaxed);
+        diag_log("info", format!("remote control applied rev={rev} auto={next_state} debug={debug}"));
+    }
 }
 
 /// 解析窗口命令的目标：命令行 --app/--title 优先，否则用 config.json 的默认值，再退环境变量。
@@ -83,9 +211,9 @@ fn resolve_target(app: &str, title: &str, default_app: &str) -> Result<winmsg::W
 }
 
 impl Cfg {
-    /// 是否开启了任意外部投递面（Windows 窗口 / Linux-macOS tmux）。
+    /// 是否开启了任意外部投递面（含服务端远程覆盖）。
     fn surface_forward(&self) -> bool {
-        self.window_forward || self.tmux_forward
+        effective_surface_forward(self)
     }
 
     /// 管理身份才允许项目广播进 TUI；服务端 token 的 role 才是权威判定，
@@ -105,7 +233,7 @@ impl Cfg {
             window_app: self.window_app.clone(), window_conversation: self.window_conversation.clone(),
             window_forward: self.window_forward,
             tmux_target: self.tmux_target.clone(), tmux_forward: self.tmux_forward,
-            tmux_verify: self.tmux_verify,
+            tmux_verify: self.tmux_verify, sources: self.sources.clone(),
         }
     }
 
@@ -193,6 +321,42 @@ impl Cfg {
             .or_else(|| std::env::var("SYNAPSE_TMUX_VERIFY").ok().filter(|s| !s.is_empty()).map(|v| cfg_truthy(&v)))
             .or_else(|| saved["tmux_verify"].as_bool())
             .unwrap_or(true);
+        let mut sources: HashMap<String, String> = HashMap::new();
+        let mut src = |key: &str, cli: bool, config: bool, env: bool| {
+            let v = if cli { "cli" } else if env { "env" } else if config { "config" } else { "default" };
+            sources.insert(key.to_string(), v.to_string());
+        };
+        src("cmd", true, false, false);
+        src("config_dir", map.contains_key("config-dir"), false,
+            std::env::var("SYNAPSE_AGENT_DIR").ok().filter(|s| !s.trim().is_empty()).is_some());
+        src("endpoint", map.contains_key("endpoint"), saved.get("endpoint").is_some(),
+            std::env::var("SYNAPSE_ENDPOINT").ok().or_else(|| std::env::var("YANSHI_ENDPOINT").ok()).is_some());
+        src("project", map.contains_key("project"), saved.get("project").is_some(),
+            std::env::var("SYNAPSE_PROJECT").ok().or_else(|| std::env::var("YANSHI_PROJECT").ok()).is_some());
+        src("token", map.contains_key("token"), saved.get("token").is_some(),
+            std::env::var("SYNAPSE_TOKEN").ok().or_else(|| std::env::var("YANSHI_TOKEN").ok()).is_some());
+        src("agent_id", map.contains_key("agent"), saved.get("agent_id").is_some(), false);
+        src("role", map.contains_key("role"), saved.get("role").is_some(),
+            std::env::var("SYNAPSE_AGENT_ROLE").ok().is_some());
+        src("heartbeat_s", map.contains_key("heartbeat"), saved.get("heartbeat_s").is_some(), false);
+        src("window_app", map.contains_key("app"), saved.get("window_app").is_some(), false);
+        src("window_conversation",
+            map.contains_key("conversation") || map.contains_key("window-conversation"),
+            saved.get("window_conversation").is_some(),
+            std::env::var("SYNAPSE_WINDOW_CONVERSATION").ok().is_some());
+        src("window_forward", map.contains_key("window"), saved.get("window_forward").is_some(),
+            std::env::var("SYNAPSE_WINDOW_FORWARD").ok().is_some());
+        src("tmux_target", tmux_arg.as_deref().map(|v| !cfg_truthy(v) && !cfg_falsey(v)).unwrap_or(false),
+            saved.get("tmux_target").is_some(),
+            std::env::var("SYNAPSE_TMUX_TARGET").ok().filter(|s| !s.is_empty()).is_some());
+        src("tmux_forward", tmux_arg.is_some(), saved.get("tmux_forward").is_some(),
+            std::env::var("SYNAPSE_TMUX_FORWARD").ok().filter(|s| !s.is_empty()).is_some());
+        src("tmux_verify", map.contains_key("tmux-verify"), saved.get("tmux_verify").is_some(),
+            std::env::var("SYNAPSE_TMUX_VERIFY").ok().filter(|s| !s.is_empty()).is_some());
+        src("exec", map.contains_key("exec"), false, false);
+        src("event_cmd", map.contains_key("event-cmd"), saved.get("event_cmd").is_some(),
+            std::env::var("SYNAPSE_EVENT_CMD").ok().filter(|s| !s.trim().is_empty()).is_some()
+              || std::env::var("YANSHI_EVENT_CMD").ok().filter(|s| !s.trim().is_empty()).is_some());
         Cfg { cmd, endpoint, project, token, agent_id, role, exec_cmd: map.get("exec").cloned(),
               event_cmd: map.get("event-cmd").cloned().filter(|s| !s.trim().is_empty())
                 .or_else(|| saved["event_cmd"].as_str().map(|s| s.to_string())
@@ -201,7 +365,8 @@ impl Cfg {
                   .filter(|s| !s.trim().is_empty()))
                 .or_else(|| std::env::var("YANSHI_EVENT_CMD").ok()
                   .filter(|s| !s.trim().is_empty())),
-              heartbeat_s, dir, window_app, window_conversation, window_forward, tmux_target, tmux_forward, tmux_verify }
+              heartbeat_s, dir, window_app, window_conversation, window_forward, tmux_target, tmux_forward, tmux_verify,
+              sources }
     }
 }
 
@@ -936,7 +1101,7 @@ fn forward_to_tmux_impl(cfg: &Cfg, m: &Value) -> bool {
     if surface_was_delivered(m) {
         return true;
     }
-    if !cfg.tmux_forward || is_surface_noise(cfg, m) {
+    if !effective_surfaces(cfg).1 || is_surface_noise(cfg, m) {
         return true;
     }
     let Some(raw) = format_hub_message(m) else { return true; };
@@ -977,11 +1142,24 @@ fn forward_to_tmux_impl(cfg: &Cfg, m: &Value) -> bool {
 
 /// 按配置选择外部投递面：tmux 优先（Linux/macOS），否则 Windows 窗口。
 fn forward_to_surface_impl(cfg: &Cfg, m: &Value) -> bool {
-    if cfg.tmux_forward {
+    let (window, tmux) = effective_surfaces(cfg);
+    if !window && !tmux {
+        return true;
+    }
+    delivery_attempt();
+    let ok = if tmux {
         forward_to_tmux_impl(cfg, m)
     } else {
         forward_to_window_impl(cfg, m)
+    };
+    if !ok {
+        delivery_result(false, Some(format!("{} 投递失败 seq={}", surface_kind(cfg),
+                                            seq_of(m).unwrap_or(0))));
+    } else {
+        delivery_result(true, None);
+        diag_log("debug", format!("delivered seq={}", seq_of(m).unwrap_or(0)));
     }
+    ok
 }
 
 /// 外部投递串行化：Windows 窗口注入是全局鼠标/键盘操作；tmux 投递也共用此锁，
@@ -1036,7 +1214,7 @@ fn forward_to_window_impl(cfg: &Cfg, m: &Value) -> bool {
     if surface_was_delivered(m) {
         return true;
     }
-    if !cfg.window_forward || is_surface_noise(cfg, m) {
+    if !effective_surfaces(cfg).0 || is_surface_noise(cfg, m) {
         return true;
     }
     let Some(text) = format_hub_message(m) else { return true; };
@@ -1328,6 +1506,12 @@ fn main() {
         return;
     }
     let cfg = Cfg::from_args();
+    load_error_outbox(&cfg.dir);
+    {
+        std::panic::set_hook(Box::new(|info| {
+            record_client_error("panic", info.to_string(), Some("rust panic hook".into()));
+        }));
+    }
     if matches!(cfg.cmd.as_str(), "run" | "ws") {
         if cfg.window_forward && cfg.tmux_forward {
             eprintln!("window_forward 与 tmux_forward 不能同时开启；Linux/macOS 用 --tmux <target>，Windows 用 --window 1");
@@ -3094,12 +3278,14 @@ fn ws_ticket(cfg: &Cfg, agent: &Agent, base: &str) -> Result<String, String> {
 }
 
 fn surface_kind(cfg: &Cfg) -> &'static str {
-    if cfg.window_forward { "window" } else if cfg.tmux_forward { "tmux" } else { "none" }
+    let (window, tmux) = effective_surfaces(cfg);
+    if window { "window" } else if tmux { "tmux" } else { "none" }
 }
 
 fn surface_target(cfg: &Cfg) -> String {
-    if cfg.window_forward { cfg.window_app.clone() }
-    else if cfg.tmux_forward { cfg.tmux_target.clone() }
+    let (window, tmux) = effective_surfaces(cfg);
+    if window { cfg.window_app.clone() }
+    else if tmux { cfg.tmux_target.clone() }
     else { String::new() }
 }
 
@@ -3151,6 +3337,104 @@ fn redacted_argv(argv: &[String]) -> Vec<String> {
 
 /// 心跳里带一份“最后一次启动现场”：原始命令行 + 解析后的生效开关。
 /// 其中 delivery.auto=false 表示没有开启窗口/tmux 外部投送，管理台直接可见。
+/// 客户端诊断环形缓冲：debug 只在服务端打开时随心跳上传；异常始终保留最近 N 条。
+static DIAG_LOGS: OnceLock<Mutex<VecDeque<Value>>> = OnceLock::new();
+static CLIENT_ERRORS: OnceLock<Mutex<VecDeque<Value>>> = OnceLock::new();
+static ERROR_SEQ: AtomicU64 = AtomicU64::new(1);
+static ERROR_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn error_outbox_path() -> Option<&'static PathBuf> {
+    ERROR_DIR.get()
+}
+
+fn save_error_outbox() {
+    let dir = match error_outbox_path() { Some(d) => d, None => return };
+    let body = CLIENT_ERRORS.get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock().map(|g| json!(g.iter().cloned().collect::<Vec<_>>())).unwrap_or_else(|_| json!([]));
+    let _ = fs::write(dir.join("error-outbox.json"), body.to_string());
+}
+
+fn load_error_outbox(dir: &std::path::Path) {
+    let _ = ERROR_DIR.set(dir.to_path_buf());
+    let path = dir.join("error-outbox.json");
+    let parsed: Value = fs::read_to_string(&path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!([]));
+    if let Some(items) = parsed.as_array() {
+        let ring = CLIENT_ERRORS.get_or_init(|| Mutex::new(VecDeque::new()));
+        if let Ok(mut g) = ring.lock() {
+            for item in items.iter().take(20) { g.push_back(item.clone()); }
+            while g.len() > 20 { g.pop_front(); }
+        }
+    }
+}
+
+fn diag_log(level: &str, msg: impl Into<String>) {
+    let entry = json!({
+        "ts": now_ms() as u64,
+        "level": level,
+        "msg": msg.into().chars().take(600).collect::<String>(),
+    });
+    let ring = DIAG_LOGS.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Ok(mut g) = ring.lock() {
+        g.push_back(entry);
+        while g.len() > 60 { g.pop_front(); }
+    }
+}
+
+fn record_client_error(kind: &str, message: impl Into<String>, detail: Option<String>) {
+    let id = format!("{}-{}", now_ms(), ERROR_SEQ.fetch_add(1, Ordering::Relaxed));
+    let entry = json!({
+        "id": id,
+        "ts": now_ms() as u64,
+        "kind": kind,
+        "message": message.into().chars().take(500).collect::<String>(),
+        "detail": detail.map(|s| s.chars().take(1200).collect::<String>()),
+    });
+    let ring = CLIENT_ERRORS.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Ok(mut g) = ring.lock() {
+        g.push_back(entry);
+        while g.len() > 20 { g.pop_front(); }
+    }
+    save_error_outbox();
+}
+
+fn debug_payload() -> Value {
+    if !remote_debug_enabled() { return json!({"enabled": false}); }
+    let logs: Vec<Value> = DIAG_LOGS.get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock().map(|g| g.iter().cloned().collect()).unwrap_or_default();
+    json!({"enabled": true, "logs": logs})
+}
+
+fn errors_payload() -> Value {
+    let errors: Vec<Value> = CLIENT_ERRORS.get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock().map(|g| g.iter().cloned().collect()).unwrap_or_default();
+    json!(errors)
+}
+
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys.into_iter()
+                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(),
+                                 canonical_json(&map[k])))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(a) => format!("[{}]", a.iter().map(canonical_json).collect::<Vec<_>>().join(",")),
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
+fn launch_digest(launch: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let text = canonical_json(launch);
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 fn launch_snapshot(cfg: &Cfg) -> Value {
     let argv = redacted_argv(startup_argv());
     // 代理地址可能带 user:pass，命令行里已脱敏；这里只保留可判断的模式。
@@ -3163,6 +3447,25 @@ fn launch_snapshot(cfg: &Cfg) -> Value {
     } else if let Some(v) = raw_argv.iter().find_map(|a| a.strip_prefix("--proxy=")) {
         proxy = if cfg_falsey(v) { "off".to_string() } else { "custom".to_string() };
     }
+    let (window_forward, tmux_forward) = effective_surfaces(cfg);
+    let mut sources = cfg.sources.clone();
+    if remote_auto_state() != "inherit" {
+        sources.insert("window_forward".into(), "remote".into());
+        sources.insert("tmux_forward".into(), "remote".into());
+        sources.insert("auto_forward".into(), "remote".into());
+    } else {
+        sources.insert("auto_forward".into(),
+            if window_forward || tmux_forward { "config".into() } else { "default".into() });
+    }
+    if REMOTE_HB_S.load(Ordering::Relaxed) > 0 { sources.insert("heartbeat_s".into(), "remote".into()); }
+    if REMOTE_REV.load(Ordering::Relaxed) > 0 { sources.insert("debug".into(), "remote".into()); }
+    let control = json!({
+        "rev": REMOTE_REV.load(Ordering::Relaxed),
+        "auto_forward": remote_auto_state(),
+        "debug": remote_debug_enabled(),
+        "heartbeat_s": runtime_heartbeat_s(cfg),
+        "applied_at": REMOTE_APPLIED_MS.load(Ordering::Relaxed),
+    });
     json!({
         "schema": "synapse.launch.v1",
         "kind": "rust",
@@ -3174,14 +3477,16 @@ fn launch_snapshot(cfg: &Cfg) -> Value {
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "pid": std::process::id(),
+        "sources": sources,
+        "control": control,
         "delivery": {
-            "auto": cfg.surface_forward(),
+            "auto": window_forward || tmux_forward,
             "kind": surface_kind(cfg),
             "target": surface_target(cfg),
-            "window_forward": cfg.window_forward,
+            "window_forward": window_forward,
             "window_app": cfg.window_app,
             "window_conversation": cfg.window_conversation,
-            "tmux_forward": cfg.tmux_forward,
+            "tmux_forward": tmux_forward,
             "tmux_target": cfg.tmux_target,
             "tmux_verify": cfg.tmux_verify,
         },
@@ -3190,30 +3495,57 @@ fn launch_snapshot(cfg: &Cfg) -> Value {
             "role": cfg.role,
             "agent_id": cfg.agent_id,
             "project": cfg.project,
-            "heartbeat_s": cfg.heartbeat_s,
+            "heartbeat_s": runtime_heartbeat_s(cfg),
             "config_dir": cfg.dir.to_string_lossy(),
             "exec": cfg.exec_cmd,
             "event_cmd": cfg.event_cmd,
-            "window_forward": cfg.window_forward,
+            "window_forward": window_forward,
             "window_app": cfg.window_app,
             "window_conversation": cfg.window_conversation,
-            "tmux_forward": cfg.tmux_forward,
+            "tmux_forward": tmux_forward,
             "tmux_target": cfg.tmux_target,
             "tmux_verify": cfg.tmux_verify,
             "proxy": proxy,
+            "auto_forward": remote_auto_state(),
+            "debug": remote_debug_enabled(),
         },
     })
 }
 
+fn handle_heartbeat_result(
+    res: std::result::Result<ureq::Response, ureq::Error>,
+    need_launch: &mut bool,
+) -> bool {
+    match res {
+        Ok(r) => {
+            let v: Value = r.into_json().unwrap_or_else(|_| json!({}));
+            let prev_rev = REMOTE_REV.load(Ordering::Relaxed);
+            apply_remote_control(&v["control"]);
+            let control_changed = REMOTE_REV.load(Ordering::Relaxed) != prev_rev;
+            *need_launch = v["launch_required"].as_bool() == Some(true) || control_changed;
+            diag_log("debug", format!("heartbeat ok control_rev={}", REMOTE_REV.load(Ordering::Relaxed)));
+            true
+        }
+        Err(e) => {
+            record_client_error("heartbeat", "heartbeat request failed", Some(format!("{e}")));
+            diag_log("warn", format!("heartbeat failed: {e}"));
+            *need_launch = true;
+            false
+        }
+    }
+}
+
 fn heartbeat_payload(cfg: &Cfg, hb: u64, queue: usize, journal: &Arc<Mutex<Vec<Value>>>,
-                     surface: &Arc<Mutex<SurfaceStatus>>) -> Value {
+                     surface: &Arc<Mutex<SurfaceStatus>>, include_launch: bool) -> Value {
     let mut load = json!({});
     if let Some(l) = load1() { load["load1"] = json!(l); }
     if let Some((u, t)) = mem_mb() { load["mem_used_mb"] = json!(u); load["mem_total_mb"] = json!(t); }
     load["disk"] = disk();
     let st = surface.lock().unwrap().clone();
     let active = st.active_task.clone();
-    json!({"hb": hb, "agent_id": cfg.agent_id,
+    let launch = launch_snapshot(cfg);
+    let launch_hash = launch_digest(&launch);
+    let mut body = json!({"hb": hb, "agent_id": cfg.agent_id,
            "work": {"state": if active.is_some() { "busy" } else { "idle" },
                      "phase": if active.is_some() { "task" } else { "idle" },
                      "task_id": active},
@@ -3223,8 +3555,12 @@ fn heartbeat_payload(cfg: &Cfg, hb: u64, queue: usize, journal: &Arc<Mutex<Vec<V
                         "queue": st.queue_len},
            "max_parallel_tasks": if surface_kind(cfg) == "none" { 2 } else { 1 },
            "load": load, "env": {"git_head": git_head()}, "sdk_version": env!("CARGO_PKG_VERSION"),
-           "launch": launch_snapshot(cfg),
-           "queue": queue, "unacked": journal.lock().unwrap().len()})
+           "launch_hash": launch_hash,
+           "debug": debug_payload(), "errors": errors_payload(),
+           "delivery_health": delivery_health_payload(),
+           "queue": queue, "unacked": journal.lock().unwrap().len()});
+    if include_launch { body["launch"] = launch; }
+    body
 }
 
 fn exec_task(cmd: &str, task: &str) {
@@ -3314,18 +3650,21 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
              last_msg.clone(), poll_stop.clone(), surface_status.clone());
         thread::spawn(move || {
             let mut hb: u64 = 0;
+            let mut need_launch = true;
             loop {
                 if stop2.load(Ordering::Relaxed) { break; }
                 hb += 1;
                 let st = surface2.lock().unwrap().clone();
                 let queue_len = if cfg2.surface_forward() { st.queue_len } else { journal2.lock().unwrap().len() };
-                let body = heartbeat_payload(&cfg2, hb, queue_len, &journal2, &surface2);
-                let ok = agent2
+                let sent_full = need_launch;
+                let body = heartbeat_payload(&cfg2, hb, queue_len, &journal2, &surface2, sent_full);
+                let res = agent2
                     .post(&format!("{}/p/{}/heartbeat", base2, cfg2.project))
                     .set("authorization", &format!("Bearer {}", cfg2.token))
                     .set("x-sdk-version", env!("CARGO_PKG_VERSION"))
                     .set("connection", "close")
-                    .send_json(body).is_ok();
+                    .send_json(body);
+                let ok = handle_heartbeat_result(res, &mut need_launch);
                 if !ok { eprintln!("[poll] heartbeat 失败 hb={hb}"); }
                 write_run_state(&cfg2.dir, &json!({
                     "connected": ok, "transport": "poll", "last_hb_ok": ok,
@@ -3337,7 +3676,7 @@ fn run_poll(cfg: &Cfg, agent: &Agent, base: &str, max_duration: Option<Duration>
                     "pid": std::process::id(),
                 }));
                 // 分片睡眠，让 run_poll 到点返回时最多等 1s，不必等满一个心跳周期。
-                let wait_until = Instant::now() + Duration::from_secs(cfg2.heartbeat_s.max(1));
+                let wait_until = Instant::now() + Duration::from_secs(runtime_heartbeat_s(&cfg2).max(1));
                 while !stop2.load(Ordering::Relaxed) && Instant::now() < wait_until {
                     thread::sleep(Duration::from_secs(1));
                 }
@@ -3620,9 +3959,9 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
 
     // 心跳线程：状态取自共享变量，能看到"在忙什么 + 队列积压"，并写 run.state.json 供 status 读。
     {
-        let (agent2, base2, proj, tok, aid, period, dir2) =
+        let (agent2, base2, proj, tok, aid, dir2) =
             (agent.clone(), base.to_string(), cfg.project.clone(), cfg.token.clone(),
-             cfg.agent_id.clone(), cfg.heartbeat_s, cfg.dir.clone());
+             cfg.agent_id.clone(), cfg.dir.clone());
         let st = state.clone();
         let conn3 = connected.clone();
         let q3 = queue.clone();
@@ -3634,6 +3973,7 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
         let cfg4 = cfg.clone_lite();
         thread::spawn(move || {
             let mut hb = 0u64;
+            let mut need_launch = true;
             loop {
                 if stop3.load(Ordering::Relaxed) { break; }
                 hb += 1;
@@ -3641,7 +3981,9 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                 let queue_now = q3.load(Ordering::Relaxed);
                 let unacked = journal3.lock().unwrap().len();
                 let surf = surface4.lock().unwrap().clone();
-                let body = json!({"hb": hb, "agent_id": aid,
+                let launch = launch_snapshot(&cfg4);
+                let launch_hash = launch_digest(&launch);
+                let mut body = json!({"hb": hb, "agent_id": aid,
                                   "work": {"state": ws, "phase": ph, "task_id": surf.active_task.clone()},
                                   "surface": {"kind": surface_kind(&cfg4), "target": surface_target(&cfg4),
                                                "forward": cfg4.surface_forward(),
@@ -3649,12 +3991,16 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                                                "queue": surf.queue_len},
                                   "max_parallel_tasks": if surface_kind(&cfg4) == "none" { 2 } else { 1 },
                                   "load": {"disk": disk()}, "sdk_version": env!("CARGO_PKG_VERSION"),
-                                  "launch": launch_snapshot(&cfg4),
+                                  "launch_hash": launch_hash,
+                                  "debug": debug_payload(), "errors": errors_payload(),
+                                  "delivery_health": delivery_health_payload(),
                                   "queue": queue_now, "unacked": unacked});
-                let ok = agent2.post(&format!("{}/p/{}/heartbeat", base2, proj))
+                if need_launch { body["launch"] = launch; }
+                let res = agent2.post(&format!("{}/p/{}/heartbeat", base2, proj))
                     .set("authorization", &format!("Bearer {}", tok))
                     .set("connection", "close")
-                    .send_json(body).is_ok();
+                    .send_json(body);
+                let ok = handle_heartbeat_result(res, &mut need_launch);
                 let _g = gate3.lock().unwrap();
                 let connected_now = conn3.load(Ordering::Relaxed);
                 write_run_state(&dir2, &json!({
@@ -3669,7 +4015,8 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
                                  "active_task_id": surf.active_task.clone(), "queue": surf.queue_len},
                     "pid": std::process::id(),
                 }));
-                thread::sleep(Duration::from_secs(period));
+                drop(_g);
+                thread::sleep(Duration::from_secs(runtime_heartbeat_s(&cfg4).max(1)));
             }
         });
     }
@@ -3678,6 +4025,9 @@ fn run_ws(cfg: &Cfg, agent: &Agent, base: &str) -> bool {
     loop {
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(InboxEvent::Surface(v)) => {
+                if surface_pump.is_none() && cfg.surface_forward() {
+                    surface_pump = Some(SurfacePump::new(cfg, journal.clone(), surface_status.clone()));
+                }
                 if let Some(pump) = surface_pump.as_mut() {
                     pump.push(v);
                     pump.pump(agent, base, &last_msg);
@@ -3793,6 +4143,28 @@ mod tests {
     }
 
     #[test]
+    fn launch_digest_is_stable_and_changes_with_target() {
+        let dir = scratch("launch-digest");
+        let mut cfg = test_cfg(dir);
+        cfg.window_forward = true;
+        cfg.window_app = "豆包".into();
+        let a = launch_snapshot(&cfg);
+        let b = launch_snapshot(&cfg);
+        assert_eq!(launch_digest(&a), launch_digest(&b));
+        cfg.window_app = "另一个窗口".into();
+        let c = launch_snapshot(&cfg);
+        assert_ne!(launch_digest(&a), launch_digest(&c));
+    }
+
+    #[test]
+    fn canonical_json_ignores_object_key_order() {
+        let a: Value = serde_json::from_str(r#"{"z":1,"a":{"y":2,"b":3}}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"a":{"b":3,"y":2},"z":1}"#).unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+
+    #[test]
     fn state_dir_cli_override_wins_over_env_and_default() {
         let got = resolve_state_dir(Some("/tmp/cli-dir"), Some("/tmp/env-dir"), "/tmp/home-x");
         assert_eq!(got, PathBuf::from("/tmp/cli-dir"));
@@ -3849,6 +4221,7 @@ mod tests {
             tmux_target: String::new(),
             tmux_forward: false,
             tmux_verify: true,
+            sources: HashMap::new(),
         }
     }
 

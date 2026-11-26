@@ -636,7 +636,7 @@ function need(action: string) {
   if (action === "tasks/list" || action === "tasks/get" || action === "tasks/active-load") return "admin";
   // 台账/单任务元数据/内部 active-load 不对普通 agent 开放
   if (action === "tasks/create") return "admin";                        // 建单只允许管理端
-  if (action === "agent/activity" || action === "agent/get" || action === "agents/idle-list") return "admin";
+  if (action === "agent/activity" || action === "agent/get" || action === "agent/control" || action === "agents/idle-list") return "admin";
   if (action === "issues" || action.startsWith("issues/")) return "issues.report";
   if (action.startsWith("submissions")) return "submissions.create";
   return "publish";
@@ -1599,6 +1599,25 @@ async function admin(req: Request, env: Env, url: URL) {
       const id = decodeURIComponent(agentActivityMatch[1]);
       const days = analyticsDays(url.searchParams.get("days"), 7);
       return json(await loadAgentActivity(env, project, id, days));
+    }
+
+    // 单个 agent 的远程运行参数：自动投送强制开关、debug 日志、心跳周期。
+    // 只写 DO 的期望状态，由客户端下一次心跳拉取并回报 control.rev；不通过消息通道执行命令。
+    const agentControlMatch = action.match(/^agent\/([A-Za-z0-9._:-]{1,80})\/control$/);
+    if (agentControlMatch && req.method === "POST") {
+      const id = decodeURIComponent(agentControlMatch[1]);
+      const b: any = await req.json().catch(() => ({}));
+      const remote: any = {};
+      if ("auto_forward" in b) remote.auto_forward = b.auto_forward;
+      if ("debug" in b) remote.debug = b.debug;
+      if ("heartbeat_s" in b) remote.heartbeat_s = b.heartbeat_s;
+      if (!Object.keys(remote).length) return err(422, "control_field_required");
+      const dr = await stub.fetch(new Request("https://do/agent/control", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agent_id: id, remote_control: remote, sender: "admin" }),
+      }));
+      const d: any = await dr.json().catch(() => ({ error: "agent_control_failed" }));
+      return json(d, dr.status);
     }
 
     // 吊销一个或多个 agent（幂等）：二次确认由前端承担，后端要 confirm 标记

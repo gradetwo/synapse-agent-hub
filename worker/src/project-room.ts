@@ -71,7 +71,9 @@ const LAUNCH_EFFECTIVE_KEYS = [
   "exec", "event_cmd", "notify_cmd", "proxy",
   "window_forward", "window_app", "window_conversation",
   "tmux_forward", "tmux_target", "tmux_verify",
+  "auto_forward", "debug",
 ];
+const LAUNCH_SOURCE_KEYS = [...LAUNCH_EFFECTIVE_KEYS, "auto_forward", "debug"];
 const LAUNCH_SECRET_FLAGS = new Set([
   "--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy",
 ]);
@@ -81,6 +83,125 @@ function launchText(v: any, max = LAUNCH_VALUE_CHARS): string | null {
   const s = String(v).replace(/[\u0000-\u001f\u007f]/g, " ").trim();
   if (!s) return null;
   return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+function launchEnum(v: any, allowed: string[]): string | null {
+  const s = launchText(v, 24);
+  return s && allowed.includes(s) ? s : null;
+}
+
+function launchStringList(v: any, limit: number, max = 400): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v.slice(0, limit)) {
+    const s = launchText(item, max);
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+function normalizeSources(raw: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const k of LAUNCH_SOURCE_KEYS) {
+    if (!(k in raw)) continue;
+    const v = launchEnum(raw[k], ["cli", "env", "config", "default", "remote", "opts", "sdk"]);
+    if (v) out[k] = v;
+  }
+  return out;
+}
+
+function normalizeControl(raw: any): any | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    rev: launchNumber(raw.rev) ?? 0,
+    auto_forward: launchEnum(raw.auto_forward, ["inherit", "on", "off"]) ?? "inherit",
+    debug: launchBool(raw.debug) === true,
+    heartbeat_s: launchNumber(raw.heartbeat_s),
+    applied_at: launchNumber(raw.applied_at),
+  };
+}
+
+/** 远程控制只允许安全、可回滚的参数；执行命令/代理/凭据永不下发。 */
+function normalizeRemoteControl(raw: any): any | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    rev: launchNumber(raw.rev) ?? 0,
+    auto_forward: launchEnum(raw.auto_forward, ["inherit", "on", "off"]) ?? "inherit",
+    debug: launchBool(raw.debug) === true,
+    heartbeat_s: launchNumber(raw.heartbeat_s),
+    updated_at: launchNumber(raw.updated_at) ?? 0,
+    updated_by: launchText(raw.updated_by, 80) ?? "admin",
+  };
+}
+
+function normalizeDeliveryHealth(raw: any, now: number): any | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const failures = launchNumber(raw.consecutive_failures) ?? 0;
+  const lastOk = launchNumber(raw.last_ok_ms);
+  const lastAttempt = launchNumber(raw.last_attempt_ms);
+  return {
+    last_attempt_ms: lastAttempt,
+    last_ok_ms: lastOk,
+    last_error: launchText(raw.last_error, 500),
+    consecutive_failures: Math.min(9999, failures),
+    received_at: now,
+    status: failures > 0 ? "failing" : (lastOk ? "ok" : "unknown"),
+  };
+}
+
+function normalizeDebug(raw: any, now: number): any | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const logs: any[] = [];
+  if (Array.isArray(raw.logs)) {
+    for (const item of raw.logs.slice(-80)) {
+      if (typeof item === "string") {
+        const msg = launchText(item, 600);
+        if (msg) logs.push({ ts: now, level: "debug", msg });
+      } else if (item && typeof item === "object") {
+        const msg = launchText(item.msg, 600);
+        if (msg) logs.push({
+          ts: launchNumber(item.ts) ?? now,
+          level: launchEnum(item.level, ["debug", "info", "warn", "error"]) ?? "debug",
+          msg,
+        });
+      }
+    }
+  }
+  return { enabled: launchBool(raw.enabled) === true, logs, received_at: now };
+}
+
+function normalizeErrors(raw: any, now: number): any[] {
+  if (!Array.isArray(raw)) return [];
+  const out: any[] = [];
+  for (const item of raw.slice(-30)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const message = launchText(item.message, 500);
+    if (!message) continue;
+    out.push({
+      id: launchText(item.id, 120) ?? `srv-${now}-${out.length}`,
+      ts: launchNumber(item.ts) ?? now,
+      kind: launchEnum(item.kind, ["exception", "heartbeat", "delivery", "ws", "control", "panic", "other"]) ?? "other",
+      message,
+      detail: launchText(item.detail, 1200),
+      count: Math.max(1, Math.min(9999, launchNumber(item.count) ?? 1)),
+    });
+  }
+  return out;
+}
+
+function mergeClientErrors(prev: any, incoming: any[], now: number): any[] {
+  const rows: any[] = Array.isArray(prev) ? prev.slice(-30) : [];
+  for (const e of incoming) {
+    const i = rows.findIndex((x) => String(x.id) === String(e.id));
+    if (i >= 0) {
+      rows[i] = { ...rows[i], ...e, count: Math.max(Number(rows[i].count ?? 1), Number(e.count ?? 1)),
+                  ts: Math.min(Number(rows[i].ts ?? now), Number(e.ts ?? now)) };
+    } else {
+      rows.push(e);
+    }
+  }
+  return rows.sort((a, b) => Number(b.ts ?? 0) - Number(a.ts ?? 0)).slice(0, 30);
 }
 
 function launchBool(v: any): boolean | null {
@@ -156,6 +277,8 @@ function normalizeLaunch(raw: any, now: number, fallbackVersion: string): any | 
     platform: launchText(raw.platform, 32),
     arch: launchText(raw.arch, 32),
     argv: launchArgv(raw.argv),
+    sources: normalizeSources(raw.sources),
+    control: normalizeControl(raw.control),
     effective,
     delivery: {
       auto: auto === true,
@@ -450,6 +573,7 @@ export class ProjectRoom implements DurableObject {
       case "broadcast":    return this.broadcast(body);
       case "agent/list":   return this.agents();
       case "agent/get":    return this.getAgent(new URL(req.url));
+      case "agent/control": return this.controlAgent(body);
       case "agent/activity": return this.markActivity(body);
       case "agents/config": return this.setAgentConfig(body);
       case "webhook/get":  return this.webhookGet();
@@ -1088,7 +1212,49 @@ export class ProjectRoom implements DurableObject {
     const now = Date.now();
     const clientVersion = String(b.sdk_version ?? "").trim().slice(0, 40);
     const latestVersion = String(b.latest_sdk_version ?? "").trim().slice(0, 40);
+    const incomingHash = launchText(b.launch_hash, 100);
     const incomingLaunch = normalizeLaunch(b.launch, now, clientVersion);
+    const hashMatched = !!(incomingHash && prev.launch_hash === incomingHash);
+    const launchRequired = !incomingLaunch && (!prev.launch || (!!incomingHash && !hashMatched));
+    const prevLaunch = prev.launch;
+    const nextLaunch = incomingLaunch ?? prevLaunch ?? null;
+    const nextAuto = nextLaunch?.delivery?.auto;
+    const prevAuto = prevLaunch?.delivery?.auto;
+    const restartCount = (() => {
+      const a = Number(prevLaunch?.started_at ?? 0);
+      const b2 = Number(nextLaunch?.started_at ?? 0);
+      if (!a || !b2 || a === b2) return Number(prev.restart_count ?? 0);
+      return Number(prev.restart_count ?? 0) + 1;
+    })();
+    const launchHash = incomingLaunch
+      ? (incomingHash ?? prev.launch_hash ?? null)
+      : (hashMatched ? prev.launch_hash : prev.launch_hash ?? null);
+    const launchReceivedMs = incomingLaunch || hashMatched
+      ? now : (prev.launch_received_ms ?? null);
+    const autoSinceMs = (() => {
+      if (nextAuto === undefined) return prev.auto_since_ms ?? null;
+      if (prevAuto === undefined || prevAuto !== nextAuto) return now;
+      return prev.auto_since_ms ?? now;
+    })();
+    const autoOffSinceMs = nextAuto === false
+      ? (prevAuto === false ? (prev.auto_off_since_ms ?? now) : now)
+      : null;
+    const launchChangeCount = incomingHash && prev.launch_hash && incomingHash !== prev.launch_hash
+      ? Number(prev.launch_change_count ?? 0) + 1
+      : Number(prev.launch_change_count ?? 0);
+    const deliveryHealth = normalizeDeliveryHealth(b.delivery_health, now) ?? prev.delivery_health ?? null;
+    const incomingDebug = normalizeDebug(b.debug, now);
+    // debug 关闭时客户端不再上传日志；保留上次日志供事后查看，只把 enabled 置为 false。
+    const debug = incomingDebug
+      ? { ...incomingDebug,
+          logs: incomingDebug.enabled === true
+            ? incomingDebug.logs
+            : (Array.isArray(prev.debug?.logs) ? prev.debug.logs : []) }
+      : (prev.debug ?? null);
+    const incomingErrors = normalizeErrors(b.errors, now);
+    const clientErrors = incomingErrors.length
+      ? mergeClientErrors(prev.client_errors, incomingErrors, now)
+      : (Array.isArray(prev.client_errors) ? prev.client_errors : []);
     // 管理员身份不催升级；普通 agent 未上报版本也按旧客户端处理。
     const outdated = b.role !== "admin" && !!latestVersion && isSdkOutdated(clientVersion, latestVersion);
     const rec = {
@@ -1099,9 +1265,19 @@ export class ProjectRoom implements DurableObject {
       env: b.env ?? {},
       // 外观/运行形态由客户端上报，用于计算默认并发；管理端覆盖值不能被心跳冲掉。
       surface: b.surface ?? prev.surface ?? null,
-      // 最后一次启动现场：新客户端每次心跳都带同一份快照；旧客户端没有时保留上次已知值。
+      // 最后一次启动现场：新客户端只有第一次或变更后才发全量；其余心跳只带 hash。
       launch: incomingLaunch ?? prev.launch ?? null,
-      launch_received_ms: incomingLaunch ? now : prev.launch_received_ms ?? null,
+      launch_hash: launchHash,
+      launch_received_ms: launchReceivedMs,
+      launch_change_count: launchChangeCount,
+      restart_count: restartCount,
+      auto_since_ms: autoSinceMs,
+      auto_off_since_ms: autoOffSinceMs,
+      control_applied_rev: incomingLaunch?.control?.rev ?? prev.control_applied_rev ?? null,
+      remote_control: normalizeRemoteControl(prev.remote_control) ?? null,
+      delivery_health: deliveryHealth,
+      debug: debug,
+      client_errors: clientErrors,
       client_max_parallel_tasks: Number.isFinite(Number(b.max_parallel_tasks))
         ? Math.max(0, Math.min(MAX_PARALLEL_TASKS, Math.floor(Number(b.max_parallel_tasks)))) : null,
       max_parallel_tasks: prev.max_parallel_tasks ?? null,
@@ -1164,7 +1340,19 @@ export class ProjectRoom implements DurableObject {
       ).run().catch(() => {});   // 心跳不能因 D1 配额/抖动失败；DO 仍会续租
     }
     return json({
-      ok: true, next_in_s: 60, server_ms: now,
+      ok: true,
+      next_in_s: Math.max(15, Math.min(300, Number(rec.remote_control?.heartbeat_s ?? 60))),
+      server_ms: now,
+      launch_hash: rec.launch_hash ?? null,
+      launch_required: launchRequired,
+      control: rec.remote_control ? {
+        rev: rec.remote_control.rev,
+        auto_forward: rec.remote_control.auto_forward,
+        debug: rec.remote_control.debug,
+        heartbeat_s: rec.remote_control.heartbeat_s,
+        updated_at: rec.remote_control.updated_at,
+        updated_by: rec.remote_control.updated_by,
+      } : null,
       ...(outdated ? {
         upgrade: {
           required: true,
@@ -2041,6 +2229,62 @@ export class ProjectRoom implements DurableObject {
                   effective: await this.agentMaxParallel(id), promoted });
   }
 
+  /** 远程参数：只接受可回滚的安全项；不以消息通道下发命令，避免管理端变成远程执行入口。 */
+  private async controlAgent(b: any) {
+    const id = String(b?.agent_id ?? "").trim();
+    if (!id) return json({ error: "agent_id_required" }, 422);
+    const rec: any = await this.st.get(`agent:${id}`);
+    if (!rec) return json({ error: "agent_not_found", agent_id: id }, 404);
+    const raw = b?.remote_control;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      return json({ error: "remote_control_required" }, 422);
+    const hasAuto = "auto_forward" in raw;
+    const hasDebug = "debug" in raw;
+    const hasHeartbeat = "heartbeat_s" in raw;
+    if (!hasAuto && !hasDebug && !hasHeartbeat)
+      return json({ error: "control_field_required" }, 422);
+    const prev = normalizeRemoteControl(rec.remote_control) ?? {
+      rev: 0, auto_forward: "inherit", debug: false, heartbeat_s: null,
+      updated_at: 0, updated_by: "admin",
+    };
+    const auto = hasAuto ? launchEnum(raw.auto_forward, ["inherit", "on", "off"]) : prev.auto_forward;
+    if (hasAuto && !auto) return json({ error: "bad_auto_forward" }, 422);
+    if (auto === "on") {
+      const launch = rec.launch;
+      const hasTarget = !!(launch?.delivery?.target || launch?.effective?.window_app
+        || launch?.effective?.tmux_target || launch?.effective?.notify_cmd);
+      if (!launch || !hasTarget)
+        return json({ error: "delivery_target_missing" }, 422);
+    }
+    let debug = prev.debug;
+    if (hasDebug) {
+      if (typeof raw.debug !== "boolean") return json({ error: "bad_debug" }, 422);
+      debug = raw.debug;
+    }
+    let heartbeat = prev.heartbeat_s;
+    if (hasHeartbeat) {
+      if (raw.heartbeat_s === null || raw.heartbeat_s === 0) {
+        heartbeat = null;                       // 0/null = 清除远程覆盖，跟随客户端本地配置
+      } else {
+        const n = Number(raw.heartbeat_s);
+        if (!Number.isFinite(n) || n < 15 || n > 300 || Math.floor(n) !== n)
+          return json({ error: "bad_heartbeat_s", min: 15, max: 300, clear_with: 0 }, 422);
+        heartbeat = n;
+      }
+    }
+    const next = {
+      ...prev,
+      rev: Number(prev.rev ?? 0) + 1,
+      auto_forward: auto ?? "inherit",
+      debug,
+      heartbeat_s: heartbeat,
+      updated_at: Date.now(),
+      updated_by: String(b?.sender ?? "admin").slice(0, 80),
+    };
+    await this.st.put(`agent:${id}`, { ...rec, remote_control: next, updated_at: Date.now() });
+    return json({ ok: true, agent_id: id, remote_control: next });
+  }
+
   private agentView(a: any, now = Date.now()) {
     const age = now - Number(a.last_hb_ms ?? 0);
     const alive = age <= 120_000 ? "alive" : age <= 300_000 ? "late" : "offline";
@@ -2052,8 +2296,12 @@ export class ProjectRoom implements DurableObject {
     const r = await this.st.list<any>({ prefix: "agent:" });
     const list = [...r.values()].map((a) => {
       const view = this.agentView(a, now);
-      // 名册不携带完整 argv 快照（31–200 个节点会放大每次列表流量）；详情用 agent/get 取全量。
-      const { launch, ...rest } = view;
+      const launch = view.launch;
+      const health = view.delivery_health;
+      const errors = Array.isArray(view.client_errors) ? view.client_errors : [];
+      const remote = view.remote_control;
+      // 名册不携带完整 argv/日志（31–200 个节点会放大每次列表流量）；详情用 agent/get 取全量。
+      const { launch: _launch, debug: _debug, client_errors: _errors, ...rest } = view;
       return {
         ...rest,
         launch_summary: launch ? {
@@ -2061,7 +2309,30 @@ export class ProjectRoom implements DurableObject {
           kind: launch.delivery?.kind ?? "none",
           target: launch.delivery?.target ?? null,
           started_at: launch.started_at ?? null,
-          received_at: launch.received_at ?? null,
+          received_at: view.launch_received_ms ?? launch.received_at ?? null,
+          auto_since_ms: view.auto_since_ms ?? null,
+          auto_off_since_ms: view.auto_off_since_ms ?? null,
+          restart_count: view.restart_count ?? 0,
+          launch_hash: view.launch_hash ?? null,
+          change_count: view.launch_change_count ?? 0,
+        } : null,
+        delivery_health: health ? {
+          status: health.status,
+          last_attempt_ms: health.last_attempt_ms,
+          last_ok_ms: health.last_ok_ms,
+          last_error: health.last_error,
+          consecutive_failures: health.consecutive_failures,
+        } : null,
+        debug_enabled: view.debug?.enabled === true,
+        error_count: errors.length,
+        last_error_at: errors.length ? errors[0]?.ts ?? null : null,
+        remote_control: remote ? {
+          rev: remote.rev,
+          auto_forward: remote.auto_forward,
+          debug: remote.debug,
+          heartbeat_s: remote.heartbeat_s,
+          updated_at: remote.updated_at,
+          applied_rev: view.control_applied_rev ?? 0,
         } : null,
       };
     });

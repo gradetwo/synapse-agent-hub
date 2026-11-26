@@ -55,6 +55,16 @@ function trimTrailingSlashes(s: string): string {
   return s.slice(0, end);
 }
 
+/** 稳定 JSON：对象键排序，保证 launch_hash 不会因 HashMap 顺序抖动。 */
+function stableStringify(value: any): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 export class Client {
   private opts: Required<ClientOptions>;
   private work: Work = { state: "idle" };
@@ -63,6 +73,15 @@ export class Client {
   private hb = 0;
   private readonly startedAt = Date.now();
   private eventListeners = new Set<(event: any) => void>();
+  private remoteControl: any = null;
+  private remoteRev = 0;
+  private remoteApplied = 0;
+  private needLaunch = true;
+  private debugLogs: any[] = [];
+  private clientErrors: any[] = [];
+  private deliveryHealth = {
+    last_attempt_ms: 0, last_ok_ms: 0, last_error: "", consecutive_failures: 0,
+  };
 
   constructor(opts: ClientOptions) {
     if (opts.endpoint.startsWith("http://") && !/127\.0\.0\.1|localhost/.test(opts.endpoint))
@@ -73,6 +92,8 @@ export class Client {
       heartbeatS: opts.heartbeatS || 60,
     } as Required<ClientOptions>;
     mkdirSync(this.opts.stateDir, { recursive: true });
+    this.loadErrorOutbox();
+    this.installExceptionHooks();
   }
 
   /** 安装时调用一次：写 600 配置；heartbeat 由运行环境 profile 决定。 */
@@ -123,8 +144,99 @@ export class Client {
 
   setWork(w: Partial<Work>) { this.work = { ...this.work, ...w }; }
 
+  // ── 客户端诊断与远程控制 ────────────────────────────────
+  private errorOutboxPath(): string { return join(this.opts.stateDir, "error-outbox.json"); }
+
+  private loadErrorOutbox(): void {
+    try {
+      const items = JSON.parse(readFileSync(this.errorOutboxPath(), "utf8"));
+      if (Array.isArray(items)) this.clientErrors = items.slice(-20);
+    } catch {}
+  }
+
+  private saveErrorOutbox(): void {
+    try { writeFileSync(this.errorOutboxPath(), JSON.stringify(this.clientErrors.slice(-20))); } catch {}
+  }
+
+  private recordError(kind: string, message: string, detail?: string): void {
+    const now = Date.now();
+    this.clientErrors.push({
+      id: `${now}-${Math.random().toString(16).slice(2, 8)}`,
+      ts: now, kind, message: String(message).slice(0, 500),
+      detail: detail ? String(detail).slice(0, 1200) : null,
+    });
+    this.clientErrors = this.clientErrors.slice(-20);
+    this.saveErrorOutbox();
+    this.debugLog("error", message);
+  }
+
+  private debugLog(level: string, msg: string): void {
+    this.debugLogs.push({ ts: Date.now(), level, msg: String(msg).slice(0, 600) });
+    this.debugLogs = this.debugLogs.slice(-60);
+  }
+
+  private installExceptionHooks(): void {
+    process.on("uncaughtExceptionMonitor", (err) => {
+      this.recordError("exception", `${err?.name ?? "Error"}: ${err?.message ?? err}`, err?.stack);
+    });
+    process.on("unhandledRejection", (reason: any) => {
+      this.recordError("exception", `unhandledRejection: ${reason?.message ?? reason}`, reason?.stack);
+    });
+  }
+
+  private applyRemoteControl(control: any): void {
+    const prev = this.remoteRev;
+    const prevControl = this.remoteControl;
+    if (!control || typeof control !== "object") {
+      const hadControl = Boolean(prev || prevControl);
+      this.remoteControl = null;
+      this.remoteRev = 0;
+      if (hadControl) {
+        this.remoteApplied = Date.now();
+        this.needLaunch = true;
+        this.debugLog("info", "remote control cleared; follow local config");
+      }
+      return;
+    }
+    const rev = Number(control.rev ?? 0);
+    if (rev && rev < prev) return;
+    const hbS = Number(control.heartbeat_s ?? 0);
+    const nextControl = {
+      rev, auto_forward: ["inherit", "on", "off"].includes(control.auto_forward)
+        ? control.auto_forward : "inherit",
+      debug: Boolean(control.debug),
+      heartbeat_s: hbS >= 15 && hbS <= 300 ? hbS : 0,
+    };
+    const changed = stableStringify(nextControl) !== stableStringify(prevControl);
+    this.remoteControl = nextControl;
+    this.remoteRev = rev;
+    if (changed) {
+      this.remoteApplied = Date.now();
+      this.needLaunch = true;
+      this.debugLog("info", `remote control applied rev=${rev}`);
+    }
+  }
+
+  private autoMode(): string { return this.remoteControl?.auto_forward ?? "inherit"; }
+  private debugEnabled(): boolean { return Boolean(this.remoteControl?.debug); }
+  private heartbeatS(): number {
+    const remote = Number(this.remoteControl?.heartbeat_s ?? 0);
+    return remote >= 15 && remote <= 300 ? remote : this.opts.heartbeatS;
+  }
+
+  private launchHash(launch: any): string {
+    return createHash("sha256").update(stableStringify(launch)).digest("hex");
+  }
+
+  private debugPayload(): any {
+    return this.debugEnabled()
+      ? { enabled: true, logs: this.debugLogs.slice(-60) }
+      : { enabled: false };
+  }
+
   // ── 心跳 ──────────────────────────────────────────────
   private launchSnapshot() {
+    const mode = this.autoMode();
     return {
       schema: "synapse.launch.v1",
       kind: "ts",
@@ -136,26 +248,53 @@ export class Client {
       platform: process.platform,
       arch: process.arch,
       pid: process.pid,
+      sources: {
+        auto_forward: mode !== "inherit" ? "remote" : "default",
+        debug: this.remoteRev ? "remote" : "default",
+        heartbeat_s: this.remoteControl?.heartbeat_s ? "remote" : "config",
+      },
+      control: {
+        rev: this.remoteRev, auto_forward: mode, debug: this.debugEnabled(),
+        heartbeat_s: this.heartbeatS(), applied_at: this.remoteApplied,
+      },
       delivery: {
         auto: false, kind: "none", target: "",
         window_forward: false, tmux_forward: false, tmux_verify: true,
       },
       effective: {
         cmd: "sdk", role: "agent", agent_id: this.opts.agentId,
-        project: this.opts.project, heartbeat_s: this.opts.heartbeatS,
+        project: this.opts.project, heartbeat_s: this.heartbeatS(),
         config_dir: this.opts.stateDir,
+        auto_forward: mode, debug: this.debugEnabled(),
       },
     };
   }
 
   async heartbeatOnce(): Promise<any> {
     this.hb++;
-    return this.post(`/p/${this.opts.project}/heartbeat`, {
+    const launch = this.launchSnapshot();
+    const payload: any = {
       hb: this.hb, agent_id: this.opts.agentId, work: this.work,
       surface: { kind: "none", forward: false }, max_parallel_tasks: 2,
       load: await this.collectLoad(), env: this.collectEnv(), sdk_version: VERSION,
-      launch: this.launchSnapshot(),
-    }).catch((e) => ({ ok: false, error: String(e) }));
+      launch_hash: this.launchHash(launch),
+      delivery_health: { ...this.deliveryHealth },
+      debug: this.debugPayload(),
+      errors: this.clientErrors.slice(-20),
+    };
+    if (this.needLaunch) payload.launch = launch;
+    try {
+      const res = await this.post(`/p/${this.opts.project}/heartbeat`, payload);
+      const prevRev = this.remoteRev;
+      this.applyRemoteControl(res?.control);
+      this.needLaunch = Boolean(res?.launch_required) || this.remoteRev !== prevRev;
+      this.debugLog("debug", `heartbeat ok control_rev=${this.remoteRev}`);
+      return res;
+    } catch (e) {
+      this.recordError("heartbeat", "heartbeat request failed", String(e));
+      this.needLaunch = true;
+      return { ok: false, error: String(e) };
+    }
   }
 
   start(): void {
@@ -165,7 +304,7 @@ export class Client {
       if (!this.running) return;
       await this.heartbeatOnce();
       if (!this.running) return;
-      this.timer = setTimeout(tick, (this.opts.heartbeatS + Math.random() * 15) * 1000);
+      this.timer = setTimeout(tick, (this.heartbeatS() + Math.random() * 15) * 1000);
     };
     void tick();
   }

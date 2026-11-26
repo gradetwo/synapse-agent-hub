@@ -280,6 +280,17 @@ if (location.search.includes("reset=1")) {
   .launchKv span{display:block;font-size:10.5px;color:#7d8798;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .launchKv b{display:block;font-size:11.5px;font-weight:500;color:#d7e0ea;overflow-wrap:anywhere;margin-top:1px}
   .launchKv b.warnv{color:#ffbd6b}
+  .ctrlGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;margin:7px 0}
+  .ctrlGrid label{display:block;font-size:10.5px;color:#7d8798}
+  .ctrlGrid select,.ctrlGrid input{width:100%;margin-top:3px;background:#0b0f14;color:#d7e0ea;border:1px solid #2a333f;border-radius:6px;padding:5px 6px;font-size:11.5px}
+  .ctrlBtns{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .ctrlHint{font-size:11px;color:#7d8798;margin-top:7px;overflow-wrap:anywhere}
+  .ctrlHint.warnv{color:#ffbd6b}
+  .diagList{max-height:260px;overflow:auto;margin-top:6px;border-top:1px solid #202936}
+  .diagItem{padding:6px 0;border-bottom:1px solid #1a222c;font-size:11px;overflow-wrap:anywhere}
+  .diagItem b{color:#ffbd6b;font-weight:500}
+  .diagItem span{color:#7d8798;margin-right:6px}
+  .diagItem pre{margin:3px 0 0;white-space:pre-wrap;color:#9aa4b2;font-size:10.5px}
   .launchDetails{margin-top:8px;background:#0b0f14}
   .launchDetails .launchSection{margin-top:7px}
   .launchPre{margin:3px 0 0;padding:7px 8px;border:1px solid #1d2530;border-radius:6px;background:#0b0f14;
@@ -315,6 +326,7 @@ if (location.search.includes("reset=1")) {
     .agentStats{grid-template-columns:repeat(2,minmax(0,1fr))}
     .agentStat .v{font-size:17px}
     .launchGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .ctrlGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
     .agentViz{grid-template-columns:1fr}
     .donut{height:96px}
     .workList .when{margin-left:0}
@@ -903,6 +915,8 @@ if (location.search.includes("reset=1")) {
     <div class="sheetBody">
     <div class="agentStats" id="dStats"></div>
     <div class="launchCard" id="dLaunch"><div class="scopeHint">客户端启动参数加载中…</div></div>
+    <div class="launchCard" id="dControl"><div class="scopeHint">远程运行控制加载中…</div></div>
+    <div class="launchCard" id="dDiag"><div class="scopeHint">客户端诊断日志加载中…</div></div>
     <div class="activityHead">
       <div class="cap">活动趋势 <span class="scopeHint" id="dActivityMeta"></span></div>
       <div class="trendSeg trendSegSmall" id="dActivityRange" aria-label="agent 活动范围">
@@ -1368,6 +1382,16 @@ function agentRow(a) {
   tr.dataset.project = String(a.project ?? "");
   tr.dataset.alive = String(a.alive || "");
   tr.dataset.work = a.alive === "alive" ? String(w.state || "") : "";
+  tr.dataset.auto = a.launch_summary ? (a.launch_summary.auto === true ? "on" : "off") : "unknown";
+  tr.dataset.launch = a.launch_summary ? "1" : "0";
+  tr.dataset.errors = Number(a.error_count ?? 0) > 0 ? "1" : "0";
+  tr.dataset.sdk = a.sdk_outdated ? "old" : "new";
+  tr.dataset.debug = a.debug_enabled ? "1" : "0";
+  tr.dataset.delivery = a.delivery_health?.consecutive_failures > 0 ? "failing"
+    : a.delivery_health?.status === "ok" ? "ok" : "unknown";
+  tr.dataset.remote = a.remote_control?.auto_forward && a.remote_control.auto_forward !== "inherit"
+    ? a.remote_control.auto_forward : "inherit";
+  tr.dataset.control = controlPending(a.remote_control, a.remote_control?.applied_rev) ? "pending" : "applied";
 
   const dot = document.createElement("span");
   dot.className = `dot ${cls}`;
@@ -1387,6 +1411,34 @@ function agentRow(a) {
     badge.className = "badge released";
     badge.textContent = "投送关";
     badge.title = "最近一次启动未开启窗口/tmux 消息自动投送";
+    cells[0].append(" ", badge);
+  }
+  if (Number(a.delivery_health?.consecutive_failures ?? 0) > 0) {
+    const badge = document.createElement("span");
+    badge.className = "badge failed";
+    badge.textContent = `投送异常${a.delivery_health.consecutive_failures > 1 ? `×${a.delivery_health.consecutive_failures}` : ""}`;
+    badge.title = a.delivery_health.last_error || "最近外部投送连续失败";
+    cells[0].append(" ", badge);
+  }
+  if (Number(a.error_count ?? 0) > 0) {
+    const badge = document.createElement("span");
+    badge.className = "badge released";
+    badge.textContent = `异常${Number(a.error_count) > 99 ? "99+" : a.error_count}`;
+    badge.title = "客户端上报的异常条数（详情可看诊断包）";
+    cells[0].append(" ", badge);
+  }
+  if (a.debug_enabled) {
+    const badge = document.createElement("span");
+    badge.className = "badge approved";
+    badge.textContent = "debug";
+    badge.title = "服务端已开启该节点 debug 日志上传";
+    cells[0].append(" ", badge);
+  }
+  if (controlPending(a.remote_control, a.remote_control?.applied_rev)) {
+    const badge = document.createElement("span");
+    badge.className = "badge released";
+    badge.textContent = "控制待应用";
+    badge.title = `远程控制 rev ${a.remote_control.rev} 已下发，客户端尚未回报应用`;
     cells[0].append(" ", badge);
   }
   cells[1].textContent = decEsc(projectName);
@@ -1973,6 +2025,9 @@ async function loadAgents() {
   const rows = (d.agents || []).map((a) => ({ ...a, project: a.project || project }));
   const alive = rows.filter(a => a.alive === "alive").length;
   const outdated = rows.filter(a => a.sdk_outdated).length;
+  const autoOff = rows.filter(a => a.launch_summary && a.launch_summary.auto === false).length;
+  const deliveryFailing = rows.filter(a => Number(a.delivery_health?.consecutive_failures ?? 0) > 0).length;
+  const withErrors = rows.filter(a => Number(a.error_count ?? 0) > 0).length;
   AGENTS_PARTIAL = Number(d.projects_failed ?? 0);
   AGENTS_FAILED_PROJECTS = Array.isArray(d.projects_failed_names) ? d.projects_failed_names : [];
   const projectsTotal = isAll ? Number(d.projects_total ?? (allProjects || []).length) : 1;
@@ -1987,6 +2042,9 @@ async function loadAgents() {
     : (isAll && AGENTS_PARTIAL
         ? `≥${alive} 在线 · ${rows.length} 个已加载 · 全部项目${partialNote}`
         : `${alive}/${rows.length} 在线${isAll ? " · 全部项目" : ""}` +
+          (autoOff ? ` · ${autoOff} 投送关` : "") +
+          (deliveryFailing ? ` · ${deliveryFailing} 投送异常` : "") +
+          (withErrors ? ` · ${withErrors} 有异常` : "") +
           (outdated ? ` · ${outdated} 个旧版 SDK` : "") + partialNote);
   $("agents").replaceChildren(...(allFailed
     ? [emptyTableRow(10, "名册读取失败，请稍后重试")]
@@ -3639,6 +3697,13 @@ function renderClientLaunch(client, available, fallbackSummary) {
   const argv = Array.isArray(launch.argv) ? launch.argv.map(String) : [];
   const argvText = argv.length ? argv.join(" ") : "—";
   const effectiveJson = Object.keys(effective).length ? JSON.stringify(effective, null, 2) : "—";
+  const control = launch.control && typeof launch.control === "object" ? launch.control : null;
+  const sources = launch.sources && typeof launch.sources === "object" ? launch.sources : {};
+  const sourcesJson = Object.keys(sources).length ? JSON.stringify(sources, null, 2) : "—";
+  const sourceHint = sources.window_forward === "remote" || sources.tmux_forward === "remote" || sources.auto_forward === "remote"
+    ? "自动投送当前由服务端远程控制覆盖" : "";
+  const controlText = control
+    ? `${autoForwardLabel(control.auto_forward)} · rev ${control.rev ?? "—"}` : "未下发";
   const kv = (k, v, warn = false) => `<div class="launchKv"><span>${txt(k)}</span><b class="${warn ? "warnv" : ""}">${txt(v || "—")}</b></div>`;
   box.innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
       <span class="launchBadge ${auto ? "on" : "off"}">消息自动投送：${txt(autoText)}</span></div>
@@ -3653,14 +3718,156 @@ function renderClientLaunch(client, available, fallbackSummary) {
       ${kv("配置目录", effective.config_dir || launch.config_dir || "—")}
       ${kv("进程", proc)}
       ${kv("客户端", `${launch.kind || "unknown"} ${launch.version || ""}`.trim())}
+      ${kv("远程控制", controlText, sourceHint ? true : false)}
       ${kv("工作目录", launch.cwd || "—")}
     </div>
+    ${sourceHint ? `<div class="launchMeta warnv">${txt(sourceHint)}</div>` : ""}
     <details class="permDetails launchDetails">
       <summary><span>完整启动参数</span><span class="lead">argv · 生效配置</span></summary>
       <div class="launchSection"><div class="cap">命令行</div><pre class="launchPre">${txt(argvText)}</pre></div>
       <div class="launchSection"><div class="cap">生效配置</div><pre class="launchPre">${txt(effectiveJson)}</pre></div>
+      <div class="launchSection"><div class="cap">参数来源</div><pre class="launchPre">${txt(sourcesJson)}</pre></div>
     </details>
     <div class="scopeHint" style="margin-top:6px">由客户端心跳随连接上报；token、代理密码等敏感值已脱敏。</div>`;
+}
+
+function autoForwardLabel(v) {
+  return v === "on" ? "强制开启" : v === "off" ? "强制关闭" : "跟随本地";
+}
+function controlPending(remote, applied) {
+  return !!remote && Number(remote.rev || 0) > Number(applied || 0);
+}
+function renderAgentControl(client, live) {
+  const box = $("dControl");
+  if (!box) return;
+  const txt = (v) => esc(decEsc(v == null ? "" : v));
+  const remote = client?.remote_control || live?.remote_control || null;
+  const applied = Number(client?.control_applied_rev ?? live?.remote_control?.applied_rev ?? 0);
+  const pending = controlPending(remote, applied);
+  const mode = remote?.auto_forward || "inherit";
+  const launch = client?.launch || null;
+  const project = live?.project || current;
+  const effectiveAuto = launch?.delivery?.auto === true;
+  const hb = remote?.heartbeat_s != null ? Number(remote.heartbeat_s) : "";
+  const status = remote
+    ? `${autoForwardLabel(mode)} · 实际投送${effectiveAuto ? "开" : "关"} · rev ${remote.rev ?? "—"}${pending ? "（等待客户端应用）" : "（已应用）"}`
+    : "跟随本地启动参数";
+  box.innerHTML = `<div class="launchTop"><div class="cap">远程运行控制</div>
+      <span class="launchBadge ${pending ? "off" : "unknown"}">${pending ? "等待应用" : "已下发"}</span></div>
+    <div class="launchMeta">${txt(status)}</div>
+    <div class="ctrlGrid">
+      <label>消息自动投送<select id="dCtrlAuto">
+        <option value="inherit"${mode === "inherit" ? " selected" : ""}>跟随本地</option>
+        <option value="on"${mode === "on" ? " selected" : ""}>强制开启</option>
+        <option value="off"${mode === "off" ? " selected" : ""}>强制关闭</option>
+      </select></label>
+      <label>debug 日志<select id="dCtrlDebug">
+        <option value="0"${!remote?.debug ? " selected" : ""}>关闭</option>
+        <option value="1"${remote?.debug ? " selected" : ""}>开启并随心跳上传</option>
+      </select></label>
+      <label>心跳周期（秒）<input id="dCtrlHb" type="number" min="0" max="300" step="1" value="${esc(String(hb))}" placeholder="跟随本地"></label>
+    </div>
+    <div class="ctrlBtns">
+      <button class="mini" id="dCtrlSave" type="button">应用远程参数</button>
+      <button class="ghost mini" id="dCtrlFollow" type="button">恢复跟随本地</button>
+    </div>
+    <div class="ctrlHint" id="dCtrlHint">远程参数只影响自动投送、debug 日志和心跳周期；心跳 15–300 秒，留空/0 表示跟随本地。下次客户端心跳后生效。</div>`;
+  const save = async (payload) => {
+    const btn = $("dCtrlSave");
+    if (btn) btn.disabled = true;
+    try {
+      await api(`/admin/p/${encodeURIComponent(project)}/agent/${encodeURIComponent(detailAgent)}/control`, "POST", payload);
+      showToast("远程参数已下发，等待客户端下一次心跳应用");
+      await openAgent(detailAgent, project, detailDays);
+    } catch (e) {
+      const msg = String(e?.message || e);
+      const friendly = msg.includes("delivery_target_missing")
+        ? "该节点没有可用的窗口/tmux/notify 目标，不能强制开启自动投送"
+        : msg.includes("bad_heartbeat_s") ? "心跳周期必须是 15–300 秒"
+        : msg;
+      showToast("下发失败：" + friendly, 9000);
+      const hint = $("dCtrlHint");
+      if (hint) { hint.className = "ctrlHint warnv"; hint.textContent = friendly; }
+    } finally { if (btn) btn.disabled = false; }
+  };
+  const collect = () => {
+    const hbRaw = $("dCtrlHb")?.value.trim() ?? "";
+    const n = hbRaw === "" ? 0 : Number(hbRaw);
+    return { auto_forward: $("dCtrlAuto")?.value || "inherit",
+             debug: $("dCtrlDebug")?.value === "1",
+             heartbeat_s: Number.isFinite(n) ? n : 0 };
+  };
+  const saveBtn = $("dCtrlSave");
+  if (saveBtn) saveBtn.onclick = () => save(collect());
+  const followBtn = $("dCtrlFollow");
+  if (followBtn) followBtn.onclick = () => save({ auto_forward: "inherit", debug: false, heartbeat_s: 0 });
+}
+
+function renderAgentDiag(client, live, available) {
+  const box = $("dDiag");
+  if (!box) return;
+  const txt = (v) => esc(decEsc(v == null ? "" : v));
+  if (available === false) {
+    box.innerHTML = `<div class="launchTop"><div class="cap">客户端诊断</div>
+      <span class="launchBadge unknown">读取失败</span></div>
+      <div class="scopeHint">客户端异常和 debug 日志暂时读不到。</div>`;
+    return;
+  }
+  const debug = client?.debug || null;
+  const errors = Array.isArray(client?.client_errors) ? client.client_errors : [];
+  const health = client?.delivery_health || live?.delivery_health || null;
+  const project = live?.project || current;
+  const logs = debug?.enabled && Array.isArray(debug.logs) ? debug.logs : [];
+  const healthLabel = health?.consecutive_failures > 0
+    ? `连续失败 ${health.consecutive_failures} 次` : health?.status === "ok" ? "最近投送成功" : "暂无投送样本";
+  const healthCls = health?.consecutive_failures > 0 ? "off" : health?.status === "ok" ? "on" : "unknown";
+  const errRows = errors.slice(0, 30).map((e) => `<div class="diagItem">
+      <span>${hasNum(e.ts) ? new Date(Number(e.ts)).toLocaleString() : "—"}</span>
+      <b>${txt(e.kind || "other")}</b> ${txt(e.message || "")}
+      ${e.detail ? `<pre>${txt(e.detail)}</pre>` : ""}
+    </div>`).join("");
+  const logRows = logs.slice(-60).map((l) => `<div class="diagItem">
+      <span>${hasNum(l.ts) ? new Date(Number(l.ts)).toLocaleTimeString() : "—"}</span>
+      <b>${txt(l.level || "debug")}</b> ${txt(l.msg || "")}
+    </div>`).join("");
+  const pkg = {
+    agent_id: detailAgent, project: project,
+    generated_at: Date.now(),
+    launch: client?.launch || null,
+    remote_control: client?.remote_control || live?.remote_control || null,
+    control_applied_rev: client?.control_applied_rev ?? live?.remote_control?.applied_rev ?? null,
+    delivery_health: health,
+    debug_enabled: !!debug?.enabled,
+    debug_logs: logs,
+    client_errors: errors,
+  };
+  box.innerHTML = `<div class="launchTop"><div class="cap">客户端诊断</div>
+      <span class="launchBadge ${debug?.enabled ? "on" : "unknown"}">debug ${debug?.enabled ? "已开启" : "关闭"}</span>
+      <span class="launchBadge ${healthCls}" style="margin-left:6px">${txt(healthLabel)}</span>
+      <span class="launchBadge ${errors.length ? "off" : "unknown"}" style="margin-left:6px">异常 ${errors.length}</span>
+    </div>
+    <div class="launchMeta">${health?.last_attempt_ms ? `最近投送 ${fmtLast(Number(health.last_attempt_ms))}` : "尚无投送记录"}${health?.last_error ? ` · ${txt(health.last_error)}` : ""}</div>
+    <div class="ctrlBtns"><button class="ghost mini" id="dDiagCopy" type="button">复制诊断包</button></div>
+    <div class="cap" style="margin-top:8px">最近异常</div>
+    <div class="diagList">${errRows || `<div class="muted">暂无异常上报</div>`}</div>
+    <div class="cap" style="margin-top:8px">debug 日志${logs.length ? ` · ${logs.length} 条` : ""}</div>
+    <div class="diagList">${logRows || `<div class="muted">${debug?.enabled ? "暂无日志" : "debug 关闭；开启后随心跳上传最近日志"}</div>`}</div>
+    <div class="ctrlHint">异常与 debug 日志由客户端内存环形缓冲上报；debug 关闭时不传日志，历史记录保留上一次上传内容。</div>`;
+  const copy = $("dDiagCopy");
+  if (copy) copy.onclick = async () => {
+    const text = JSON.stringify(pkg, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("诊断包已复制到剪贴板");
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.left = "-9999px";
+      document.body.append(ta); ta.select();
+      try { document.execCommand("copy"); showToast("诊断包已复制到剪贴板"); }
+      catch { showToast("复制失败，请手动展开日志"); }
+      ta.remove();
+    }
+  };
 }
 
 let detailAgent = null;
@@ -3737,6 +3944,8 @@ function openAgent(id, project, days = detailDays) {
   $("dMsgs").innerHTML = $("dSubs").innerHTML = "";
   $("dStats").innerHTML = $("dTasks").innerHTML = $("dIssues").innerHTML = "";
   $("dLaunch").innerHTML = `<div class="scopeHint">客户端启动参数加载中…</div>`;
+  $("dControl").innerHTML = `<div class="scopeHint">远程运行控制加载中…</div>`;
+  $("dDiag").innerHTML = `<div class="scopeHint">客户端诊断日志加载中…</div>`;
   $("dWorkBars").innerHTML = ""; $("dTaskLegend").innerHTML = "";
   $("dTaskTotal").textContent = ""; $("dIssueSummary").textContent = "";
   $("dPermSummary").textContent = "加载中…";
@@ -3765,6 +3974,8 @@ function openAgent(id, project, days = detailDays) {
     const sdkNote = live?.sdk_version
       ? ` · SDK ${live.sdk_version}${live.sdk_outdated ? "（旧版）" : ""}` : "";
     renderClientLaunch(d.client, d.client_available !== false, live && live.launch_summary);
+    renderAgentControl(d.client, live);
+    renderAgentDiag(d.client, live, d.client_available !== false);
     $("dMeta").textContent = `${role} · ${scopes.length} 项权限 · ${hb.length} 个采样${sdkNote}`;
     const maxInput = $("dMaxParallel");
     if (maxInput) {
@@ -3832,6 +4043,10 @@ function openAgent(id, project, days = detailDays) {
   }).catch((e) => {
     $("dMeta").textContent = "加载失败：" + e.message;
     $("dLaunch").innerHTML = `<div class="launchTop"><div class="cap">客户端启动</div>
+      <span class="launchBadge unknown">详情读取失败</span></div>`;
+    $("dControl").innerHTML = `<div class="launchTop"><div class="cap">远程运行控制</div>
+      <span class="launchBadge unknown">详情读取失败</span></div>`;
+    $("dDiag").innerHTML = `<div class="launchTop"><div class="cap">客户端诊断</div>
       <span class="launchBadge unknown">详情读取失败</span></div>`;
     $("dStats").innerHTML = `<div class="muted">详情读取失败，无法显示统计</div>`;
     $("dTaskTotal").textContent = "统计不可用";
@@ -4172,6 +4387,16 @@ function bindFilters() {
         { v: "work:idle", label: "闲" },
         { v: "work:blocked", label: "阻塞" },
         { v: "work:other", label: "其他进行态" },
+        { v: "auto:off", label: "投送关闭" },
+        { v: "auto:on", label: "投送开启" },
+        { v: "launch:0", label: "启动参数未上报" },
+        { v: "delivery:failing", label: "投送异常" },
+        { v: "errors:1", label: "有异常上报" },
+        { v: "debug:1", label: "debug 已开启" },
+        { v: "remote:on", label: "远程强制开" },
+        { v: "remote:off", label: "远程强制关" },
+        { v: "control:pending", label: "控制待应用" },
+        { v: "sdk:old", label: "旧版 SDK" },
       ],
       test: (row, v) => {
         if (v === "all") return true;
@@ -4180,6 +4405,7 @@ function bindFilters() {
         if (v === "work:other")
           return (row.dataset.alive || "") === "alive"
             && !["idle", "busy", "blocked"].includes(row.dataset.work || "");
+        if (v === "debug:1") return (row.dataset.debug || "") === "1";
         const [k, want] = v.split(":");
         return (row.dataset[k] || "") === want;
       },
