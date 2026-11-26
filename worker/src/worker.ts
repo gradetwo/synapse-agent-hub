@@ -349,7 +349,7 @@ export default {
     // 返工节点要按真实补丁开工，不能要求 admin token（ISS-MWSZPB49-B96120）；
     // 写路径仍按 submissions.create 查，其它 submissions GET 不在这里放行。
     const subRead = req.method === "GET" &&
-      (action === "submissions" || /^submissions\/[^/]+\/bundle$/.test(action));
+      (action === "submissions" || /^submissions\/[^/]+\/(bundle|applies)$/.test(action));
     const taskPoolRead = req.method === "GET" && action === "tasks";
     // 单条任务自查：GET /p/{project}/tasks/{task_id}。排除内部动作，避免把
     // tasks/active-load 等管理端点误当成任务详情而绕过 admin 鉴权。
@@ -397,6 +397,13 @@ export default {
     const subBundle = action.match(/^submissions\/([^/]+)\/bundle$/);
     if (subBundle && req.method === "GET")
       return bundleSubmission(env, project, subBundle[1]);
+    // 交付补丁适用性：GET 直接算/读当前 main 的结果；POST 接收节点 git apply --check 的权威结果。
+    const subApplies = action.match(/^submissions\/([^/]+)\/applies$/);
+    if (subApplies && req.method === "GET")
+      return submissionApplies(env, project, subApplies[1], url, auth.agentId ?? "", auth.role === "admin");
+    const subApplyCheck = action.match(/^submissions\/([^/]+)\/apply-check$/);
+    if (subApplyCheck && req.method === "POST")
+      return recordSubmissionApply(req, env, project, subApplyCheck[1], auth.agentId ?? "", auth.role === "admin");
     // 误绑/错单自救：交付人可撤回自己尚未被管理侧取走的 delivered 交付。
     const subWithdraw = action.match(/^submissions\/([^/]+)\/withdraw$/);
     if (subWithdraw && req.method === "POST")
@@ -470,6 +477,8 @@ export default {
       "SELECT project, retention_days FROM projects WHERE status='active'"
     ).all<{ project: string; retention_days: number }>();
     ctx.waitUntil((async () => {
+      // 0077：main 前进后重查未归档补丁；只有 main SHA 变化才扫，避免每分钟空跑。
+      const main = await repoMainSha(env).catch(() => ({ sha: null, error: "repo_main_unavailable", cached: false }));
       for (const r of rows.results) {
         try {
           const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + r.project));
@@ -477,6 +486,19 @@ export default {
             method: "POST", headers: { "content-type": "application/json" },
             body: JSON.stringify({ project: r.project }),
           }));
+          if (main.sha) {
+            const key = `applymain:${r.project}`;
+            const last = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
+              .bind(key).first<any>().catch(() => null);
+            if (String(last?.value ?? "") !== main.sha) {
+              const out = await checkCollectedApplies(env, r.project, main.sha);
+              await env.DB.prepare(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+              ).bind(key, main.sha, Date.now()).run().catch(() => {});
+              console.log("apply recheck", r.project, main.sha, out);
+            }
+          }
           // F2 收尾：归档按项目 retention_days 清理，避免无限增长
           const days = Math.max(1, Number(r.retention_days ?? 30));
           const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
@@ -1434,6 +1456,28 @@ async function admin(req: Request, env: Env, url: URL) {
       return err(403, "project_not_visible");
     const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
 
+    if (action === "repo/status" && req.method === "GET") {
+      const main = await repoMainSha(env);
+      const key = `applymain:${project}`;
+      const last = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
+        .bind(key).first<any>().catch(() => null);
+      return json({ repo: env.GITHUB_REPO ?? null, branch: env.GITHUB_BRANCH ?? "main",
+                    target_sha: main.sha, error: main.error ?? null,
+                    last_project_check: last?.value ?? null, last_project_check_at: last?.updated_at ?? null });
+    }
+    if (action === "repo/applicability" && req.method === "POST") {
+      const b: any = await req.json().catch(() => ({}));
+      let target = String(b.target_sha ?? "").trim().toLowerCase();
+      if (!target) target = (await repoMainSha(env)).sha ?? "";
+      if (!/^[a-f0-9]{7,64}$/.test(target))
+        return err(422, "target_sha_not_hex", { hint: "target_sha 7-64 位十六进制；也可留空用 GITHUB_REPO 当前 main。" });
+      const out = await checkCollectedApplies(env, project, target);
+      await env.DB.prepare(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+      ).bind(`applymain:${project}`, target, Date.now()).run().catch(() => {});
+      return json({ ok: true, target_sha: target, ...out });
+    }
     if (action === "idle" && req.method === "GET") {
       const config = await idleConfig(env, project);
       if (!config.ready) return json({ config, agents: [], migration_required: true });
@@ -2039,7 +2083,13 @@ async function admin(req: Request, env: Env, url: URL) {
       const allowOvertake = b.allow_overtake === true;
       const overtakeReason = String(b.overtake_reason ?? "").trim().slice(0, 240);
       if (allowOvertake && !overtakeReason) return err(422, "overtake_reason_required");
-      const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, allowOvertake, false);
+      // 修正版：旧交付已 collected/任务已 done 时，允许同一提交人交 rebase 版。
+      const rev = await resolveRevisionSubmission(
+        env, project, agentId, b.revision_of ?? b.supersedes ?? b.rebase_of, kind,
+        b.task_id === undefined || b.task_id === null ? null : String(b.task_id).trim(), true);
+      if (rev.error) return rev.error;
+      const bind = await resolveSubmissionTask(env, project, agentId, rev.taskId ?? b.task_id,
+                                               allowOvertake, false, !!rev.row);
       if (bind.error) return bind.error;
       const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
       if (missing.length) return deliveryFormatError(project, kind, missing);
@@ -2051,12 +2101,14 @@ async function admin(req: Request, env: Env, url: URL) {
       const res = await env.DB.prepare(
         `INSERT OR IGNORE INTO submissions
          (project, submission_id, agent_id, task_id, task_assignee, overtake, overtake_reason,
-          base_sha, kind, title, refs_json, checks_json, state, review_state, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'delivered', 'pending', ?, ?)`
-      ).bind(project, sid, agentId, taskId, bind.assigneeAtSubmit, bind.overtake ? 1 : 0,
+          base_sha, kind, title, refs_json, checks_json, supersedes_id, state, review_state, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'delivered', 'pending', ?, ?)`
+      ).bind(project, sid, agentId, taskId,
+             bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null, bind.overtake ? 1 : 0,
              bind.overtake ? overtakeReason : null,
              b.base_sha, kind, b.title ?? "",
-             JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
+             JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}),
+             rev.row?.submission_id ?? null, now, now).run();
       if (res.meta.changes === 0) {
         const old = await env.DB.prepare(
           "SELECT agent_id,task_id,state,review_state FROM submissions WHERE project = ? AND submission_id = ?"
@@ -2072,22 +2124,31 @@ async function admin(req: Request, env: Env, url: URL) {
         });
         return json({ submission_id: sid, state: old?.state ?? "delivered", review_state: old?.review_state ?? "pending",
                       deduped: true, seq: null, task_id: old?.task_id ?? taskId,
-                      task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                      task_assignee: bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null, auto_bound: bind.autoBound,
                       next: submissionNext(project, sid, old?.task_id ?? taskId, old?.state ?? "delivered") });
+      }
+      if (rev.row?.submission_id) {
+        await env.DB.prepare(
+          `UPDATE submissions SET superseded_by = ?
+            WHERE project = ? AND submission_id = ? AND superseded_by IS NULL`
+        ).bind(sid, project, rev.row.submission_id).run();
       }
       const seq = await stub.fetch(new Request("https://do/publish", {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind,
                                payload: { submission_id: sid, task_id: taskId,
-                                          task_assignee: bind.assigneeAtSubmit,
+                                          task_assignee: bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null,
                                           kind, title: b.title ?? "", base_sha: b.base_sha,
                                           review_state: "pending",
                                           refs: norm.refs,
+                                          supersedes_id: rev.row?.submission_id ?? null,
                                           overtake: bind.overtake, overtake_reason: bind.overtake ? overtakeReason : null },
                                dedupe_key: `sub:${sid}` }),
       }));
       return Response.json({ submission_id: sid, state: "delivered", review_state: "pending", task_id: taskId,
-                             task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                             task_assignee: bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null, auto_bound: bind.autoBound,
+                             revision_of: rev.row?.submission_id ?? null,
+                             base_sha: b.base_sha, apply_state: "unknown",
                              overtake: bind.overtake, seq: await seq.json(),
                              next: submissionNext(project, sid, taskId, "delivered") });
     }
@@ -2498,10 +2559,17 @@ async function bootstrapPayload(env: Env, project: string, auth: any) {
   const active = mine.filter((t: any) => t.state === "claimed" && t.owner === agentId);
   const directed = mine.filter((t: any) => t.state === "open" && t.to === agentId);
   const quota = await projectQuota(env, project).catch(() => null);
+  // 交付失效是“已收但打不上”，bootstrap 直接给出待处理数量，不等节点翻列表。
+  const applyConflict = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM submissions
+      WHERE project = ? AND agent_id = ? AND apply_state = 'conflict'
+        AND state IN ('delivered','collected')`
+  ).bind(project, agentId).first<any>().catch(() => null);
   return json({
     ok: true, agent_id: agentId, project, role: auth.role, scopes: auth.scopes ?? [],
     server_version: { sdk: SDK_VERSION, build: BUILD_TAG }, generated_at: Date.now(),
     project_status: auth.projectStatus ?? "active",
+    apply_conflicts: Number(applyConflict?.n ?? 0),
     limits: {
       active_task_limit: ACTIVE_TASK_LIMIT,
       active_tasks: active.length,
@@ -2515,6 +2583,7 @@ async function bootstrapPayload(env: Env, project: string, auth: any) {
       claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
       mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
       public_pool: { method: "GET", path: `/p/${project}/tasks` },
+      applies_conflict: { method: "GET", path: `/p/${project}/submissions?mine=1&applies=conflict` },
       inbox: { method: "GET", path: `/p/${project}/inbox?since=0` },
       skill: { method: "GET", path: "/skill" },
     },
@@ -2673,23 +2742,40 @@ async function listSubmissions(env: Env, project: string, url: URL, full = false
   const state = url.searchParams.get("state") ?? "";
   const taskId = url.searchParams.get("task_id") ?? "";
   const review = url.searchParams.get("review_state") ?? "";
+  const applies = url.searchParams.get("applies") ?? "";
   const withCounts = url.searchParams.get("counts") === "1";
   // 普通 agent 的 “我的交付” 只返回自己的记录；管理侧显式传 all=1 才看全项目。
   const mine = !full && url.searchParams.get("mine") === "1" && !!agentId;
   const valid = ["delivered", "collected", "archived"].includes(state);
   const validReview = ["pending", "accepted", "approved", "rejected", "withdrawn"].includes(review);
+  const validApply = ["unknown", "ok", "conflict", "error"].includes(applies);
   const cond = ["project = ?"];
   const vals: any[] = [project];
   if (mine) { cond.push("agent_id = ?"); vals.push(agentId); }
   if (valid) { cond.push("state = ?"); vals.push(state); }
   if (taskId && /^[a-zA-Z0-9._:-]{1,64}$/.test(taskId)) { cond.push("task_id = ?"); vals.push(taskId); }
   if (validReview) { cond.push("review_state = ?"); vals.push(review); }
+  if (validApply) { cond.push("apply_state = ?"); vals.push(applies); }
   const cols = full ? "*" : "submission_id,agent_id,task_id,base_sha,kind,title,refs_json," +
-    "checks_json,review_state,task_assignee,overtake,state,created_at,updated_at";
+    "checks_json,review_state,task_assignee,overtake,state,created_at,updated_at," +
+    "apply_state,apply_target_sha,apply_checked_at,apply_engine,apply_result_json,supersedes_id,superseded_by";
   const rows = await env.DB.prepare(
     `SELECT ${cols} FROM submissions WHERE ${cond.join(" AND ")} ORDER BY created_at DESC LIMIT 100`
   ).bind(...vals).all();
-  if (!withCounts) return Response.json(rows.results);
+  // 列表不要只给原始列：apply 摘要/失败文件行必须一眼能读，避免节点再猜。
+  const enrich = (r: any) => {
+    let detail: any = null;
+    if (r.apply_result_json) { try { detail = JSON.parse(String(r.apply_result_json)); } catch {} }
+    return { ...r, apply: detail ? {
+      state: detail.state, applies: detail.applies ?? (detail.state === "ok" ? true : detail.state === "conflict" ? false : null),
+      target_sha: detail.target_sha, checked_at: detail.checked_at,
+      checked_by: detail.checked_by, engine: detail.engine,
+      failed_files: detail.failed_files ?? [], failed_lines: detail.failed_lines ?? [],
+      summary: detail.summary, error: detail.error ?? null,
+    } : null };
+  };
+  const outRows = (rows.results ?? []).map(enrich);
+  if (!withCounts) return Response.json(outRows);
   // 交付箱的“共 N / 待取 / 待裁决”必须基于全量计数，不能拿 LIMIT 100 的行数冒充总数。
   const all = await env.DB.prepare(
     `SELECT state, review_state, COUNT(*) AS n FROM submissions WHERE ${cond.join(" AND ")} GROUP BY state, review_state`
@@ -2708,7 +2794,7 @@ async function listSubmissions(env: Env, project: string, url: URL, full = false
     if (st !== "archived" && (rv === "pending" || rv === "accepted")) pendingReview += n;
   }
   return Response.json({
-    submissions: rows.results,
+    submissions: outRows,
     total, delivered, pending_review: pendingReview,
     by_state: byState, by_review: byReview,
     limit: 100, returned: rows.results.length, truncated: total > rows.results.length,
@@ -2719,7 +2805,11 @@ async function listSubmissions(env: Env, project: string, url: URL, full = false
 function submissionNext(project: string, sid: string, taskId: string | null, state: string | null) {
   return {
     bundle: { method: "GET", path: `/p/${project}/submissions/${encodeURIComponent(sid)}/bundle` },
+    applies: { method: "GET", path: `/p/${project}/submissions/${encodeURIComponent(sid)}/applies` },
     detail: { method: "GET", path: `/p/${project}/submissions?task_id=${encodeURIComponent(taskId ?? "")}&mine=1` },
+    revision: { method: "POST", path: `/p/${project}/submissions`, required_scope: "submissions.create",
+                body_template: { revision_of: sid, submission_id: "rev-<new-id>",
+                                 base_sha: "<current-main-sha>", kind: "patch" } },
     ...(state === "delivered" ? {
       withdraw: { method: "POST", path: `/p/${project}/submissions/${encodeURIComponent(sid)}/withdraw`, body: {} },
     } : {}),
@@ -2768,6 +2858,9 @@ async function bundleSubmission(env: Env, project: string, id: string) {
     task_id: row.task_id ?? null, task_assignee: row.task_assignee ?? null,
     review_state: row.review_state ?? "pending", overtake: !!row.overtake,
     kind: row.kind, title: row.title, state: row.state, checks,
+    apply_state: row.apply_state ?? "unknown", apply_target_sha: row.apply_target_sha ?? null,
+    apply_checked_at: row.apply_checked_at ?? null, apply_engine: row.apply_engine ?? null,
+    supersedes_id: row.supersedes_id ?? null, superseded_by: row.superseded_by ?? null,
     created_at: row.created_at, updated_at: row.updated_at,
     refs: normalized.map((r) => ({ sha256: r?.sha256, name: r?.name, bytes: r?.bytes })),
     generated_at: Date.now(), generator: "agent-hub bundle v1",
@@ -2829,6 +2922,52 @@ type TaskBinding = {
   error?: Response;
 };
 
+/** 修正版(rebase)入口：新交付 rev-* 指向旧 collected 交付，任务 done 也允许。 */
+async function resolveRevisionSubmission(
+  env: Env, project: string, agentId: string, rawId: unknown,
+  kind: string, taskId: string | null, isAdmin = false
+): Promise<{ row: any | null; error?: Response; taskId: string | null }> {
+  const id = rawId === undefined || rawId === null ? "" : String(rawId).trim();
+  if (!id) return { row: null, taskId };
+  if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(id))
+    return { row: null, taskId, error: err(422, "bad_revision_of", {
+      hint: "revision_of 必须是旧交付的 submission_id，只能用字母、数字、点、下划线、冒号、连字符。",
+      use: { mine: { method: "GET", path: `/p/${project}/submissions?mine=1` } },
+    }) };
+  const row = await env.DB.prepare(
+    `SELECT submission_id, agent_id, task_id, kind, state, review_state, superseded_by, task_assignee
+       FROM submissions WHERE project = ? AND submission_id = ?`
+  ).bind(project, id).first<any>();
+  if (!row) return { row: null, taskId, error: err(404, "revision_not_found", {
+    submission_id: id,
+    hint: "被修正的旧交付不存在；revision_of 用 submissions?mine=1 里的 submission_id。",
+    use: { mine: { method: "GET", path: `/p/${project}/submissions?mine=1` } },
+  }) };
+  if (!isAdmin && String(row.agent_id ?? "") !== agentId)
+    return { row, taskId, error: err(403, "revision_not_owner", {
+      submission_id: id,
+      hint: "只能修正自己提交的交付；别人的补丁请走管理侧代建。",
+    }) };
+  if (String(row.state) === "archived" || String(row.review_state) === "withdrawn")
+    return { row, taskId, error: err(409, "revision_archived", {
+      submission_id: id, state: row.state, review_state: row.review_state,
+      hint: "已撤回归档的交付不能作为修正底稿；直接交新 submission。",
+      use: { submit: { method: "POST", path: `/p/${project}/submissions`, required_scope: "submissions.create" } },
+    }) };
+  if (row.kind && kind && String(row.kind) !== kind)
+    return { row, taskId, error: err(422, "revision_kind_mismatch", {
+      revision_of: id, old_kind: row.kind, kind,
+      hint: "修正版只能沿用旧交付的 kind（patch 修 patch）；换 kind 请新建交付。",
+    }) };
+  const oldTask = row.task_id ? String(row.task_id) : null;
+  if (taskId && oldTask && taskId !== oldTask)
+    return { row, taskId, error: err(422, "revision_task_mismatch", {
+      revision_of: id, revision_task_id: oldTask, task_id: taskId,
+      hint: "修正版必须挂回旧交付同一个 task_id；不要挂到别的任务上。",
+    }) };
+  return { row, taskId: oldTask ?? taskId };
+}
+
 /**
  * S1/S2：交付绑定与越单校验。
  * - task_id 必填；不再按“名下只有一个 claimed”猜测，猜错会把交付挂到旧任务；
@@ -2838,7 +2977,7 @@ type TaskBinding = {
  */
 async function resolveSubmissionTask(
   env: Env, project: string, agentId: string, rawTaskId: unknown,
-  allowOvertake = false, requireClaimed = true
+  allowOvertake = false, requireClaimed = true, allowDoneRevision = false
 ): Promise<TaskBinding> {
   const taskId = rawTaskId === undefined || rawTaskId === null || String(rawTaskId).trim() === ""
     ? null : String(rawTaskId).trim();
@@ -2881,15 +3020,24 @@ async function resolveSubmissionTask(
                  claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
                },
              }) };
-  if (t.state === "done")
+  if (t.state === "done") {
+    // 修正版例外：旧交付已 collected、任务已 done 时，允许同一提交人带
+    // revision_of 重新交一份 rebase 版；任务本身不 reopen，避免把完成态拉回。
+    if (allowDoneRevision)
+      return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null };
     return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: null,
              error: err(409, `task_done:${taskId}`, {
-               state: "done", hint: "任务已完成，不能再交付；领下一个任务，或让管理员 reopen。",
+               state: "done",
+               hint: "任务已完成，不能再交付；领下一个任务，或让管理员 reopen。若这是已 collected 补丁的 rebase 修正，用 POST submissions 带 revision_of=<旧 submission_id>，任务不必 reopen。",
                use: {
+                 revision: { method: "POST", path: `/p/${project}/submissions`, required_scope: "submissions.create",
+                             body_template: { revision_of: "<collected-submission-id>", submission_id: "rev-<new-id>",
+                                              base_sha: "<current-main-sha>", kind: "patch" } },
                  claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
                  mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
                },
              }) };
+  }
 
   const isOwner = t.state === "claimed" && t.owner === agentId;
   const isAssigned = t.to === agentId && t.state !== "done";
@@ -3107,6 +3255,589 @@ async function baseCommitExists(env: Env, sha: string): Promise<boolean | null> 
   } catch {
     return null;
   }
+}
+
+// ── 0077：交付补丁对当前 main 的适用性 ─────────────────────
+// 目标：collected 之后 main 前进，中心不能只留 base_sha 就假装还能打。
+// 这里做两层：server 静态 hunk 检查（无 git 二进制的 Worker 也能跑）+ 节点用
+// git apply --check 上报的权威结果；两者共用同一组字段，列表/事件直接消费。
+type ApplyState = "unknown" | "ok" | "conflict" | "error";
+
+type ApplyFailure = {
+  file: string;
+  patch_line: number;
+  target_line?: number;
+  hunk?: string;
+  reason: string;
+  detail?: string;
+};
+
+type ApplyResult = {
+  state: ApplyState;
+  applies: boolean | null;
+  target_sha: string;
+  engine: string;
+  checked_at: number;
+  checked_by: string;
+  checked_hunks: number;
+  failed_files: string[];
+  failed_lines: string[];
+  failures: ApplyFailure[];
+  summary: string;
+  error?: string;
+};
+
+interface ParsedHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  patchLine: number;
+  oldLines: string[];
+  newLines: string[];
+}
+
+interface ParsedPatchFile {
+  aPath: string | null;
+  bPath: string | null;
+  headerLine: number;
+  isNew: boolean;
+  isDeleted: boolean;
+  binary: boolean;
+  hunks: ParsedHunk[];
+}
+
+function patchPath(raw: string): string | null {
+  let v = String(raw ?? "").trim().split("\t")[0].trim();
+  if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+  if (v === "/dev/null") return null;
+  v = v.replace(/^[ab]\//, "");
+  return v;
+}
+
+function parseUnifiedPatch(text: string): ParsedPatchFile[] {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const files: ParsedPatchFile[] = [];
+  let cur: ParsedPatchFile | null = null;
+  let hunk: ParsedHunk | null = null;
+  const hunkDone = () => {
+    if (hunk && hunk.oldLines.length >= hunk.oldCount && hunk.newLines.length >= hunk.newCount)
+      hunk = null;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNo = i + 1;
+    if (line.startsWith("diff --git ")) {
+      const m = line.match(/^diff --git a\/(.*?) b\/(.*)$/);
+      cur = {
+        aPath: m ? patchPath("a/" + m[1]) : null,
+        bPath: m ? patchPath("b/" + m[2]) : null,
+        headerLine: lineNo, isNew: false, isDeleted: false, binary: false, hunks: [],
+      };
+      files.push(cur);
+      hunk = null;
+      continue;
+    }
+    if (!cur) {
+      if (!line.startsWith("--- ")) continue;
+      cur = { aPath: null, bPath: null, headerLine: lineNo, isNew: false,
+              isDeleted: false, binary: false, hunks: [] };
+      files.push(cur);
+      hunk = null;
+    }
+    if (line.startsWith("new file mode ")) { cur.isNew = true; hunk = null; continue; }
+    if (line.startsWith("deleted file mode ")) { cur.isDeleted = true; hunk = null; continue; }
+    if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) {
+      cur.binary = true; hunk = null; continue;
+    }
+    if (!hunk && line.startsWith("--- ")) { cur.aPath = patchPath(line.slice(4)); continue; }
+    if (!hunk && line.startsWith("+++ ")) { cur.bPath = patchPath(line.slice(4)); continue; }
+    if (!hunk && line.startsWith("rename from ")) { cur.aPath = patchPath(line.slice(12)); continue; }
+    if (!hunk && line.startsWith("rename to ")) { cur.bPath = patchPath(line.slice(10)); continue; }
+    if (line.startsWith("@@ ")) {
+      const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+      if (!m) { hunk = null; continue; }
+      hunk = {
+        oldStart: Number(m[1]),
+        oldCount: m[2] === undefined ? 1 : Number(m[2]),
+        newStart: Number(m[3]),
+        newCount: m[4] === undefined ? 1 : Number(m[4]),
+        patchLine: lineNo, oldLines: [], newLines: [],
+      };
+      cur.hunks.push(hunk);
+      continue;
+    }
+    if (!hunk) continue;
+    // hunk 正文：上下文/删除/新增；空行是某些工具把只有一个空格的上下文行裁掉了。
+    if (line.startsWith("\\")) continue;
+    if (line.startsWith("+")) { hunk.newLines.push(line.slice(1)); hunkDone(); continue; }
+    if (line.startsWith("-")) { hunk.oldLines.push(line.slice(1)); hunkDone(); continue; }
+    if (line.startsWith(" ") || line === "") {
+      const v = line === "" ? "" : line.slice(1);
+      hunk.oldLines.push(v); hunk.newLines.push(v); hunkDone(); continue;
+    }
+    hunk = null;
+  }
+  return files;
+}
+
+function fileLines(text: string): string[] {
+  const out = text.replace(/\r\n/g, "\n").split("\n");
+  if (out.length && out[out.length - 1] === "") out.pop();
+  return out;
+}
+
+function findBlock(work: string[], block: string[], expected: number): number | null {
+  if (block.length === 0) return Math.min(Math.max(expected, 0), work.length);
+  const max = work.length - block.length;
+  if (max < 0) return null;
+  const at = Math.min(Math.max(expected, 0), max);
+  for (let d = 0; d <= max; d++) {
+    const a = at + d, b = at - d;
+    if (a <= max && block.every((v, i) => work[a + i] === v)) return a;
+    if (d > 0 && b >= 0 && block.every((v, i) => work[b + i] === v)) return b;
+  }
+  for (let pos = 0; pos <= max; pos++) {
+    if (block.every((v, i) => work[pos + i] === v)) return pos;
+  }
+  return null;
+}
+
+function applyFailSummary(state: ApplyState, failed: string[], failures: ApplyFailure[], error?: string) {
+  if (state === "ok") return "补丁可在目标基线上应用";
+  if (state === "unknown") return error || "尚未检查适用性";
+  if (state === "error") return error || "检查失败，未得出能否应用";
+  const first = failures[0];
+  const where = first ? `${first.file}:${first.patch_line}` : (failed[0] ?? "未知文件");
+  return `补丁与目标基线冲突：${failed.length} 个文件，首处 ${where}`;
+}
+
+type RepoTextResult = { text: string | null; missing: boolean; error?: string };
+type RepoTextCache = Map<string, RepoTextResult>;
+
+async function githubRepoText(
+  env: Env, repo: string, sha: string, path: string, cache?: RepoTextCache
+): Promise<RepoTextResult> {
+  if (!repo || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo))
+    return { text: null, missing: false, error: "repo_not_configured" };
+  if (!path || path.startsWith("/") || path.split("/").some((p) => p === ".." || p === ""))
+    return { text: null, missing: false, error: "bad_patch_path" };
+  const key = `${sha}:${path}`;
+  const hit = cache?.get(key);
+  if (hit) return hit;
+  const save = (v: RepoTextResult) => { cache?.set(key, v); return v; };
+  const rawUrl = `https://raw.githubusercontent.com/${repo}/${encodeURIComponent(sha)}/` +
+    path.split("/").map(encodeURIComponent).join("/");
+  try {
+    const r = await fetch(rawUrl, { headers: { "user-agent": "synapse-agent-hub" } });
+    if (r.status === 200) {
+      const text = await r.text();
+      if (text.length > PATCH_MAX_BYTES)
+        return save({ text: null, missing: false, error: "target_file_too_large" });
+      return save({ text, missing: false });
+    }
+    if (r.status !== 404 && r.status !== 403 && r.status !== 429)
+      return save({ text: null, missing: false, error: `raw_http_${r.status}` });
+  } catch (e: any) {
+    if (!env.GITHUB_TOKEN)
+      return save({ text: null, missing: false, error: `raw_network:${e?.message ?? e}` });
+  }
+  // raw 404/私有仓库：有 token 时走 contents API，能区分“文件不存在”和“无权”。
+  if (!env.GITHUB_TOKEN) return save({ text: null, missing: true });
+  try {
+    const api = `https://api.github.com/repos/${repo}/contents/` +
+      path.split("/").map(encodeURIComponent).join("/") + `?ref=${encodeURIComponent(sha)}`;
+    const r = await fetch(api, {
+      headers: {
+        accept: "application/vnd.github.raw+json",
+        authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        "user-agent": "synapse-agent-hub",
+      },
+    });
+    if (r.status === 404) return save({ text: null, missing: true });
+    if (r.status !== 200)
+      return save({ text: null, missing: false, error: `contents_http_${r.status}` });
+    const text = await r.text();
+    if (text.length > PATCH_MAX_BYTES)
+      return save({ text: null, missing: false, error: "target_file_too_large" });
+    return save({ text, missing: false });
+  } catch (e: any) {
+    return save({ text: null, missing: false, error: `contents_network:${e?.message ?? e}` });
+  }
+}
+
+async function repoMainSha(env: Env): Promise<{ sha: string | null; error?: string; cached: boolean }> {
+  const repo = String(env.GITHUB_REPO ?? "").trim();
+  if (!repo || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo))
+    return { sha: null, error: "repo_not_configured", cached: false };
+  const branch = String(env.GITHUB_BRANCH ?? "main").trim() || "main";
+  const key = `repo:main:${repo}:${branch}`;
+  try {
+    const cached = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
+      .bind(key).first<any>();
+    if (cached?.value && Date.now() - Number(cached.updated_at ?? 0) < 300_000)
+      return { sha: String(cached.value), cached: true };
+  } catch { /* settings 不可用时继续查远端 */ }
+  let sha: string | null = null;
+  // 公开仓库先读 atom：GitHub API 匿名 60 次/小时，cron 每分钟查一次会把额度打满。
+  try {
+    const r = await fetch(`https://github.com/${repo}/commits/${encodeURIComponent(branch)}.atom`, {
+      headers: { "user-agent": "synapse-agent-hub" },
+    });
+    if (r.status === 200) {
+      const xml = await r.text();
+      const m = xml.match(/Grit::Commit\/([a-f0-9]{40})/i) || xml.match(/\/commit\/([a-f0-9]{40})/i);
+      if (m) sha = m[1].toLowerCase();
+    }
+  } catch { /* 走 API */ }
+  if (!sha && env.GITHUB_TOKEN) {
+    try {
+      const r = await fetch(`https://api.github.com/repos/${repo}/commits/${encodeURIComponent(branch)}`, {
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${env.GITHUB_TOKEN}`,
+          "user-agent": "synapse-agent-hub",
+        },
+      });
+      if (r.status === 200) {
+        const d: any = await r.json();
+        if (/^[a-f0-9]{40}$/.test(String(d?.sha ?? ""))) sha = String(d.sha).toLowerCase();
+      }
+    } catch { /* 保持 null */ }
+  }
+  if (!sha) return { sha: null, error: "repo_main_unavailable", cached: false };
+  try {
+    await env.DB.prepare(
+      "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+    ).bind(key, sha, Date.now()).run();
+  } catch { /* 缓存失败不影响本次判定 */ }
+  return { sha, cached: false };
+}
+
+async function checkPatchAgainstRepo(
+  env: Env, repo: string, targetSha: string, patchText: string,
+  checkedBy: string, engine: string, cache?: RepoTextCache
+): Promise<ApplyResult> {
+  const checkedAt = Date.now();
+  const base: ApplyResult = {
+    state: "unknown", applies: null, target_sha: targetSha, engine, checked_at: checkedAt,
+    checked_by: checkedBy, checked_hunks: 0, failed_files: [], failed_lines: [],
+    failures: [], summary: "尚未检查适用性",
+  };
+  if (!repo) return { ...base, state: "unknown", error: "repo_not_configured", summary: "未配置 GITHUB_REPO，无法自动检查" };
+  const files = parseUnifiedPatch(patchText);
+  if (!files.length) return { ...base, state: "error", error: "patch_parse_empty", summary: "补丁里没有 diff 文件，无法检查" };
+  const failures: ApplyFailure[] = [];
+  let checkedHunks = 0;
+  for (const f of files) {
+    const path = f.bPath ?? f.aPath;
+    if (!path) {
+      failures.push({ file: "?", patch_line: f.headerLine, reason: "no_path" });
+      continue;
+    }
+    if (f.binary) {
+      failures.push({ file: path, patch_line: f.headerLine, reason: "binary_unsupported" });
+      continue;
+    }
+    // 有些 git diff 只有 `--- /dev/null` / `+++ /dev/null`，没有 new/deleted file mode。
+    const isDeleted = f.isDeleted || (!f.bPath && !!f.aPath);
+    const isNew = f.isNew || (!f.aPath && !!f.bPath);
+    if (isDeleted) {
+      const got = await githubRepoText(env, repo, targetSha, path, cache);
+      if (got.error) {
+        failures.push({ file: path, patch_line: f.headerLine, reason: got.error });
+        continue;
+      }
+      // 删除补丁对已不存在的文件是 no-op，可以视作可应用；还存在则冲突。
+      if (!got.missing) failures.push({ file: path, patch_line: f.headerLine, reason: "delete_target_still_exists" });
+      else checkedHunks += f.hunks.length;
+      continue;
+    }
+    if (isNew) {
+      const got = await githubRepoText(env, repo, targetSha, path, cache);
+      if (got.error) {
+        failures.push({ file: path, patch_line: f.headerLine, reason: got.error });
+        continue;
+      }
+      if (!got.missing) {
+        failures.push({ file: path, patch_line: f.headerLine, reason: "new_target_already_exists" });
+        continue;
+      }
+      checkedHunks += f.hunks.length;
+      continue;
+    }
+    const got = await githubRepoText(env, repo, targetSha, path, cache);
+    if (got.error) {
+      failures.push({ file: path, patch_line: f.headerLine, reason: got.error });
+      continue;
+    }
+    if (got.missing) {
+      failures.push({ file: path, patch_line: f.headerLine, reason: "target_file_missing" });
+      continue;
+    }
+    // 只读检查：每个 hunk 的旧上下文必须能在目标文件里找到；不要在工作副本上
+    // 逐段替换，否则前一个 hunk 的插入会把后一个 hunk 的原始行号/上下文推歪，
+    // 产生 git apply --check 没有的假冲突（ISS-MWX37OYG 的 0077 实测踩到）。
+    const work = fileLines(got.text ?? "");
+    for (const h of f.hunks) {
+      const expected = Math.max(0, h.oldStart - 1);
+      const pos = findBlock(work, h.oldLines, expected);
+      if (pos === null) {
+        failures.push({
+          file: path, patch_line: h.patchLine, target_line: h.oldStart,
+          hunk: `@@ -${h.oldStart},${h.oldCount} +${h.newStart},${h.newCount} @@`,
+          reason: "context_mismatch",
+        });
+        break;
+      }
+      checkedHunks += 1;
+    }
+  }
+  const failedFiles = [...new Set(failures.map((f) => f.file).filter((f) => f && f !== "?"))].sort();
+  const failedLines = [...new Set(failures.map((f) => `${f.file}:${f.target_line ?? f.patch_line}`))].sort();
+  const state: ApplyState = failures.length ? "conflict" : "ok";
+  return {
+    ...base, state, applies: state === "ok", checked_hunks: checkedHunks,
+    failed_files: failedFiles, failed_lines: failedLines, failures,
+    summary: applyFailSummary(state, failedFiles, failures),
+  };
+}
+
+function patchRefFromRow(row: any): NormalizedRef | null {
+  let refs: any[] = [];
+  try { refs = JSON.parse(row?.refs_json ?? "[]"); } catch { refs = []; }
+  const list = refs.map((r) => typeof r === "string" ? { sha256: r, name: "" } : r);
+  return list.find((r) => /\.(patch|diff)$/i.test(String(r?.name ?? ""))) ||
+         list.find((r) => /patch|diff/i.test(String(r?.name ?? ""))) || null;
+}
+
+async function checkSubmissionApplyRow(
+  env: Env, project: string, row: any, targetSha: string, checkedBy = "server",
+  cache?: RepoTextCache
+): Promise<ApplyResult> {
+  const base: ApplyResult = {
+    state: "unknown", applies: null, target_sha: targetSha, engine: "server-hunk-v1",
+    checked_at: Date.now(), checked_by: checkedBy, checked_hunks: 0,
+    failed_files: [], failed_lines: [], failures: [], summary: "尚未检查适用性",
+  };
+  const repo = String(env.GITHUB_REPO ?? "").trim();
+  if (!repo) return { ...base, error: "repo_not_configured", summary: "未配置 GITHUB_REPO，无法自动检查" };
+  const ref = patchRefFromRow(row);
+  if (!ref) return { ...base, state: "error", error: "patch_ref_missing", summary: "交付里找不到 .patch/.diff 文件" };
+  let obj: R2ObjectBody | null = null;
+  try { obj = await env.BLOBS.get(`p/${project}/artifacts/${ref.sha256}`); } catch { obj = null; }
+  if (!obj) return { ...base, state: "error", error: "patch_blob_missing", summary: "补丁对象不在 R2" };
+  if (Number((obj as any).size ?? 0) > PATCH_MAX_BYTES)
+    return { ...base, state: "error", error: "patch_too_large", summary: "补丁超过 8MB，未检查" };
+  let patchText = "";
+  try { patchText = await obj.text(); } catch { return { ...base, state: "error", error: "patch_read_failed", summary: "补丁读取失败" }; }
+  return checkPatchAgainstRepo(env, repo, targetSha, patchText, checkedBy, base.engine, cache);
+}
+
+async function saveSubmissionApply(
+  env: Env, project: string, sid: string, result: ApplyResult
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE submissions
+        SET apply_state = ?, apply_target_sha = ?, apply_checked_at = ?, apply_checked_by = ?,
+            apply_engine = ?, apply_result_json = ?
+      WHERE project = ? AND submission_id = ?`
+  ).bind(result.state, result.target_sha, result.checked_at, result.checked_by,
+         result.engine, JSON.stringify(result), project, sid).run();
+}
+
+async function notifyApplyConflict(
+  env: Env, project: string, row: any, result: ApplyResult
+): Promise<void> {
+  await publishSubmissionEvent(env, project, row, "apply_conflict", {
+    apply_state: result.state, target_sha: result.target_sha,
+    failed_files: result.failed_files, failed_lines: result.failed_lines,
+    summary: result.summary, checked_at: result.checked_at, engine: result.engine,
+    hint: "这个 collected 补丁已经打不上当前 main；用 revision_of 提交 rebase 版，不要改旧 submission。",
+    use: {
+      applies: { method: "GET", path: `/p/${project}/submissions/${encodeURIComponent(row.submission_id)}/applies` },
+      revision: {
+        method: "POST", path: `/p/${project}/submissions`, required_scope: "submissions.create",
+        body_template: { revision_of: row.submission_id, base_sha: result.target_sha,
+                         submission_id: "rev-<new-id>", kind: row.kind ?? "patch" },
+      },
+    },
+  });
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
+    }
+  };
+  const lanes = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: lanes }, () => worker()));
+  return out;
+}
+
+async function checkCollectedApplies(
+  env: Env, project: string, targetSha: string
+): Promise<{ checked: number; conflicts: number; errors: number; skipped: number }> {
+  const rows = await env.DB.prepare(
+    `SELECT submission_id, agent_id, task_id, kind, base_sha, refs_json, state, apply_state, apply_target_sha
+       FROM submissions
+      WHERE project = ? AND state IN ('delivered','collected')
+        AND kind IN ('patch','bundle')
+      ORDER BY created_at ASC LIMIT 40`
+  ).bind(project).all<any>();
+  let checked = 0, conflicts = 0, errors = 0, skipped = 0;
+  // 24 个 patch 逐个串行会被 GitHub raw 网络拖慢；4 路并发，落库/通知仍串行。
+  // 同一 target 下跨 patch 共享文件正文，避免 24 个 patch 重复拉同一个 worker.ts。
+  const repoTextCache: RepoTextCache = new Map();
+  const checks = await mapLimit(rows.results ?? [], 4, async (row: any) => ({
+    row,
+    result: await checkSubmissionApplyRow(env, project, row, targetSha, "server:cron", repoTextCache)
+      .catch((e: any) => ({ state: "error" as ApplyState, applies: null, target_sha: targetSha,
+                            engine: "server-hunk-v1", checked_at: Date.now(), checked_by: "server:cron",
+                            checked_hunks: 0, failed_files: [], failed_lines: [], failures: [],
+                            summary: "检查异常", error: String(e?.message ?? e) })),
+  }));
+  for (const { row, result } of checks) {
+    if (result.state === "unknown") { skipped += 1; continue; }
+    await saveSubmissionApply(env, project, row.submission_id, result);
+    checked += 1;
+    if (result.state === "conflict") {
+      conflicts += 1;
+      if (String(row.apply_state ?? "unknown") !== "conflict" ||
+          String(row.apply_target_sha ?? "") !== result.target_sha)
+        await notifyApplyConflict(env, project, row, result);
+    } else if (result.state === "error") errors += 1;
+  }
+  return { checked, conflicts, errors, skipped };
+}
+
+async function submissionApplies(
+  env: Env, project: string, id: string, url: URL, agentId: string, isAdmin: boolean
+): Promise<Response> {
+  const row = await env.DB.prepare("SELECT * FROM submissions WHERE project = ? AND submission_id = ?")
+    .bind(project, id).first<any>();
+  if (!row) return err(404, "submission_not_found", {
+    hint: "先 GET /submissions?mine=1 找到自己的 submission_id。",
+    use: { mine: { method: "GET", path: `/p/${project}/submissions?mine=1` } },
+  });
+  if (!isAdmin && String(row.agent_id ?? "") !== agentId)
+    return err(403, "submission_not_owner", {
+      hint: "只能查自己交付的适用性；管理员可查全部。",
+    });
+  const requested = String(url.searchParams.get("target_sha") ?? "").trim();
+  if (requested && !/^[a-f0-9]{7,64}$/i.test(requested))
+    return err(422, "target_sha_not_hex");
+  const refresh = url.searchParams.get("refresh") === "1";
+  let target = requested.toLowerCase();
+  // 不指定 target 时，默认查当前 main；只有远端不可用才退回已存目标。
+  if (!target) {
+    const main = await repoMainSha(env);
+    target = (main.sha ?? String(row.apply_target_sha ?? "")).toLowerCase();
+  }
+  // 节点用 git apply --check 上报的权威结果不能被 GET 的静态检查覆盖；
+  // 只有目标变了或显式 refresh=1 才重算。
+  if (!refresh && row.apply_result_json && target &&
+      String(row.apply_target_sha ?? "").toLowerCase() === target) {
+    try {
+      const stored = JSON.parse(String(row.apply_result_json));
+      return json({ submission_id: id, base_sha: row.base_sha ?? null,
+                    target_sha: stored.target_sha ?? target, apply_state: stored.state,
+                    applies: stored.applies ?? null, failed_files: stored.failed_files ?? [],
+                    failed_lines: stored.failed_lines ?? [], failures: stored.failures ?? [],
+                    checked_hunks: stored.checked_hunks ?? 0, summary: stored.summary,
+                    error: stored.error ?? null, checked_at: stored.checked_at ?? row.apply_checked_at,
+                    checked_by: stored.checked_by ?? row.apply_checked_by,
+                    engine: stored.engine ?? row.apply_engine, stored: true });
+    } catch { /* 坏 JSON 继续重算 */ }
+  }
+  if (!target) {
+    return json({
+      submission_id: id, base_sha: row.base_sha ?? null, target_sha: null,
+      apply_state: row.apply_state ?? "unknown", applies: null,
+      failed_files: [], failed_lines: [], failures: [],
+      summary: "没有目标 SHA，也没有可用的 GITHUB_REPO；用 ?target_sha=<sha> 指定基线。",
+      checked_at: row.apply_checked_at ?? null, engine: row.apply_engine ?? null,
+    });
+  }
+  const result = await checkSubmissionApplyRow(env, project, row, target, "server:read");
+  await saveSubmissionApply(env, project, id, result);
+  if (result.state === "conflict" &&
+      (String(row.apply_state ?? "unknown") !== "conflict" ||
+       String(row.apply_target_sha ?? "") !== result.target_sha))
+    await notifyApplyConflict(env, project, row, result);
+  return json({
+    submission_id: id, base_sha: row.base_sha ?? null, target_sha: result.target_sha,
+    apply_state: result.state, applies: result.applies,
+    failed_files: result.failed_files, failed_lines: result.failed_lines,
+    failures: result.failures, checked_hunks: result.checked_hunks,
+    summary: result.summary, error: result.error ?? null,
+    checked_at: result.checked_at, checked_by: result.checked_by, engine: result.engine,
+  });
+}
+
+async function recordSubmissionApply(
+  req: Request, env: Env, project: string, id: string, agentId: string, isAdmin: boolean
+): Promise<Response> {
+  const row = await env.DB.prepare("SELECT * FROM submissions WHERE project = ? AND submission_id = ?")
+    .bind(project, id).first<any>();
+  if (!row) return err(404, "submission_not_found");
+  if (!isAdmin && String(row.agent_id ?? "") !== agentId)
+    return err(403, "submission_not_owner", {
+      hint: "只能上报自己交付的 apply-check；管理员可代报。",
+    });
+  const b: any = await req.json().catch(() => ({}));
+  const target = String(b.target_sha ?? "").trim().toLowerCase();
+  if (!/^[a-f0-9]{7,64}$/.test(target))
+    return err(422, "target_sha_not_hex", {
+      hint: "target_sha 是你要检查的 main 提交，7-64 位十六进制。",
+      use: { applies: { method: "GET", path: `/p/${project}/submissions/${encodeURIComponent(id)}/applies` } },
+    });
+  const stateRaw = String(b.apply_state ?? b.state ?? (b.applies === true ? "ok" : "conflict")).toLowerCase();
+  if (!["ok", "conflict", "error"].includes(stateRaw))
+    return err(422, "bad_apply_state");
+  const state = stateRaw as ApplyState;
+  if (state === "ok" && Array.isArray(b.failed_files) && b.failed_files.length)
+    return err(422, "apply_state_mismatch");
+  const failures: ApplyFailure[] = Array.isArray(b.failures) ? b.failures.slice(0, 400).map((f: any) => ({
+    file: String(f?.file ?? "?").slice(0, 300),
+    patch_line: Math.max(0, Number(f?.patch_line ?? 0)),
+    ...(Number(f?.target_line) ? { target_line: Number(f.target_line) } : {}),
+    ...(f?.hunk ? { hunk: String(f.hunk).slice(0, 200) } : {}),
+    reason: String(f?.reason ?? "reported").slice(0, 120),
+    ...(f?.detail ? { detail: String(f.detail).slice(0, 500) } : {}),
+  })) : [];
+  const failedFiles = Array.isArray(b.failed_files)
+    ? [...new Set(b.failed_files.map((x: any) => String(x).slice(0, 300)).filter(Boolean))].slice(0, 200)
+    : [...new Set(failures.map((f) => f.file))].slice(0, 200);
+  const failedLines = Array.isArray(b.failed_lines)
+    ? [...new Set(b.failed_lines.map((x: any) => String(x).slice(0, 320)).filter(Boolean))].slice(0, 400)
+    : [...new Set(failures.map((f) => `${f.file}:${f.target_line ?? f.patch_line}`))].slice(0, 400);
+  const result: ApplyResult = {
+    state, applies: state === "ok" ? true : state === "conflict" ? false : null,
+    target_sha: target, engine: String(b.engine ?? "git-apply").slice(0, 80),
+    checked_at: Date.now(), checked_by: String(b.checked_by ?? agentId).slice(0, 80),
+    checked_hunks: Math.max(0, Number(b.checked_hunks ?? 0)), failed_files: failedFiles,
+    failed_lines: failedLines, failures, summary: String(b.summary ?? "").slice(0, 300),
+  };
+  if (!result.summary) result.summary = applyFailSummary(state, failedFiles, failures, b.error ? String(b.error) : undefined);
+  if (b.error) result.error = String(b.error).slice(0, 300);
+  await saveSubmissionApply(env, project, id, result);
+  if (state === "conflict" &&
+      (String(row.apply_state ?? "unknown") !== "conflict" ||
+       String(row.apply_target_sha ?? "") !== target))
+    await notifyApplyConflict(env, project, row, result);
+  return json({
+    submission_id: id, base_sha: row.base_sha ?? null, target_sha: target,
+    apply_state: result.state, applies: result.applies, failed_files: failedFiles,
+    failed_lines: failedLines, failures, checked_at: result.checked_at,
+    checked_by: result.checked_by, engine: result.engine, summary: result.summary,
+  });
 }
 
 /** S2：读补丁/回执正文做交付门；不合格直接 422，不先收下再由管理侧拒。 */
@@ -3333,7 +4064,11 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
     if (!head) return err(422, `blob_missing:${r.sha256}`);
   }
   const kind = String(b.kind ?? "patch");
-  const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, false, true);
+  const rev = await resolveRevisionSubmission(
+    env, project, agentId, b.revision_of ?? b.supersedes ?? b.rebase_of, kind,
+    b.task_id === undefined || b.task_id === null ? null : String(b.task_id).trim(), isAdmin);
+  if (rev.error) return rev.error;
+  const bind = await resolveSubmissionTask(env, project, agentId, rev.taskId ?? b.task_id, false, true, !!rev.row);
   if (bind.error) return bind.error;
   const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
   if (missing.length) return deliveryFormatError(project, kind, missing);
@@ -3344,11 +4079,13 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
   const res = await env.DB.prepare(
     `INSERT OR IGNORE INTO submissions
      (project, submission_id, agent_id, task_id, task_assignee, overtake, overtake_reason,
-      base_sha, kind, title, refs_json, checks_json, state, review_state, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'delivered', 'pending', ?, ?)`
-  ).bind(project, sid, agentId, taskId, bind.assigneeAtSubmit, bind.overtake ? 1 : 0, null,
+      base_sha, kind, title, refs_json, checks_json, supersedes_id, state, review_state, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'delivered', 'pending', ?, ?)`
+  ).bind(project, sid, agentId, taskId,
+         bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null, bind.overtake ? 1 : 0, null,
          b.base_sha, kind, b.title ?? "",
-         JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
+         JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}),
+         rev.row?.submission_id ?? null, now, now).run();
   if (res.meta.changes === 0) {
     // 幂等只对“同一个 agent 的同一份交付”成立；别的 agent 抢了 ID 必须拒绝。
     const old = await env.DB.prepare(
@@ -3365,24 +4102,33 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
     });
     return json({ submission_id: sid, state: old?.state ?? "delivered", review_state: old?.review_state ?? "pending",
                   deduped: true, seq: null, task_id: old?.task_id ?? taskId,
-                  task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                  task_assignee: bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null, auto_bound: bind.autoBound,
                   next: submissionNext(project, sid, old?.task_id ?? taskId, old?.state ?? "delivered") });
   }
 
+  if (rev.row?.submission_id) {
+    await env.DB.prepare(
+      `UPDATE submissions SET superseded_by = ?
+        WHERE project = ? AND submission_id = ? AND superseded_by IS NULL`
+    ).bind(sid, project, rev.row.submission_id).run();
+  }
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
   const seqRes = await stub.fetch(new Request("https://do/publish", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ project, sender: agentId, topic: "artifact", kind,
                            payload: { submission_id: sid, task_id: taskId,
-                                      task_assignee: bind.assigneeAtSubmit,
+                                      task_assignee: bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null,
                                       kind, base_sha: b.base_sha, title: b.title ?? "",
+                                      supersedes_id: rev.row?.submission_id ?? null,
                                       agent_id: agentId, refs: norm.refs },
                            dedupe_key: `sub:${sid}` }),
   }));
   const seq = await seqRes.json<any>().catch(() => ({}));
   return json({ submission_id: sid, state: "delivered", review_state: "pending", task_id: taskId,
-                task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
-                seq: seq.seq ?? null, next: submissionNext(project, sid, taskId, "delivered") });
+                task_assignee: bind.assigneeAtSubmit ?? rev.row?.task_assignee ?? null, auto_bound: bind.autoBound,
+                revision_of: rev.row?.submission_id ?? null, base_sha: b.base_sha,
+                apply_state: "unknown", seq: seq.seq ?? null,
+                next: submissionNext(project, sid, taskId, "delivered") });
 }
 
 /**

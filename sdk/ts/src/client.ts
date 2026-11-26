@@ -507,9 +507,11 @@ export class Client {
              ref: { sha256: sha, name: basename(path) } };
   }
 
-  private submissionId(kind: string, title: string, refs: any[], base: string, taskId?: string) {
+  private submissionId(kind: string, title: string, refs: any[], base: string, taskId?: string,
+                       revisionOf?: string) {
     const seed = JSON.stringify({
       agent: this.opts.agentId, task: taskId ?? "", kind, title, base,
+      revision_of: revisionOf ?? "",
       refs: refs.map((r) => String(r?.sha256 ?? "")).sort(),
     });
     const clean = this.opts.agentId.replace(/[^a-zA-Z0-9._:-]/g, "-").slice(0, 40);
@@ -517,21 +519,40 @@ export class Client {
   }
 
   async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {},
-               taskId?: string, submissionId?: string, notes = "") {
+               taskId?: string, submissionId?: string, notes = "", revisionOf?: string) {
     const base = baseSha || this.collectEnv().git_head || "";
     if (!base) throw new Error("base_sha required: pass baseSha or run inside a git repo");
     const boundTaskId = taskId || this.activeTaskId();
-    const sid = submissionId || this.submissionId(kind, title, refs, base, boundTaskId);
+    const sid = submissionId || this.submissionId(kind, title, refs, base, boundTaskId, revisionOf);
     return this.post(`/p/${this.opts.project}/submissions`, {
       submission_id: sid, agent_id: this.opts.agentId, kind, title, refs, base_sha: base, checks, notes,
       ...(boundTaskId ? { task_id: boundTaskId } : {}),
+      ...(revisionOf ? { revision_of: revisionOf } : {}),
+    });
+  }
+
+  /** 查旧交付在当前 main 是否还能应用；返回 failed_files/failed_lines。 */
+  async applies(submissionId: string, targetSha?: string) {
+    const q = targetSha ? `?target_sha=${encodeURIComponent(targetSha)}` : "";
+    return this.get(`/p/${this.opts.project}/submissions/${encodeURIComponent(submissionId)}/applies${q}`);
+  }
+
+  /** 节点本地 git apply --check 后回传权威结果；服务端统一落字段并发事件。 */
+  async reportApplyCheck(submissionId: string, targetSha: string, applies: boolean, opts: {
+    failedFiles?: string[]; failedLines?: string[]; failures?: any[];
+    engine?: string; summary?: string;
+  } = {}) {
+    return this.post(`/p/${this.opts.project}/submissions/${encodeURIComponent(submissionId)}/apply-check`, {
+      target_sha: targetSha, applies: !!applies,
+      failed_files: opts.failedFiles ?? [], failed_lines: opts.failedLines ?? [],
+      failures: opts.failures ?? [], engine: opts.engine ?? "git-apply", summary: opts.summary ?? "",
     });
   }
 
   /** 一条龙交付：上传多个文件 + 建交付；submission_id 由内容生成，超时重试不会重复交付。 */
   async deliver(files: string[], opts: {
     kind?: string; title?: string; baseSha?: string; checks?: object;
-    taskId?: string; notes?: string; submissionId?: string;
+    taskId?: string; notes?: string; submissionId?: string; revisionOf?: string;
   } = {}) {
     if (!files.length) throw new Error("deliver 需要至少一个文件");
     const uploaded: any[] = [];
@@ -543,7 +564,8 @@ export class Client {
     }
     try {
       const sub: any = await this.submit(opts.kind ?? "patch", opts.title ?? "", refs,
-        opts.baseSha, opts.checks ?? {}, opts.taskId, opts.submissionId, opts.notes ?? "");
+        opts.baseSha, opts.checks ?? {}, opts.taskId, opts.submissionId, opts.notes ?? "",
+        opts.revisionOf);
       return { ...sub, files: uploaded };
     } catch (e: any) {
       if (e instanceof SynapseAPIError) e.body = { ...e.body, uploaded };

@@ -2129,6 +2129,7 @@ fn main() {
             let base_sha = args_map.get("base-sha").cloned();
             let notes = args_map.get("notes").cloned().unwrap_or_default();
             let sid = args_map.get("sid").cloned();
+            let revision_of = args_map.get("revision-of").cloned();
             let task = args_map.get("task").or_else(|| args_map.get("task-id"))
                 .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
                 .or_else(|| active_task_id(&cfg));
@@ -2142,7 +2143,8 @@ fn main() {
                     json!({"sha256": parts[0], "name": parts.get(1).copied().unwrap_or("artifact")})
                 }).collect();
             match artifact_submit(&cfg, &agent, &base, &kind, &title, refs,
-                                  base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref()) {
+                                  base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref(),
+                                  revision_of.as_deref()) {
                 Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
                 Err(e) => { eprintln!("submit 失败：{e}"); std::process::exit(1); }
             }
@@ -2166,6 +2168,7 @@ fn main() {
             let base_sha = args_map.get("base-sha").cloned();
             let notes = args_map.get("notes").cloned().unwrap_or_default();
             let sid = args_map.get("sid").cloned();
+            let revision_of = args_map.get("revision-of").cloned();
             let task = args_map.get("task").or_else(|| args_map.get("task-id"))
                 .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
                 .or_else(|| active_task_id(&cfg));
@@ -2185,7 +2188,8 @@ fn main() {
                 }));
             }
             let sub = match artifact_submit(&cfg, &agent, &base, &kind, &title, refs,
-                                            base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref()) {
+                                            base_sha.as_deref(), checks, &notes, sid.as_deref(), task.as_deref(),
+                                            revision_of.as_deref()) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("deliver/submit 失败（文件已上传）：{e}"); std::process::exit(1); }
             };
@@ -2983,12 +2987,14 @@ fn artifact_upload(cfg: &Cfg, agent: &Agent, base: &str, path: &str) -> Result<V
 }
 
 /// 由内容生成稳定 submission_id：超时重试命中同一条交付，不会生成重复提交。
-fn new_submission_id(agent_id: &str, kind: &str, title: &str, base: &str, refs: &[Value], task_id: Option<&str>) -> String {
+fn new_submission_id(agent_id: &str, kind: &str, title: &str, base: &str, refs: &[Value],
+                     task_id: Option<&str>, revision_of: Option<&str>) -> String {
     let clean: String = agent_id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == ':' { c } else { '-' })
         .collect();
     let seed = json!({
         "agent": agent_id, "kind": kind, "title": title, "base": base, "task": task_id.unwrap_or(""),
+        "revision_of": revision_of.unwrap_or(""),
         "refs": refs.iter().map(|r| r["sha256"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>()
     });
     let hash = Sha256::digest(seed.to_string().as_bytes());
@@ -3001,6 +3007,7 @@ fn artifact_submit(
     cfg: &Cfg, agent: &Agent, base: &str,
     kind: &str, title: &str, refs: Vec<Value>,
     base_sha: Option<&str>, checks: Value, notes: &str, sid: Option<&str>, task_id: Option<&str>,
+    revision_of: Option<&str>,
 ) -> Result<Value, String> {
     if cfg.token.is_empty() { return Err("缺少 --token（submit 需要 submissions.create scope）".into()); }
     let sha = match base_sha {
@@ -3015,7 +3022,7 @@ fn artifact_submit(
         "submission_id": sid.map(|s| s.to_string()).unwrap_or_else(|| new_submission_id(
             &cfg.agent_id,
             if kind.is_empty() { "patch" } else { kind },
-            title, &sha, &refs, task_id)),
+            title, &sha, &refs, task_id, revision_of)),
         "agent_id": cfg.agent_id,
         "kind": if kind.is_empty() { "patch" } else { kind },
         "title": title,
@@ -3026,6 +3033,9 @@ fn artifact_submit(
     });
     if let Some(t) = task_id.filter(|s| !s.trim().is_empty()) {
         body["task_id"] = json!(t.trim());
+    }
+    if let Some(r) = revision_of.filter(|s| !s.trim().is_empty()) {
+        body["revision_of"] = json!(r.trim());
     }
     let url = format!("{}/p/{}/submissions", base, cfg.project);
     match agent.post(&url)

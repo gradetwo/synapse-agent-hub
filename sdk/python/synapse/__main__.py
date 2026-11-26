@@ -79,8 +79,15 @@ def cmd_deliver(a):
     checks = json.loads(a.checks) if a.checks else {}
     print(json.dumps(c.deliver(files=a.files, kind=a.kind, title=a.title,
                                base_sha=a.base_sha, checks=checks, notes=a.notes or "",
-                               task_id=a.task, submission_id=a.sid),
+                               task_id=a.task, submission_id=a.sid,
+                               revision_of=a.revision_of),
                      ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_applies(a):
+    c = Client.from_config(auto=False)
+    print(json.dumps(c.applies(a.sid, target_sha=a.target_sha), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -153,7 +160,14 @@ def main(argv=None):
     dl.add_argument("--sid", default=None)
     dl.add_argument("--checks", default="")
     dl.add_argument("--notes", default="")
+    dl.add_argument("--revision-of", dest="revision_of", default=None,
+                    help="失效补丁修正：旧 submission_id；任务 done 也允许")
     dl.set_defaults(fn=cmd_deliver)
+
+    ap = sub.add_parser("applies", help="查交付补丁对当前 main 是否可应用")
+    ap.add_argument("sid")
+    ap.add_argument("--target-sha", dest="target_sha", default=None)
+    ap.set_defaults(fn=cmd_applies)
 
     a = p.parse_args(argv)
     return a.fn(a)

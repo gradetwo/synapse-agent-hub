@@ -756,7 +756,7 @@ class Client:
                 files: Iterable[str | Path] | None = None, kind: str = "patch",
                 title: str = "", base_sha: str | None = None,
                 checks: dict | None = None, notes: str = "", task_id: str | None = None,
-                submission_id: str | None = None) -> Any:
+                submission_id: str | None = None, revision_of: str | None = None) -> Any:
         """一条龙交付：deliver(files=[patch, RECEIPT.md]) 上传 + 建交付。
 
         兼容旧用法 deliver(msgs)：不传 files 时仍是消息落盘。
@@ -771,7 +771,8 @@ class Client:
             refs.append(up["ref"])
         try:
             sub = self.submit(kind, title, refs, base_sha=base_sha, checks=checks,
-                              notes=notes, task_id=task_id, submission_id=submission_id)
+                              notes=notes, task_id=task_id, submission_id=submission_id,
+                              revision_of=revision_of)
         except SynapseAPIError as e:
             # 文件已上传但交付被拒：错误体带上已传文件，agent 不用重新上传。
             e.payload["uploaded"] = uploaded
@@ -796,11 +797,12 @@ class Client:
 
     # ── 交付 ─────────────────────────────────────────────────
     def _submission_id(self, kind: str, title: str, refs: list[dict],
-                       base_sha: str, task_id: str | None) -> str:
+                       base_sha: str, task_id: str | None,
+                       revision_of: str | None = None) -> str:
         """内容稳定 ID：超时重试会命中同一条交付，而不是生成重复 submission。"""
         seed = json.dumps({
             "agent": self.agent_id, "task": task_id or "", "kind": kind,
-            "title": title, "base": base_sha,
+            "title": title, "base": base_sha, "revision_of": revision_of or "",
             "refs": sorted([str(r.get("sha256", "")) for r in refs]),
         }, sort_keys=True, separators=(",", ":"))
         clean = re.sub(r"[^a-zA-Z0-9._:-]", "-", self.agent_id)[:40]
@@ -821,20 +823,39 @@ class Client:
 
     def submit(self, kind: str, title: str, refs: list[dict], base_sha: str | None = None,
                checks: dict | None = None, notes: str = "", task_id: str | None = None,
-               submission_id: str | None = None) -> dict:
+               submission_id: str | None = None, revision_of: str | None = None) -> dict:
         base = base_sha or self._git_head()
         if not base:
             raise SynapseAPIError(422, {"error": "base_sha_required",
                 "hint": "传 base_sha，或在 git 仓库内运行；base 必须是 7-64 位十六进制。"})
         task_id = task_id or self._active_task_id()
-        sid = submission_id or self._submission_id(kind, title, refs, base, task_id)
+        sid = submission_id or self._submission_id(kind, title, refs, base, task_id, revision_of)
         body = {
             "submission_id": sid, "agent_id": self.agent_id, "kind": kind, "title": title,
             "refs": refs, "base_sha": base, "checks": checks or {}, "notes": notes,
         }
         if task_id:
             body["task_id"] = task_id
+        if revision_of:
+            body["revision_of"] = revision_of
         return self._post(f"/p/{self.project}/submissions", body)
+
+    def applies(self, submission_id: str, target_sha: str | None = None) -> dict:
+        """查旧交付在当前 main 是否还能应用；返回 failed_files/failed_lines。"""
+        q = f"?target_sha={quote(target_sha)}" if target_sha else ""
+        return self._get(f"/p/{self.project}/submissions/{quote(submission_id)}/applies{q}")
+
+    def report_apply_check(self, submission_id: str, target_sha: str, applies: bool, *,
+                           failed_files: list[str] | None = None,
+                           failed_lines: list[str] | None = None,
+                           failures: list[dict] | None = None,
+                           engine: str = "git-apply", summary: str = "") -> dict:
+        """节点本地 git apply --check 后回传权威结果；服务端统一落字段并发事件。"""
+        return self._post(f"/p/{self.project}/submissions/{quote(submission_id)}/apply-check", {
+            "target_sha": target_sha, "applies": bool(applies),
+            "failed_files": failed_files or [], "failed_lines": failed_lines or [],
+            "failures": failures or [], "engine": engine, "summary": summary,
+        })
 
     # ── active task：CLI/SDK 共享同一份“当前任务”上下文 ─────────
     def _active_task_path(self) -> Path:

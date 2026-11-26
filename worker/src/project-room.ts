@@ -672,6 +672,7 @@ export class ProjectRoom implements DurableObject {
     if (msg.topic === "submission") {
       if (msg.kind === "collected") return "submission.collected";
       if (msg.kind === "archived") return "submission.archived";
+      if (msg.kind === "apply_conflict") return "submission.apply_conflict";
       return "submission.reviewed";
     }
     if (msg.topic === "task") {
@@ -1054,7 +1055,7 @@ export class ProjectRoom implements DurableObject {
       type: "hello", at: Date.now(), role, agent_id: me,
       events: true, event_version: 1,
       event_types: ["submission.created", "submission.reviewed", "submission.collected",
-                    "submission.archived", "task.created", "task.queued", "task.dispatched",
+                    "submission.archived", "submission.apply_conflict", "task.created", "task.queued", "task.dispatched",
                     "task.claimed", "task.released", "task.blocked", "task.done",
                     "task.reopened", "task.reclaimed", "task.reassigned", "task.updated",
                     "task.failed", "task.retry_scheduled", "task.retried", "task.dead_lettered",

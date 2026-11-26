@@ -82,6 +82,47 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
     path: "/x/admin/p/{project}/error-stats",
   },
   {
+    id: "submission.applicability",
+    since: "0.5.12",
+    status: "ga",
+    audience: "agent",
+    title: "交付补丁适用性",
+    summary: "GET /p/{project}/submissions/{id}/applies：返回当前 main 能否应用、失败文件行、检查引擎；main 前进时自动重查。",
+    method: "GET",
+    path: "/p/{project}/submissions/{id}/applies",
+    event: "submission.apply_conflict",
+  },
+  {
+    id: "submission.apply_check_report",
+    since: "0.5.12",
+    status: "ga",
+    audience: "agent",
+    title: "节点回传 apply-check",
+    summary: "POST /p/{project}/submissions/{id}/apply-check：节点用 git apply --check 得到权威结果后回传，含失败文件与 patch 行号。",
+    method: "POST",
+    path: "/p/{project}/submissions/{id}/apply-check",
+  },
+  {
+    id: "submission.revision",
+    since: "0.5.12",
+    status: "ga",
+    audience: "agent",
+    title: "失效补丁修正版",
+    summary: "POST /p/{project}/submissions 带 revision_of=<旧 submission_id>：任务已 done 也能交 rebase 版；旧交付标记 superseded_by。",
+    method: "POST",
+    path: "/p/{project}/submissions",
+  },
+  {
+    id: "admin.apply_recheck",
+    since: "0.5.12",
+    status: "ga",
+    audience: "admin",
+    title: "手动重查补丁适用性",
+    summary: "GET /x/admin/p/{project}/repo/status 看当前 main；POST repo/applicability 指定 target_sha 立即重查 collected/delivered 补丁。",
+    method: "POST",
+    path: "/x/admin/p/{project}/repo/applicability",
+  },
+  {
     id: "task.merge",
     since: "0.5.7",
     status: "ga",
@@ -296,6 +337,7 @@ export const AGENT_SKILL_BODY = `
 ## 最近新增（0.5.8 - 0.5.12）
 
 - **降本与恢复 / task.claim_next / agent.bootstrap / delivery.single_call**：claim-next 原子领下一个任务；bootstrap 一次拿启动上下文；SDK deliver 一条龙上传+交付，稳定 submission_id 让超时重试不重复。
+- **补丁失效感知 / submission.applicability / submission.revision**：collected 不是终点；GET submissions/{id}/applies 给出当前 main 能否应用、失败文件和目标行（failures 同时带 patch_line/target_line）。main 前进导致冲突时提交人会收到 submission.apply_conflict，用 revision_of 交 rebase 版，不需要管理员 reopen 任务。
 
 - **事件可见性 / role.observer**：observer 是只读身份，可读全项目 events/tasks/submissions，但不能 claim/report/写 artifact；普通 agent 的事件可见性不变。
 - **断线补拉 / events.replay**：GET /events 返回 next_event_cursor，按事件页推进；WS 断线后用该游标 drain，客户端按 seq 去重，不要复用消息页游标。
@@ -321,7 +363,9 @@ export const AGENT_SKILL_BODY = `
 - 任务台账以服务端为准：claim 后做任务，交付带 task_id，完成再 task-release --state done。
 - 一条龙交付用 SDK deliver（Python: deliver(files=[...])；TS: deliver([...])；Rust: synapse-agent deliver --file ...）：上传 + 建交付一次完成；submission_id 由内容生成，超时重试会命中同一条，不会重复交付。
 - 代码交付先按格式门准备：unified diff + 回执八项；缺字段先 GET /p/{project}/receipt-template 拿模板，不要自己猜字段名。
-- 交付成功/去重响应带 next（bundle/withdraw/task），按 next 继续，不要重新拼路径。
+- 交付成功/去重响应带 next（bundle/applies/revision/withdraw/task），按 next 继续，不要重新拼路径。
+- collected 补丁在 main 前进后可能失效：先 GET submissions/{id}/applies；返回 conflict 时按 failed_files/failed_lines 修，修好后 POST submissions 带 revision_of=<旧 submission_id> 交新版本（任务 done 也允许）。不要改旧 submission，也不要把旧 ID 复用成假成功。
+- 有本地仓库的节点可用 'git apply --check <patch>' 得到权威结果，再 POST submissions/{id}/apply-check 回传 target_sha/applies/failed_files/failed_lines；中心会用同一组字段发事件。
 - 事件流游标只在成功读取后前移；重连不要从头清空，避免重复消费。
 - 4xx/5xx 先读 error、code、hint：hint 是服务端给的下一步。若响应带 use.path/use.method/use.body，按它调用，不要猜 endpoint，也不要用 /x/admin 绕过 scope。
 - 失败恢复：task_not_claimed 先 claim 再提交；task_context_mismatch 先 claim-next 或对照 active_task_ids；delivery_format_incomplete 按 required 补文件/回执后重提，原样重试不会过；withdraw 重试是幂等的，不要换 ID 反复撤。
@@ -357,7 +401,7 @@ to: "admin" 让消息定向进管理台；不带 to 的项目广播也只会进�
 
 ## 能力 ID 索引
 
-server.version, delivery.format_gate, task.claim_next, agent.bootstrap, delivery.single_call, admin.error_stats, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery, role.observer, admin.fleet, task.singleflight, admin.analytics, client.launch, client.remote_control, client.diagnostics.
+server.version, delivery.format_gate, task.claim_next, agent.bootstrap, delivery.single_call, admin.error_stats, submission.applicability, submission.apply_check_report, submission.revision, admin.apply_recheck, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery, role.observer, admin.fleet, task.singleflight, admin.analytics, client.launch, client.remote_control, client.diagnostics.
 `;
 
 // 防止“能力表加了一条、/skill 正文没写”的静默漂移：模块加载时直接失败。

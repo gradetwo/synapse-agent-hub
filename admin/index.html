@@ -1973,6 +1973,7 @@ async function showTaskTimeline(taskId) {
       "task.reassigned": "转派", "task.merged": "已合入", "task.requeued": "退回公共池",
       "submission.created": "交付到达", "submission.reviewed": "交付裁决",
       "submission.collected": "交付取走", "submission.archived": "交付归档",
+      "submission.apply_conflict": "补丁失效",
       "issue.created": "Issue 创建", "issue.closed": "Issue 关闭",
       "issue.reopened": "Issue 重开", "issue.merged": "Issue 合并",
       "issue.dispatched": "Issue 派发", "issue.updated": "Issue 更新",
@@ -2601,7 +2602,8 @@ async function loadSubs() {
   const shown = Math.min(40, d.length);
   const more = total > shown ? ` · 列表仅显示最近 ${shown} 条` : "";
   const approx = !counts ? " · 计数按当前列表" : "";
-  $("subStat").textContent = `${pending} 待取 · ${pendingReview} 待裁决 / 共 ${total}${more}${approx}`;
+  const applyConflict = d.filter((s) => s.apply_state === "conflict").length;
+  $("subStat").textContent = `${pending} 待取 · ${pendingReview} 待裁决${applyConflict ? ` · ${applyConflict} 失效` : ""} / 共 ${total}${more}${approx}`;
   BADGES.deli = pending;
   updateBadges();
   renderDeliveryAlert(pendingRows, pending);
@@ -2617,7 +2619,8 @@ async function loadSubs() {
     const taskCell = s.task_id
       ? `<span class="mono">${s.task_id}</span>${s.task_assignee ? `<div class="muted" style="font-size:10px">指派 ${s.task_assignee}</div>` : ""}`
       : `<span class="warnv">未绑定</span>`;
-    const source = `${s.agent_id}${Number(s.overtake) ? ` <span class="badge overtake" title="${esc(s.overtake_reason || "越单交付")}">越单</span>` : ""}`;
+    const source = `${s.agent_id}${Number(s.overtake) ? ` <span class="badge overtake" title="${esc(s.overtake_reason || "越单交付")}">越单</span>` : ""}` +
+      (s.apply_state === "conflict" ? ` <span class="badge rejected" title="${esc((s.apply?.failed_lines || []).join(", ") || s.apply?.summary || "当前 main 打不上")}">失效</span>` : "");
     const actions = [
       s.state === "delivered"
         ? `<button class="ghost" data-collect="${s.submission_id}">下载并取走</button>`

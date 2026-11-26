@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS submissions (
   task_assignee TEXT,
   overtake      INTEGER NOT NULL DEFAULT 0,
   overtake_reason TEXT,
+  -- 当前基线适用性：unknown|ok|conflict|error；main 前进后由 apply-check 更新
+  apply_state   TEXT NOT NULL DEFAULT 'unknown',
+  apply_target_sha TEXT,
+  apply_checked_at INTEGER,
+  apply_checked_by TEXT,
+  apply_engine  TEXT,
+  apply_result_json TEXT,
+  -- 失效补丁修正链：新交付指向旧交付；旧交付标记被谁取代
+  supersedes_id TEXT,
+  superseded_by TEXT,
   state         TEXT NOT NULL DEFAULT 'delivered',
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,

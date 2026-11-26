@@ -22,6 +22,8 @@ export interface Env {
   MAX_SUBMISSION_MB: string;
   /** S2：校验 base/merged 提交是否真实存在；留空则跳过远端存在性检查。 */
   GITHUB_REPO?: string;
+  /** S2：仓库默认分支，缺省 main；用于 main 前进检测。 */
+  GITHUB_BRANCH?: string;
   GITHUB_TOKEN?: string;
 }
 
