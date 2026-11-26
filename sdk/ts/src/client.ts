@@ -20,6 +20,31 @@ export interface ClientOptions {
 
 const VERSION = "0.5.11";
 
+/** 服务端 4xx/5xx：保留 code/hint/use，调用方可以直接打印下一步。 */
+export class SynapseAPIError extends Error {
+  status: number;
+  code: string;
+  hint?: string;
+  use?: any;
+  body: any;
+  constructor(status: number, body: any) {
+    const payload = body && typeof body === "object" ? body : { error: String(body ?? "").slice(0, 300) };
+    const code = String(payload.error ?? payload.code ?? status);
+    const hint = payload.hint ? `｜${payload.hint}` : "";
+    const use = payload.use ? `｜next=${JSON.stringify(payload.use)}` : "";
+    super(`HTTP ${status} ${code}${hint}${use}`);
+    this.status = status; this.code = code; this.hint = payload.hint;
+    this.use = payload.use; this.body = payload;
+  }
+}
+
+async function throwApiError(res: Response): Promise<never> {
+  const text = await res.text();
+  let body: any;
+  try { body = JSON.parse(text); } catch { body = { error: `http_${res.status}`, text: text.slice(0, 300) }; }
+  throw new SynapseAPIError(res.status, body);
+}
+
 const LAUNCH_SECRET_FLAGS = new Set(["--token", "--admin-token", "--api-key", "--secret", "--password", "--proxy"]);
 
 /** 启动参数进管理台前先脱敏；代理/token 只留参数名。 */
@@ -477,19 +502,53 @@ export class Client {
     const res = await fetchT(`${this.opts.endpoint}/p/${this.opts.project}/artifact/${sha}`, {
       method: "PUT", body: data, headers: this.headers(), timeoutMs: 300_000,
     });
-    if (!res.ok) throw new Error(`upload ${res.status}: ${await res.text()}`);
-    return { sha256: sha, name: basename(path), bytes: data.length };
+    if (!res.ok) await throwApiError(res);
+    return { sha256: sha, name: basename(path), bytes: data.length,
+             ref: { sha256: sha, name: basename(path) } };
   }
 
-  async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {}, taskId?: string) {
+  private submissionId(kind: string, title: string, refs: any[], base: string, taskId?: string) {
+    const seed = JSON.stringify({
+      agent: this.opts.agentId, task: taskId ?? "", kind, title, base,
+      refs: refs.map((r) => String(r?.sha256 ?? "")).sort(),
+    });
+    const clean = this.opts.agentId.replace(/[^a-zA-Z0-9._:-]/g, "-").slice(0, 40);
+    return `sub-${clean}-${createHash("sha256").update(seed).digest("hex").slice(0, 16)}`;
+  }
+
+  async submit(kind: string, title: string, refs: any[], baseSha?: string, checks: object = {},
+               taskId?: string, submissionId?: string, notes = "") {
     const base = baseSha || this.collectEnv().git_head || "";
     if (!base) throw new Error("base_sha required: pass baseSha or run inside a git repo");
     const boundTaskId = taskId || this.activeTaskId();
+    const sid = submissionId || this.submissionId(kind, title, refs, base, boundTaskId);
     return this.post(`/p/${this.opts.project}/submissions`, {
-      submission_id: `sub-${this.opts.agentId}-${crypto.randomUUID().slice(0, 8)}`,
-      agent_id: this.opts.agentId, kind, title, refs, base_sha: base, checks,
+      submission_id: sid, agent_id: this.opts.agentId, kind, title, refs, base_sha: base, checks, notes,
       ...(boundTaskId ? { task_id: boundTaskId } : {}),
     });
+  }
+
+  /** 一条龙交付：上传多个文件 + 建交付；submission_id 由内容生成，超时重试不会重复交付。 */
+  async deliver(files: string[], opts: {
+    kind?: string; title?: string; baseSha?: string; checks?: object;
+    taskId?: string; notes?: string; submissionId?: string;
+  } = {}) {
+    if (!files.length) throw new Error("deliver 需要至少一个文件");
+    const uploaded: any[] = [];
+    const refs: any[] = [];
+    for (const f of files) {
+      const up = await this.upload(f);
+      uploaded.push(up);
+      refs.push(up.ref);
+    }
+    try {
+      const sub: any = await this.submit(opts.kind ?? "patch", opts.title ?? "", refs,
+        opts.baseSha, opts.checks ?? {}, opts.taskId, opts.submissionId, opts.notes ?? "");
+      return { ...sub, files: uploaded };
+    } catch (e: any) {
+      if (e instanceof SynapseAPIError) e.body = { ...e.body, uploaded };
+      throw e;
+    }
   }
 
   // ── active task：CLI/SDK 共享同一份“当前任务”上下文 ─────────
@@ -517,6 +576,15 @@ export class Client {
   claimTask(taskId: string) {
     return this.post(`/p/${this.opts.project}/tasks/claim`, { task_id: taskId });
   }
+  async claimNext() {
+    const r: any = await this.post(`/p/${this.opts.project}/tasks/claim-next`, {});
+    if (r?.ok && r?.task_id) this.activeTaskSet(String(r.task_id), Number(r.seq ?? 0),
+                                                String(r.task?.title ?? ""));
+    return r;
+  }
+  bootstrap() {
+    return this.get(`/p/${this.opts.project}/bootstrap`);
+  }
   releaseTask(taskId: string, state: "done" | "open" | "blocked" = "done") {
     return this.post(`/p/${this.opts.project}/tasks/release`, { task_id: taskId, state });
   }
@@ -537,10 +605,7 @@ export class Client {
       method: "POST", headers: { ...this.headers(), "content-type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (res.status === 401) throw new Error("token revoked or unknown");
-    if (res.status === 403) throw new Error("scope/project mismatch");
-    if (res.status === 426) throw new Error("sdk too old");
-    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    if (!res.ok) await throwApiError(res);
     return res.json();
   }
   private async get(path: string) {
@@ -549,12 +614,12 @@ export class Client {
     for (let i = 0; i < 3; i++) {
       try {
         const res = await fetchT(this.opts.endpoint + path, { headers: this.headers() });
-        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        if (!res.ok) await throwApiError(res);
         return await res.json();
       } catch (e: any) {
         last = e;
         // S6：fetch/JSON 读取中途断开（chunked 中断）也走这里的重试；4xx 不重试。
-        if (/^4\d\d:/.test(String(e?.message))) throw e;
+        if (/^(HTTP )?4\d\d:?/.test(String(e?.message))) throw e;
         if (i < 2) await new Promise((r) => setTimeout(r, 300 * (i + 1)));
       }
     }

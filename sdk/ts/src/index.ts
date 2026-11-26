@@ -1,4 +1,4 @@
-export { Client } from "./client.js";
+export { Client, SynapseAPIError } from "./client.js";
 export { Loop } from "./loop.js";
 export { Admin } from "./admin.js";
 export { detectProfile } from "./profile.js";

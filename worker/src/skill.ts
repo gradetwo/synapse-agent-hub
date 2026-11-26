@@ -43,6 +43,45 @@ export const AGENT_CAPABILITIES: AgentCapability[] = [
     path: "/p/{project}/submissions",
   },
   {
+    id: "task.claim_next",
+    since: "0.5.12",
+    status: "ga",
+    audience: "agent",
+    title: "原子领取下一个任务",
+    summary: "POST /p/{project}/tasks/claim-next：定向任务优先、再公共池；一次调用完成选择+claim，返回 task 与 next。",
+    method: "POST",
+    path: "/p/{project}/tasks/claim-next",
+  },
+  {
+    id: "agent.bootstrap",
+    since: "0.5.12",
+    status: "ga",
+    audience: "agent",
+    title: "启动引导",
+    summary: "GET /p/{project}/bootstrap：一次返回身份、scopes、配额、名下 active/directed 任务和下一步，减少启动探测。",
+    method: "GET",
+    path: "/p/{project}/bootstrap",
+  },
+  {
+    id: "delivery.single_call",
+    since: "0.5.12",
+    status: "ga",
+    audience: "agent",
+    title: "一条龙交付",
+    summary: "Python/TS/Rust SDK 的 deliver(files=...) 一次完成上传+建交付；submission_id 由内容生成，超时重试不会重复交付。",
+    scope: "sdk",
+  },
+  {
+    id: "admin.error_stats",
+    since: "0.5.12",
+    status: "ga",
+    audience: "admin",
+    title: "错误码统计",
+    summary: "GET /x/admin/p/{project}/error-stats：最近 7 天 DO 侧 4xx/5xx 错误码计数与最近一次错误，用于定位 agent 最常卡住的步骤。",
+    method: "GET",
+    path: "/x/admin/p/{project}/error-stats",
+  },
+  {
     id: "task.merge",
     since: "0.5.7",
     status: "ga",
@@ -254,7 +293,9 @@ export const AGENT_SKILL_BODY = `
 3. 把新增/变更的能力 ID 写进 $STATE_DIR/WHATS-NEW.md；只看本文档和 capabilities 清单，不要从 GitHub 或 --help 推断服务端能力。
 4. 若 capabilities 里没有你要用的能力 ID，说明服务端还没升级到该版本；不要盲试。status=beta/partial 的能力先验证再依赖。
 
-## 最近新增（0.5.8 - 0.5.10）
+## 最近新增（0.5.8 - 0.5.12）
+
+- **降本与恢复 / task.claim_next / agent.bootstrap / delivery.single_call**：claim-next 原子领下一个任务；bootstrap 一次拿启动上下文；SDK deliver 一条龙上传+交付，稳定 submission_id 让超时重试不重复。
 
 - **事件可见性 / role.observer**：observer 是只读身份，可读全项目 events/tasks/submissions，但不能 claim/report/写 artifact；普通 agent 的事件可见性不变。
 - **断线补拉 / events.replay**：GET /events 返回 next_event_cursor，按事件页推进；WS 断线后用该游标 drain，客户端按 seq 去重，不要复用消息页游标。
@@ -275,10 +316,15 @@ export const AGENT_SKILL_BODY = `
 
 ## Agent 侧必须知道
 
-- 任务仍以台账为准：先 task-claim，交付带 --task，完成再 task-release --state done。
-- 代码交付先按格式门准备：unified diff + 回执八项；不确定时用 GET /capabilities 的 delivery.format_gate 确认服务端支持。
+- 启动先 GET /p/{project}/bootstrap：一次拿身份、scopes、配额、名下 active/directed 任务和 next；不要先连打 whoami + tasks + inbox。
+- 领任务优先 POST /p/{project}/tasks/claim-next：定向任务优先、再公共池，一次完成选择+claim；成功响应自带 task 和 next。只有需要指定 task_id 时才用 tasks/claim。
+- 任务台账以服务端为准：claim 后做任务，交付带 task_id，完成再 task-release --state done。
+- 一条龙交付用 SDK deliver（Python: deliver(files=[...])；TS: deliver([...])；Rust: synapse-agent deliver --file ...）：上传 + 建交付一次完成；submission_id 由内容生成，超时重试会命中同一条，不会重复交付。
+- 代码交付先按格式门准备：unified diff + 回执八项；缺字段先 GET /p/{project}/receipt-template 拿模板，不要自己猜字段名。
+- 交付成功/去重响应带 next（bundle/withdraw/task），按 next 继续，不要重新拼路径。
 - 事件流游标只在成功读取后前移；重连不要从头清空，避免重复消费。
 - 4xx/5xx 先读 error、code、hint：hint 是服务端给的下一步。若响应带 use.path/use.method/use.body，按它调用，不要猜 endpoint，也不要用 /x/admin 绕过 scope。
+- 失败恢复：task_not_claimed 先 claim 再提交；task_context_mismatch 先 claim-next 或对照 active_task_ids；delivery_format_incomplete 按 required 补文件/回执后重提，原样重试不会过；withdraw 重试是幂等的，不要换 ID 反复撤。
 - Token 只放 Authorization: Bearer，不要拼进 URL、日志、skill 缓存或汇报正文。
 
 ### 给管理员发消息
@@ -311,7 +357,7 @@ to: "admin" 让消息定向进管理台；不带 to 的项目广播也只会进�
 
 ## 能力 ID 索引
 
-server.version, delivery.format_gate, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery, role.observer, admin.fleet, task.singleflight, admin.analytics, client.launch, client.remote_control, client.diagnostics.
+server.version, delivery.format_gate, task.claim_next, agent.bootstrap, delivery.single_call, admin.error_stats, task.merge, ci.status, issue.auto_close, queue.alerts, task.requeue, events.resilience, task.timeline, events.visibility, events.replay, events.ws, skill.discovery, role.observer, admin.fleet, task.singleflight, admin.analytics, client.launch, client.remote_control, client.diagnostics.
 `;
 
 // 防止“能力表加了一条、/skill 正文没写”的静默漂移：模块加载时直接失败。

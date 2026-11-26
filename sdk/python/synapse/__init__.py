@@ -8,6 +8,6 @@
 """
 from .loop import Loop
 from .admin import Admin, AdminError
-from .client import Client, Work, TaskLease, __version__
+from .client import Client, Work, TaskLease, SynapseAPIError, __version__
 
-__all__ = ["Client", "Work", "TaskLease", "Loop", "__version__"]
+__all__ = ["Client", "Work", "TaskLease", "SynapseAPIError", "Loop", "__version__"]

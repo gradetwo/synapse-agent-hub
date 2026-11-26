@@ -555,6 +555,7 @@ export class ProjectRoom implements DurableObject {
       case "ack":          return this.ack(body);
       case "report":       return this.report(body);
       case "tasks/claim":  return this.claim(body);
+      case "tasks/claim-next": return this.claimNext(body);
       case "tasks/release":return this.release(body);
       case "tasks/fail":   return this.failTask(body);
       case "tasks/admin-retry": return this.adminRetry(body);
@@ -1403,7 +1404,12 @@ export class ProjectRoom implements DurableObject {
         if (load.active_tasks >= ACTIVE_TASK_LIMIT)
           return json({ error: "agent_task_limit_exceeded", active_tasks: load.active_tasks,
                         limit: ACTIVE_TASK_LIMIT, task_ids: load.task_ids,
-                        message: `你当前名下已 claim 未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再认领 Issue。` }, 409);
+                        hint: "先完成或释放部分任务，再认领新任务；定向任务不受这个上限限制。",
+                        use: {
+                          mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+                          release: { method: "POST", path: `/p/${project}/tasks/release`, required_scope: "tasks.release",
+                                     body_template: { task_id: "<task_id>", state: "open", note: "<reason>" } },
+                        } }, 409);
       }
     }
     const projectName = String(b.project ?? this.projectName());
@@ -1494,24 +1500,34 @@ export class ProjectRoom implements DurableObject {
   // ── 任务租约：CPU 单线程，CAS 免费 ─────────────────────────
   private async claim(b: any) {
     const t: any = await this.st.get(`task:${b.task_id}`);
-    if (!t) return json({ error: "not_found" }, 404);
+    const project = String(b.project ?? this.projectName());
+    if (!t) return json({ error: "not_found", task_id: b.task_id,
+      hint: "任务不存在或已被清理；先列自己的任务，不要用缓存里的旧 task_id。",
+      use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 404);
     const now = Date.now();
     if (t.state === "failed" || t.dead_letter === true)
       return json({ error: "task_dead_letter", state: t.state, attempts: Number(t.attempts ?? 0),
                     max_attempts: Number(t.max_attempts ?? DEFAULT_MAX_ATTEMPTS),
-                    message: "任务已进入死信，需管理端重试后再下发。" }, 409);
+                    hint: "任务已进死信，节点不能自己 claim；让管理员在管理台重试/重派，或去领别的任务。",
+                    use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 409);
     if (Number(t.next_retry_at ?? 0) > now)
       return json({ error: "task_retry_scheduled", task_id: t.task_id ?? t.id,
                     retry_in_ms: Number(t.next_retry_at) - now,
                     attempts: Number(t.attempts ?? 0),
-                    message: "任务失败后正在退避等待，时间到会自动重新下发。" }, 409);
-    if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task" }, 403);
+                    hint: "失败退避中；到 retry_in_ms 后再 claim，不要立即重试刷接口。",
+                    use: { claim: { method: "POST", path: `/p/${project}/tasks/claim`, body: { task_id: String(t.task_id ?? t.id) } } } }, 409);
+    if (t.to && !this.isToMe(t.to, b.agent_id)) return json({ error: "not_your_task", task_id: t.task_id ?? t.id,
+      hint: "这是别的节点的定向任务，claim 会被拒；用 tasks?mine=1 只看自己的任务。",
+      use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 403);
     if (t.to && this.dispatchStateOf(t) === "queued")
       return json({ error: "task_not_dispatched", task_id: t.task_id ?? t.id,
                     queue_position: await this.queuePosition(String(t.to), String(t.task_id ?? t.id ?? "")),
-                    message: "该任务还在该节点的派单队列里，等前序任务释放后会自动下发；不要提前 claim。" }, 409);
+                    hint: "定向任务还在该节点的派单队列，等前序任务释放后会自动下发；现在 claim 会被拒。",
+                    use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 409);
     if (t.state === "claimed" && t.owner === b.agent_id && Number(t.lease_until ?? 0) > now)
-      return json({ ok: true, lease_until: t.lease_until, already: true });
+      return json({ ok: true, task_id: String(t.task_id ?? t.id ?? b.task_id), lease_until: t.lease_until,
+                    already: true, task: t, next: this.taskNext(String(b.project ?? t.project ?? this.projectName()),
+                                                                 String(t.task_id ?? t.id ?? b.task_id)) });
     // 自领公共任务前检查名下已 claim 未完成任务；定向任务不受此限（管理员派单只提醒不拦截）。
     // 过期后重领自己原来的任务时，把该任务本身从计数里排除。
     if (!t.to && (t.state === "open" || (t.state === "claimed" && Number(t.lease_until ?? 0) < now))) {
@@ -1519,15 +1535,25 @@ export class ProjectRoom implements DurableObject {
       if (load.active_tasks >= ACTIVE_TASK_LIMIT)
         return json({ error: "agent_task_limit_exceeded", active_tasks: load.active_tasks,
                       limit: ACTIVE_TASK_LIMIT, task_ids: load.task_ids,
-                      message: `你当前名下已 claim 未完成任务 ${load.active_tasks} 个，已达上限 ${ACTIVE_TASK_LIMIT}；请先完成或释放部分任务，再领取公共任务。` }, 409);
+                      retryable: false,
+                      hint: "先完成或释放部分任务，再领取公共任务；不要换 task_id 反复试。",
+                      use: {
+                        mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+                        release: { method: "POST", path: `/p/${project}/tasks/release`, required_scope: "tasks.release",
+                                   body_template: { task_id: "<task_id>", state: "open", note: "<reason>" } },
+                      } }, 409);
     }
     // 非 open 状态按真实原因报错，不能一律说 locked：done/blocked/released 的
     // owner 与 lease_until 都是空值，旧实现会拼出“被锁定但 owner=null、租约 0”的
     // 假象，让节点以为任务被不存在的人占着（ISS-MWSSGUQ1-88BD71）。
     if (t.state === "done")
-      return json({ error: "already_done", state: t.state }, 409);
+      return json({ error: "already_done", state: t.state,
+        hint: "任务已完成，不能再次 claim；直接领下一个。",
+        use: { claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" } } }, 409);
     if (t.state === "blocked")
-      return json({ error: "blocked", state: t.state }, 409);
+      return json({ error: "blocked", state: t.state,
+        hint: "任务被依赖/管理侧阻塞；等解除后由系统重新下发，或让管理员 reopen。",
+        use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 409);
     if (t.state === "released") {
       // 误绑/错单自救：交付人 release 后仍可重新 claim 自己刚放下的任务，修正交付；
       // 仍待管理侧取件时不能把任务直接判 done，但也不该把 agent 永久锁在门外。
@@ -1536,24 +1562,100 @@ export class ProjectRoom implements DurableObject {
       if (!(t.released_by === b.agent_id && pendingNow > 0))
         return json({ error: "released_pending_collection", state: t.state,
                       pending_submissions: Number(t.pending_submissions ?? pendingNow),
-                      released_by: t.released_by ?? null }, 409);
+                      released_by: t.released_by ?? null,
+                      hint: "该任务已释放但还有待管理侧取走的交付；先等取件，或让管理员归档旧交付后再 claim。",
+                      use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+                             submissions: { method: "GET", path: `/p/${project}/submissions?mine=1` } } }, 409);
     }
     if (t.state !== "open" && t.state !== "released"
         && !(t.state === "claimed" && Number(t.lease_until ?? 0) < now))
-      return json({ error: "locked", state: t.state, owner: t.owner, lease_until: t.lease_until }, 409);
+      return json({ error: "locked", state: t.state, owner: t.owner, lease_until: t.lease_until,
+        hint: "任务在别人名下且租约未过期；等 lease_until 到期后再 claim，或换下一个任务。",
+        use: { claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+               mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 409);
     const lease = now + this.taskLeaseMs();
-    const next = { ...t, state: "claimed", owner: b.agent_id, released_by: null,
+    const claimedTask = { ...t, state: "claimed", owner: b.agent_id, released_by: null,
                    ...(t.to ? { dispatch_state: "active" } : {}),
                    ...(t.state === "claimed" ? {} : { claimed_at: now }),
                    lease_until: lease, updated_at: now };
-    await this.st.put(`task:${b.task_id}`, next);
+    await this.st.put(`task:${b.task_id}`, claimedTask);
     await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "claimed",
                         payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                    lease_until: lease, attempts: Number(t.attempts ?? 0),
                                    priority: clampPriority(t.priority),
                                    deadline_at: t.deadline_at ?? null },
                         dedupe_key: `claim:${b.task_id}:${b.agent_id}:${now}` });
-    return json({ ok: true, lease_until: lease });
+    return json({ ok: true, task_id: b.task_id, lease_until: lease, task: claimedTask,
+                  next: this.taskNext(String(b.project ?? t.project ?? this.projectName()),
+                                       String(b.task_id)) });
+  }
+
+  /** claim/claim-next 的响应自带下一步，agent 不需要再背 endpoint。 */
+  private taskNext(project: string, taskId: string) {
+    return {
+      task: { method: "GET", path: `/p/${project}/tasks/${encodeURIComponent(taskId)}` },
+      submit: { method: "POST", path: `/p/${project}/submissions`, required_scope: "submissions.create",
+                body_template: { task_id: taskId, base_sha: "<7-64 hex>", kind: "patch",
+                                 title: "<title>", refs: [], checks: { tests: { passed: 0, failed: 0 } } } },
+      release_done: { method: "POST", path: `/p/${project}/tasks/release`, required_scope: "tasks.release",
+                      body: { task_id: taskId, state: "done" } },
+      release_open: { method: "POST", path: `/p/${project}/tasks/release`, required_scope: "tasks.release",
+                      body: { task_id: taskId, state: "open" } },
+      claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+    };
+  }
+
+  /** 一次调用领取一个可执行任务：优先定向给本节点的，再取公共池；DO 单线程保证选择+claim 原子。 */
+  private async claimNext(b: any) {
+    const agentId = String(b?.agent_id ?? "").trim();
+    if (!agentId) return json({ error: "agent_id_required",
+      hint: "claim-next 必须带真实 agent_id；由 Worker 注入，节点不要自己伪造。" }, 422);
+    const project = String(b?.project ?? this.projectName());
+    const now = Date.now();
+    const tasks = await this.listRawTasks();
+    const taskIdOf = (t: any) => String(t?.task_id ?? t?.id ?? "");
+    const candidate = tasks.filter((t: any) => {
+      if (!t || !taskIdOf(t) || t.dead_letter === true) return false;
+      if (!this.retryReady(t, now)) return false;
+      const state = String(t.state ?? "");
+      if (t.to === agentId) {
+        if (state === "claimed" && t.owner === agentId) return true;
+        if (state !== "open") return false;
+        // queued 定向任务还没轮到本节点，不能提前 claim；notified/active 可以。
+        return this.dispatchStateOf(t) !== "queued";
+      }
+      if (t.to) return false;                       // 别的节点的定向任务
+      if (state === "open") return true;            // 公共池
+      return state === "claimed" && Number(t.lease_until ?? 0) < now;
+    });
+    const directed = candidate.filter((t: any) => t.to === agentId)
+      .sort((a: any, b: any) => this.compareQueue(a, b, now));
+    const publicPool = candidate.filter((t: any) => !t.to)
+      .sort((a: any, b: any) => this.compareQueue(a, b, now));
+    let last: any = null;
+    for (const t of [...directed, ...publicPool]) {
+      const id = taskIdOf(t);
+      const r = await this.claim({ ...b, project, agent_id: agentId, task_id: id });
+      const d: any = await r.json().catch(() => ({ error: "claim_bad_payload" }));
+      if (r.ok) return json(d, r.status);
+      last = { status: r.status, body: d };
+      // 配额已满时后面的公共任务也不会成功；定向任务已经先试过，直接返回。
+      if (d?.error === "agent_task_limit_exceeded") return json(d, r.status);
+      // 已被别人拿走/状态变化：继续试下一个；权限/死信等错误直接返回。
+      if (!["not_your_task", "task_not_dispatched", "locked", "not_found", "already_done", "blocked",
+            "released_pending_collection"].includes(String(d?.error ?? "")))
+        return json(d, r.status);
+    }
+    return json({
+      error: "no_task_available",
+      hint: "当前没有你已收到或可领取的任务。先 GET /p/{project}/tasks?mine=1 检查；公共池用 GET /p/{project}/tasks；若任务还在 queued，等它下发。",
+      use: {
+        mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+        public_pool: { method: "GET", path: `/p/${project}/tasks` },
+        inbox: { method: "GET", path: `/p/${project}/inbox?since=0` },
+      },
+      ...(last ? { last_error: last.body, last_status: last.status } : {}),
+    }, 404);
   }
 
   /** 该任务还有多少件交付没被管理侧取走（state = delivered）。真源在 D1 submissions。 */

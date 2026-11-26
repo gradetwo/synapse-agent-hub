@@ -2054,6 +2054,20 @@ fn main() {
             }
             return;
         }
+        "claim-next" | "task-claim-next" => {
+            match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/claim-next", cfg.project), json!({})) {
+                Ok(v) => {
+                    if let Some(id) = v["task_id"].as_str() {
+                        let seq = v["task"]["seq"].as_u64().or_else(|| v["seq"].as_u64()).unwrap_or(0);
+                        let title = v["task"]["title"].as_str().unwrap_or("");
+                        active_task_set_id(&cfg, id, seq, title);
+                    }
+                    println!("{}", serde_json::to_string(&v).unwrap_or_default());
+                }
+                Err(e) => { eprintln!("claim-next 失败：{e}"); std::process::exit(1); }
+            }
+            return;
+        }
         "task-claim" => {
             let id = args_map.get("task").or_else(|| args_map.get("task-id")).cloned().unwrap_or_default();
             if id.trim().is_empty() { eprintln!("task-claim 需要 --task <id>"); std::process::exit(2); }
@@ -2180,7 +2194,7 @@ fn main() {
                 "ok": true, "files": uploaded,
                 "sha256": first["sha256"].clone(), "bytes": first["bytes"].clone(),
                 "submission_id": sub["submission_id"], "task_id": sub["task_id"],
-                "state": sub["state"], "seq": sub["seq"]
+                "state": sub["state"], "seq": sub["seq"], "next": sub["next"]
             })).unwrap_or_default());
             return;
         }
@@ -2953,7 +2967,7 @@ fn artifact_upload(cfg: &Cfg, agent: &Agent, base: &str, path: &str) -> Result<V
     match resp {
         Ok(r) => {
             let (status, text, j) = resp_parts(r);
-            if status >= 400 { return Err(format!("upload HTTP {status}: {}", text.chars().take(200).collect::<String>())); }
+            if status >= 400 { return Err(format!("upload HTTP {status}: {}", text.chars().take(1200).collect::<String>())); }
             Ok(json!({
                 "sha256": sha, "name": name, "bytes": data.len(),
                 "ref": {"sha256": sha, "name": name},
@@ -2962,18 +2976,23 @@ fn artifact_upload(cfg: &Cfg, agent: &Agent, base: &str, path: &str) -> Result<V
         }
         Err(ureq::Error::Status(code, r)) => {
             let (_, text, _) = resp_parts(r);
-            Err(format!("upload HTTP {code}: {}", text.chars().take(200).collect::<String>()))
+            Err(format!("upload HTTP {code}: {}", text.chars().take(1200).collect::<String>()))
         }
         Err(e) => Err(format!("upload 失败: {e}")),
     }
 }
 
-/// 由 refs 列表生成 submission_id：sub-{agent}-{ms hex}，符合 ^[a-zA-Z0-9._:-]{1,128}$。
-fn new_submission_id(agent_id: &str) -> String {
+/// 由内容生成稳定 submission_id：超时重试命中同一条交付，不会生成重复提交。
+fn new_submission_id(agent_id: &str, kind: &str, title: &str, base: &str, refs: &[Value], task_id: Option<&str>) -> String {
     let clean: String = agent_id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == ':' { c } else { '-' })
         .collect();
-    format!("sub-{}-{:x}", clean, now_ms())
+    let seed = json!({
+        "agent": agent_id, "kind": kind, "title": title, "base": base, "task": task_id.unwrap_or(""),
+        "refs": refs.iter().map(|r| r["sha256"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>()
+    });
+    let hash = Sha256::digest(seed.to_string().as_bytes());
+    format!("sub-{}-{}", clean, hash.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string())
 }
 
 /// 交付第二步：建交付（POST /p/{project}/submissions）。
@@ -2993,7 +3012,10 @@ fn artifact_submit(
     }
     if refs.is_empty() { return Err("refs 为空：先 upload 拿到 ref，再用 --ref 传入".into()); }
     let mut body = json!({
-        "submission_id": sid.map(|s| s.to_string()).unwrap_or_else(|| new_submission_id(&cfg.agent_id)),
+        "submission_id": sid.map(|s| s.to_string()).unwrap_or_else(|| new_submission_id(
+            &cfg.agent_id,
+            if kind.is_empty() { "patch" } else { kind },
+            title, &sha, &refs, task_id)),
         "agent_id": cfg.agent_id,
         "kind": if kind.is_empty() { "patch" } else { kind },
         "title": title,
@@ -3013,12 +3035,12 @@ fn artifact_submit(
     {
         Ok(r) => {
             let (status, text, j) = resp_parts(r);
-            if status >= 400 { return Err(format!("submit HTTP {status}: {}", text.chars().take(200).collect::<String>())); }
+            if status >= 400 { return Err(format!("submit HTTP {status}: {}", text.chars().take(1200).collect::<String>())); }
             Ok(j.unwrap_or(body))
         }
         Err(ureq::Error::Status(code, r)) => {
             let (_, text, _) = resp_parts(r);
-            Err(format!("submit HTTP {code}: {}", text.chars().take(200).collect::<String>()))
+            Err(format!("submit HTTP {code}: {}", text.chars().take(1200).collect::<String>()))
         }
         Err(e) => Err(format!("submit 失败: {e}")),
     }

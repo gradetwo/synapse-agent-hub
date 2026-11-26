@@ -62,6 +62,28 @@ def cmd_issues(a):
     return 0
 
 
+def cmd_claim_next(a):
+    c = Client.from_config(auto=False)
+    print(json.dumps(c.claim_next(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_bootstrap(a):
+    c = Client.from_config(auto=False)
+    print(json.dumps(c.bootstrap(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_deliver(a):
+    c = Client.from_config(auto=False)
+    checks = json.loads(a.checks) if a.checks else {}
+    print(json.dumps(c.deliver(files=a.files, kind=a.kind, title=a.title,
+                               base_sha=a.base_sha, checks=checks, notes=a.notes or "",
+                               task_id=a.task, submission_id=a.sid),
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_daemon(a):
     """常驻：长连接优先，连不上自动回退轮询；消息落到 inbox/ 与 INBOX.md。"""
     c = Client.from_config(auto=False)
@@ -72,7 +94,7 @@ def cmd_daemon(a):
           f"transport={loop.mode} 每 {c.heartbeat_s}s 一拍", flush=True)
 
     def handler(m, _loop):
-        c.deliver([m])
+        c._deliver_messages([m])
         print(f"  ← 新指令 #{m.get('seq')} {m.get('topic')}", flush=True)
 
     try:
@@ -117,6 +139,21 @@ def main(argv=None):
     issues.add_argument("--status", choices=["", "open", "closed", "merged"], default="")
     issues.add_argument("--limit", type=int, default=100)
     issues.set_defaults(fn=cmd_issues)
+
+    cn = sub.add_parser("claim-next", help="原子领取下一个任务（定向优先，再公共池）")
+    cn.set_defaults(fn=cmd_claim_next)
+    bs = sub.add_parser("bootstrap", help="启动引导：身份/配额/名下任务/下一步")
+    bs.set_defaults(fn=cmd_bootstrap)
+    dl = sub.add_parser("deliver", help="一条龙：上传文件并建交付")
+    dl.add_argument("--file", dest="files", nargs="+", required=True)
+    dl.add_argument("--kind", default="patch")
+    dl.add_argument("--title", default="")
+    dl.add_argument("--base-sha", dest="base_sha", default=None)
+    dl.add_argument("--task", default=None)
+    dl.add_argument("--sid", default=None)
+    dl.add_argument("--checks", default="")
+    dl.add_argument("--notes", default="")
+    dl.set_defaults(fn=cmd_deliver)
 
     a = p.parse_args(argv)
     return a.fn(a)

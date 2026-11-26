@@ -22,6 +22,11 @@ const SDK_VERSION = "0.5.11";
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const res = await this.handleRequest(req, env, ctx);
+    try { ctx.waitUntil(recordApiError(env, req, res).catch(() => {})); } catch { /* 统计失败不能影响请求 */ }
+    return res;
+  },
+  async handleRequest(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -312,6 +317,9 @@ export default {
     if (action === "whoami" && req.method === "GET")
       return json({ agent_id: auth.agentId, project, role: auth.role, scopes: auth.scopes,
                     server_version: { sdk: SDK_VERSION, build: BUILD_TAG } });
+    // 启动引导：一次拿到身份、配额、名下任务和下一步，减少 agent 启动时的 3-5 次探测。
+    if (action === "bootstrap" && req.method === "GET")
+      return bootstrapPayload(env, project, auth);
     // 观察员是只读身份：可心跳、可 GET 事件/任务/Issue/交付，但不能 claim/report/写 artifact。
     if (auth.role === "observer" && req.method !== "GET" && !action.startsWith("heartbeat"))
       return err(403, "observer_read_only");
@@ -345,7 +353,7 @@ export default {
     const taskPoolRead = req.method === "GET" && action === "tasks";
     // 单条任务自查：GET /p/{project}/tasks/{task_id}。排除内部动作，避免把
     // tasks/active-load 等管理端点误当成任务详情而绕过 admin 鉴权。
-    const taskInternal = /^(claim|release|create|list|get|active-load|admin-close|admin-reclaim|admin-reassign|fail|submission-settled)$/;
+    const taskInternal = /^(claim|claim-next|release|create|list|get|active-load|admin-close|admin-reclaim|admin-reassign|fail|submission-settled)$/;
     const taskDetailRead = req.method === "GET" && /^tasks\/[A-Za-z0-9._:-]{1,64}$/.test(action) &&
       !taskInternal.test(action.slice(6));
     const issuePoolRead = req.method === "GET" && action === "issues";
@@ -393,6 +401,8 @@ export default {
     const subWithdraw = action.match(/^submissions\/([^/]+)\/withdraw$/);
     if (subWithdraw && req.method === "POST")
       return withdrawSubmission(env, project, subWithdraw[1], auth.agentId ?? "", auth.role === "admin");
+    if (action === "receipt-template" && req.method === "GET")
+      return receiptTemplate(project, url);
 
     // Issue 上报同样在 Worker 侧写 D1；权限对所有 agent 默认放行（见 inScope）。
     if (action === "issues" && req.method === "POST")
@@ -665,7 +675,8 @@ function need(action: string) {
   if (action.startsWith("ack")) return "ack";
   if (action.startsWith("report")) return "report";
   if (action.startsWith("inbox") || action === "events") return "poll";
-  if (action === "tasks/claim") return "tasks.claim";
+  if (action === "tasks/claim" || action === "tasks/claim-next") return "tasks.claim";
+  if (action === "receipt-template") return "submissions.create";
   if (action === "tasks/release" || action === "tasks/fail") return "tasks.release";
   if (action.startsWith("tasks/admin-")) return "admin";
   if (action === "tasks/list" || action === "tasks/get" || action === "tasks/active-load") return "admin";
@@ -696,6 +707,61 @@ const inScope = (s: string[], n: string) => {
     // 兼容：存量 token 只有 publish，给它们继续走 claim/release 的过渡期。
     ((n === "tasks.claim" || n === "tasks.release") && s.includes("publish"));
 };
+
+/** 全量 API 错误统计：Worker 边缘统一记录 4xx/5xx，覆盖鉴权/交付/DO 所有分支。 */
+async function recordApiError(env: Env, req: Request, res: Response) {
+  if (res.status < 400) return;
+  const path = new URL(req.url).pathname;
+  const m = path.match(/^\/(?:p|admin\/p|x\/admin\/p)\/([a-z0-9-]+)(?:\/|$)/);
+  const project = m?.[1];
+  if (!project) return;
+  let code = `http_${res.status}`;
+  try {
+    const d: any = JSON.parse(await res.clone().text());
+    code = String(d?.error ?? d?.code ?? code).split(":")[0].slice(0, 80);
+  } catch { /* 非 JSON 错误也计数 */ }
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `api_err:${project}:${day}:${code}`;
+  const now = Date.now();
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
+     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+                                   updated_at = excluded.updated_at`
+  ).bind(key, now).run();
+  await env.DB.prepare(
+    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).bind(`api_err:last:${project}`,
+         JSON.stringify({ at: now, code, path, status: res.status }), now).run();
+}
+
+/** 最近 7 天 API 错误码计数；管理台只看到 code/count 和最后一次错误。 */
+async function d1ErrorSummary(env: Env, project: string) {
+  const cutoff = new Date(Date.now() - 6 * 86_400_000).toISOString().slice(0, 10);
+  const prefix = `api_err:${project}:`;
+  const rows = await env.DB.prepare(
+    "SELECT key, value FROM settings WHERE key LIKE ?"
+  ).bind(prefix + "%").all<any>();
+  const counts: Record<string, number> = {};
+  let total = 0;
+  for (const r of rows.results ?? []) {
+    const key = String(r?.key ?? "");
+    const parts = key.slice(prefix.length).split(":");
+    if (parts.length < 2) continue;
+    const [day, ...rest] = parts;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < cutoff) continue;
+    const code = rest.join(":");
+    counts[code] = (counts[code] ?? 0) + Number(r?.value ?? 0);
+    total += Number(r?.value ?? 0);
+  }
+  let last: any = null;
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
+      .bind(`api_err:last:${project}`).first<any>();
+    last = row?.value ? JSON.parse(String(row.value)) : null;
+  } catch { /* 旧库没有 last 时忽略 */ }
+  return json({ ok: true, days: 7, total, counts, last, generated_at: Date.now() });
+}
 
 async function projectQuota(env: Env, project: string) {
   const r = await env.DB.prepare(
@@ -1465,6 +1531,9 @@ async function admin(req: Request, env: Env, url: URL) {
       return json({ ...d, server_version: { sdk: SDK_VERSION, build: BUILD_TAG,
                                             at: new Date().toISOString() } }, r.status);
     }
+    // 错误码统计：D1 边缘计数，覆盖鉴权/交付/DO 所有分支。
+    if (action === "error-stats" && req.method === "GET")
+      return d1ErrorSummary(env, project);
     // 单任务时间线：management-only，返回热窗口 + D1 归档 + 记录里程碑。
     if (action === "tasks/timeline" && req.method === "GET") {
       const taskId = String(url.searchParams.get("task_id") ?? "").trim();
@@ -1967,15 +2036,15 @@ async function admin(req: Request, env: Env, url: URL) {
       }
       const kind = String(b.kind ?? "patch");
       // 越单只能由管理侧显式发起；普通 agent 不能自报 allow_overtake 绕过绑定。
-      const allowOvertake = isAdmin && b.allow_overtake === true;
+      const allowOvertake = b.allow_overtake === true;
       const overtakeReason = String(b.overtake_reason ?? "").trim().slice(0, 240);
       if (allowOvertake && !overtakeReason) return err(422, "overtake_reason_required");
       const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, allowOvertake, false);
       if (bind.error) return bind.error;
       const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
-      if (missing.length) return deliveryFormatError(kind, missing);
+      if (missing.length) return deliveryFormatError(project, kind, missing);
       const contentMissing = await deliveryFormatContentMissing(env, project, kind, norm.refs, String(b.base_sha));
-      if (contentMissing.length) return deliveryFormatError(kind, contentMissing);
+      if (contentMissing.length) return deliveryFormatError(project, kind, contentMissing);
       const taskId = bind.taskId;
       const sid = String(b.submission_id).trim();
       const now = Date.now();
@@ -1990,11 +2059,21 @@ async function admin(req: Request, env: Env, url: URL) {
              JSON.stringify(norm.refs), JSON.stringify(b.checks ?? {}), now, now).run();
       if (res.meta.changes === 0) {
         const old = await env.DB.prepare(
-          "SELECT agent_id FROM submissions WHERE project = ? AND submission_id = ?"
+          "SELECT agent_id,task_id,state,review_state FROM submissions WHERE project = ? AND submission_id = ?"
         ).bind(project, sid).first<any>();
-        if (old?.agent_id !== agentId) return err(409, "submission_id_conflict");
-        return json({ submission_id: sid, state: "delivered", deduped: true, seq: null,
-                      task_id: taskId, task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound });
+        if (old?.agent_id !== agentId) return err(409, "submission_id_conflict", {
+          hint: "submission_id 已被其它 agent 占用；换一个 ID，或使用内容哈希生成稳定 ID。",
+          use: { method: "POST", path: `/x/admin/p/${project}/submissions`, body_template: { submission_id: "sub-<new-id>" } },
+        });
+        if (String(old?.state) === "archived" || String(old?.review_state) === "withdrawn") return err(409, "submission_archived", {
+          submission_id: sid, state: old?.state, review_state: old?.review_state,
+          hint: "这个 submission_id 已撤回归档，重试不能复活它；换新 ID 重新交付，或先 GET submissions 查看状态。",
+          use: { method: "POST", path: `/x/admin/p/${project}/submissions`, body_template: { submission_id: "sub-<new-id>" } },
+        });
+        return json({ submission_id: sid, state: old?.state ?? "delivered", review_state: old?.review_state ?? "pending",
+                      deduped: true, seq: null, task_id: old?.task_id ?? taskId,
+                      task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                      next: submissionNext(project, sid, old?.task_id ?? taskId, old?.state ?? "delivered") });
       }
       const seq = await stub.fetch(new Request("https://do/publish", {
         method: "POST", headers: { "content-type": "application/json" },
@@ -2007,9 +2086,10 @@ async function admin(req: Request, env: Env, url: URL) {
                                           overtake: bind.overtake, overtake_reason: bind.overtake ? overtakeReason : null },
                                dedupe_key: `sub:${sid}` }),
       }));
-      return Response.json({ submission_id: sid, state: "delivered", task_id: taskId,
+      return Response.json({ submission_id: sid, state: "delivered", review_state: "pending", task_id: taskId,
                              task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
-                             overtake: bind.overtake, seq: await seq.json() });
+                             overtake: bind.overtake, seq: await seq.json(),
+                             next: submissionNext(project, sid, taskId, "delivered") });
     }
 
     const bun = action.match(/^submissions\/([^/]+)\/bundle$/);
@@ -2410,6 +2490,68 @@ async function getTaskForAgent(env: Env, project: string, taskId: string, agentI
   return json(agentTaskView(task, agentId));
 }
 
+/** 启动引导：一次拿全身份、配额、名下任务和下一步；失败也返回可执行的降级路径。 */
+async function bootstrapPayload(env: Env, project: string, auth: any) {
+  const agentId = String(auth.agentId ?? "");
+  const tasks = await projectTasks(env, project);
+  const mine = tasks.filter((t: any) => taskBelongsToAgent(t, agentId));
+  const active = mine.filter((t: any) => t.state === "claimed" && t.owner === agentId);
+  const directed = mine.filter((t: any) => t.state === "open" && t.to === agentId);
+  const quota = await projectQuota(env, project).catch(() => null);
+  return json({
+    ok: true, agent_id: agentId, project, role: auth.role, scopes: auth.scopes ?? [],
+    server_version: { sdk: SDK_VERSION, build: BUILD_TAG }, generated_at: Date.now(),
+    project_status: auth.projectStatus ?? "active",
+    limits: {
+      active_task_limit: ACTIVE_TASK_LIMIT,
+      active_tasks: active.length,
+      max_messages_per_min: quota?.maxMsgsPerMin ?? null,
+      max_storage_mb: quota?.maxStorageMb ?? null,
+    },
+    active_tasks: active.slice(0, 20).map((t: any) => agentTaskView(t, agentId)),
+    directed_tasks: directed.slice(0, 20).map((t: any) => agentTaskView(t, agentId)),
+    public_claimable: tasks.filter((t: any) => t.state === "open" && !t.to && !t.dead_letter).length,
+    next: {
+      claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+      mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+      public_pool: { method: "GET", path: `/p/${project}/tasks` },
+      inbox: { method: "GET", path: `/p/${project}/inbox?since=0` },
+      skill: { method: "GET", path: "/skill" },
+    },
+  });
+}
+
+/** 回执模板：把交付格式门的字段清单直接变成可填文件，少一次“缺字段-被拒-再改”。 */
+function receiptTemplate(project: string, url: URL) {
+  const base = String(url.searchParams.get("base_sha") ?? "").trim();
+  if (base && !/^[a-f0-9]{7,64}$/i.test(base)) return err(422, "base_sha_not_hex", {
+    hint: "base_sha 用 7-64 位十六进制；留空则模板里用 <base_sha> 占位。",
+  });
+  const task = String(url.searchParams.get("task_id") ?? "").trim();
+  const b = base || "<base_sha>";
+  const template = [
+    `base: ${b}`,
+    "branch: <branch>",
+    "commit: <commit>",
+    "box: <box>",
+    "fmt: pass",
+    "clippy: pass",
+    "tests: pass",
+    "logs: <path>",
+    "",
+    `<!-- task_id: ${task || "<task_id>"} -->`,
+  ].join("\n");
+  return json({
+    template, filename: "RECEIPT.md",
+    required_fields: ["base", "branch", "commit", "box", "fmt", "clippy", "tests", "logs"],
+    note: "把占位符替换成实际值；commit/base 用 7-64 位十六进制，base 必须等于提交的 base_sha；与 patch 一起放到 refs。",
+    use: {
+      submit: { method: "POST", path: `/p/${project}/submissions` },
+      skill: { method: "GET", path: "/skill#交付格式" },
+    },
+  });
+}
+
 /** 普通 agent 的 Issue 池：只列 open 且尚未生成任务的 Issue。 */
 async function listOpenIssues(env: Env, project: string, url: URL) {
   const raw = Number(url.searchParams.get("limit") ?? 50);
@@ -2423,6 +2565,40 @@ async function listOpenIssues(env: Env, project: string, url: URL) {
   return json({ issues: rows.results ?? [], count: (rows.results ?? []).length, limit });
 }
 
+/** 撤回后的任务结算；重复调用必须幂等，不能因为第一次 DO 调用失败就把任务卡死。 */
+async function settleWithdrawnTask(env: Env, project: string, taskId: string, agentId: string, isAdmin: boolean) {
+  const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
+  const tasks = await taskListFromDo(stub);
+  const t = tasks.find((x: any) => String(x.task_id ?? x.id ?? "") === String(taskId));
+  if (!t) return { error: "task_not_found", task_id: taskId };
+  if (t.owner && t.owner !== agentId && t.state === "claimed")
+    return { error: "task_owned_by_other", task_id: taskId, owner: t.owner };
+  if (t.to && t.to !== agentId && t.state === "open")
+    return { error: "task_owned_by_other", task_id: taskId, to: t.to };
+  // 已经是该 agent 的定向 open：说明上次撤回已经成功，只是响应丢了；不再重复抛事件。
+  if (t.state === "open" && (t.to === agentId || t.released_by === agentId))
+    return { ok: true, task_id: taskId, state: "open", already: true, recovered: true };
+  // 老 DO 的 submission-settled 没有 reopen_on_withdraw：先显式转回该 agent 的定向 open。
+  if (!isAdmin && t.state !== "done") {
+    const rr = await stub.fetch(new Request("https://do/tasks/admin-reassign", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, task_id: taskId, to: agentId, force: true,
+                             reason: "submission_withdrawn", sender: "system" }),
+    })).catch(() => null);
+    if (!rr || !rr.ok) {
+      const d: any = rr ? await rr.json().catch(() => ({})) : { error: "reassign_unreachable" };
+      return { error: "task_reassign_failed", task_id: taskId, detail: d };
+    }
+  }
+  const r = await stub.fetch(new Request("https://do/tasks/submission-settled", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ project, task_id: taskId, sender: isAdmin ? "admin" : agentId,
+                           reopen_on_withdraw: true, closed_by: "withdraw" }),
+  })).catch(() => null);
+  return r ? await r.json().catch(() => ({ error: "settle_bad_payload" }))
+           : { error: "settle_unreachable" };
+}
+
 /** 撤回自己尚未被取走的交付；错绑任务时不必等管理员驳回，也不锁死 claim。 */
 async function withdrawSubmission(env: Env, project: string, sid: string, agentId: string, isAdmin: boolean) {
   if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(sid)) return err(422, "bad_submission_id");
@@ -2430,46 +2606,64 @@ async function withdrawSubmission(env: Env, project: string, sid: string, agentI
     `SELECT submission_id, agent_id, task_id, state, review_state
        FROM submissions WHERE project = ? AND submission_id = ?`
   ).bind(project, sid).first<any>();
-  if (!row) return err(404, "submission_not_found");
-  if (!isAdmin && row.agent_id !== agentId) return err(403, "not_submission_owner");
-  if (row.state !== "delivered")
-    return err(409, `not_withdrawable:${row.state}`);
-  if (row.review_state === "approved")
-    return err(409, "already_approved");
+  if (!row) return err(404, "submission_not_found", {
+    hint: "先 GET /p/{project}/submissions?mine=1 找到自己的 submission_id。",
+    use: { method: "GET", path: `/p/${project}/submissions?mine=1` },
+  });
+  if (!isAdmin && row.agent_id !== agentId) return err(403, "not_submission_owner", {
+    hint: "只能撤回自己提交的交付；管理员可以代撤。",
+    use: { method: "GET", path: `/p/${project}/submissions?mine=1` },
+  });
+  // 幂等恢复：第一次已把 D1 标成 withdrawn，但 DO 结算失败；第二次不能只回 409。
+  if (row.state === "archived" && row.review_state === "withdrawn") {
+    const taskLink = row.task_id
+      ? await settleWithdrawnTask(env, project, row.task_id, row.agent_id, isAdmin)
+      : null;
+    return json({ ok: true, submission_id: sid, state: "archived", review_state: "withdrawn",
+                  task_id: row.task_id ?? null, task_link: taskLink, replayed: true,
+                  next: submissionNext(project, sid, row.task_id ?? null, "archived") });
+  }
+  if (row.state !== "delivered") return err(409, `not_withdrawable:${row.state}`, {
+    state: row.state, review_state: row.review_state,
+    hint: "只有 state=delivered 且尚未被取走/裁决的交付可撤回；先 GET submissions 查看当前状态。",
+    use: { method: "GET", path: `/p/${project}/submissions?mine=1` },
+  });
+  if (["approved", "accepted"].includes(String(row.review_state))) return err(409, "already_reviewed", {
+    state: row.state, review_state: row.review_state,
+    hint: "该交付已经进入管理侧裁决，不能再由交付人撤回；需要重做请提交新交付，或让管理员归档。",
+    use: { method: "GET", path: `/p/${project}/submissions?mine=1` },
+  });
   const now = Date.now();
   const upd: any = await env.DB.prepare(
     `UPDATE submissions SET state = 'archived', review_state = 'withdrawn',
        reviewed_at = ?, reviewed_by = ?, updated_at = ?
-     WHERE project = ? AND submission_id = ? AND state = 'delivered'`
+     WHERE project = ? AND submission_id = ? AND state = 'delivered'
+       AND review_state NOT IN ('approved','accepted')`
   ).bind(now, isAdmin ? "admin" : agentId, now, project, sid).run();
-  if (Number(upd?.meta?.changes ?? 0) === 0)
-    return err(409, "not_withdrawable:raced");
-  let taskLink: any = null;
-  if (row.task_id) {
-    const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
-    // 老 DO 的 submission-settled 没有 reopen_on_withdraw：它会把 released 直接收成 done，
-    // 反而让撤回后无法再 claim。先显式把任务转回该 agent 的定向 open，再让 DO 重算待取数。
-    if (!isAdmin) {
-      const tasks = await taskListFromDo(stub);
-      const t = tasks.find((x: any) => String(x.task_id ?? x.id ?? "") === String(row.task_id));
-      if (t && t.state !== "done") {
-        await stub.fetch(new Request("https://do/tasks/admin-reassign", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ project, task_id: row.task_id, to: agentId, force: true,
-                                 reason: "submission_withdrawn", sender: "system" }),
-        })).catch(() => null);
-      }
+  if (Number(upd?.meta?.changes ?? 0) === 0) {
+    const again = await env.DB.prepare(
+      "SELECT state,review_state FROM submissions WHERE project = ? AND submission_id = ?"
+    ).bind(project, sid).first<any>();
+    if (again?.state === "archived" && again?.review_state === "withdrawn") {
+      const taskLink = row.task_id
+        ? await settleWithdrawnTask(env, project, row.task_id, row.agent_id, isAdmin)
+        : null;
+      return json({ ok: true, submission_id: sid, state: "archived", review_state: "withdrawn",
+                    task_id: row.task_id ?? null, task_link: taskLink, replayed: true,
+                    next: submissionNext(project, sid, row.task_id ?? null, "archived") });
     }
-    const r = await stub.fetch(new Request("https://do/tasks/submission-settled", {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ project, task_id: row.task_id, sender: isAdmin ? "admin" : agentId,
-                             reopen_on_withdraw: true, closed_by: "withdraw" }),
-    })).catch(() => null);
-    taskLink = r ? await r.json().catch(() => ({ error: "settle_bad_payload" }))
-                 : { error: "settle_unreachable" };
+    return err(409, "not_withdrawable:raced", {
+      state: again?.state, review_state: again?.review_state,
+      hint: "交付状态已被并发修改；重新 GET submissions 后再决定是否撤回。",
+      use: { method: "GET", path: `/p/${project}/submissions?mine=1` },
+    });
   }
-  return json({ ok: true, submission_id: sid, state: "archived",
-                review_state: "withdrawn", task_id: row.task_id ?? null, task_link: taskLink });
+  const taskLink = row.task_id
+    ? await settleWithdrawnTask(env, project, row.task_id, row.agent_id, isAdmin)
+    : null;
+  return json({ ok: true, submission_id: sid, state: "archived", review_state: "withdrawn",
+                task_id: row.task_id ?? null, task_link: taskLink,
+                next: submissionNext(project, sid, row.task_id ?? null, "archived") });
 }
 
 /** 交付列表（只读）：管理面与数据面共用查询；数据面只返回返工需要的字段。
@@ -2519,6 +2713,20 @@ async function listSubmissions(env: Env, project: string, url: URL, full = false
     by_state: byState, by_review: byReview,
     limit: 100, returned: rows.results.length, truncated: total > rows.results.length,
   });
+}
+
+/** 交付成功/去重后的下一步；agent 不需要再拼 GET/withdraw 路径。 */
+function submissionNext(project: string, sid: string, taskId: string | null, state: string | null) {
+  return {
+    bundle: { method: "GET", path: `/p/${project}/submissions/${encodeURIComponent(sid)}/bundle` },
+    detail: { method: "GET", path: `/p/${project}/submissions?task_id=${encodeURIComponent(taskId ?? "")}&mine=1` },
+    ...(state === "delivered" ? {
+      withdraw: { method: "POST", path: `/p/${project}/submissions/${encodeURIComponent(sid)}/withdraw`, body: {} },
+    } : {}),
+    ...(taskId ? {
+      task: { method: "GET", path: `/p/${project}/tasks/${encodeURIComponent(taskId)}` },
+    } : {}),
+  };
 }
 
 async function bundleSubmission(env: Env, project: string, id: string) {
@@ -2649,20 +2857,39 @@ async function resolveSubmissionTask(
       error: json({ error: "task_id_required",
                     reason: "提交必须显式指定当前任务；服务端不再按 claimed 数量自动绑定",
                     active_task_ids: activeIds,
-                    hint: "用任务消息里的 [task:<id>]，或让 CLI 从 active_task.json 读取；多任务并发时尤其不能省略" }, 422) };
+                    hint: "用任务消息里的 [task:<id>]，或让 CLI 从 active_task.json 读取；多任务并发时尤其不能省略",
+                    use: {
+                      claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+                      mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+                    } }, 422) };
   }
 
   if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(taskId))
     return { taskId: null, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
-             error: err(422, "bad_task_id") };
+             error: err(422, "bad_task_id", {
+               hint: "task_id 只能用字母、数字、点、下划线、冒号、连字符；从任务消息的 [task:<id>] 复制，不要截断。",
+               use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } },
+             }) };
   let t: any = all.find((x: any) => String(x.task_id ?? x.id ?? "") === taskId) ?? null;
   if (!t) t = await taskMeta(env, project, taskId);
   if (!t)
     return { taskId, task: null, autoBound, overtake: false, assigneeAtSubmit: null,
-             error: err(422, `task_not_found:${taskId}`) };
+             error: err(422, `task_not_found:${taskId}`, {
+               hint: "任务不存在或已删除；先列自己的任务，别继续猜 task_id。",
+               use: {
+                 mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+                 claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+               },
+             }) };
   if (t.state === "done")
     return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: null,
-             error: err(409, `task_done:${taskId}`) };
+             error: err(409, `task_done:${taskId}`, {
+               state: "done", hint: "任务已完成，不能再交付；领下一个任务，或让管理员 reopen。",
+               use: {
+                 claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+                 mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+               },
+             }) };
 
   const isOwner = t.state === "claimed" && t.owner === agentId;
   const isAssigned = t.to === agentId && t.state !== "done";
@@ -2677,20 +2904,31 @@ async function resolveSubmissionTask(
       error: json({ error: "task_context_mismatch", task_id: taskId,
                     task_state: t.state, task_owner: t.owner ?? null, task_to: t.to ?? null,
                     active_task_ids: activeIds,
-                    hint: "只能交付当前 active/已 claim 的任务；如果确实要越单，管理侧代建需带 allow_overtake + overtake_reason" }, 409) };
+                    hint: "只能交付当前 active/已 claim 的任务；如果确实要越单，管理侧代建需带 allow_overtake + overtake_reason",
+                    use: {
+                      claim: { method: "POST", path: `/p/${project}/tasks/claim`, body: { task_id: taskId } },
+                      claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+                      mine: { method: "GET", path: `/p/${project}/tasks?mine=1` },
+                    } }, 409) };
   }
   if (requireClaimed && !isOwner) {
     return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
       error: json({ error: "task_not_claimed", task_id: taskId,
                     task_state: t.state, task_to: t.to ?? null,
                     active_task_ids: activeIds,
-                    hint: "该任务已经下发但还没有 claim；先 task-claim，再交付" }, 409) };
+                    hint: "该任务已经下发但还没有 claim；先 POST tasks/claim 带 task_id，再交付",
+                    use: {
+                      claim: { method: "POST", path: `/p/${project}/tasks/claim`, required_scope: "tasks.claim",
+                               body: { task_id: taskId } },
+                      claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" },
+                    } }, 409) };
   }
   if (!isOwner && !isAssigned) {
     return { taskId, task: t, autoBound, overtake: false, assigneeAtSubmit: t.owner ?? t.to ?? null,
       error: json({ error: "task_not_assignee", task_id: taskId,
                     task_state: t.state, task_owner: t.owner ?? null, task_to: t.to ?? null,
-                    hint: "只能交付自己 owner 或被指派的任务；管理侧代建可用 allow_overtake 留痕" }, 409) };
+                    hint: "只能交付自己 owner 或被指派的任务；管理侧代建可用 allow_overtake 留痕",
+                    use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 409) };
   }
   return { taskId, task: t, autoBound, overtake: false,
            assigneeAtSubmit: t.owner ?? t.to ?? null };
@@ -2922,7 +3160,7 @@ function deliveryChecksMissing(kindRaw: unknown, checksRaw: unknown): string[] {
 }
 
 /** 交付格式门的统一错误体：缺什么、期望什么，一次说清，避免 agent 反复猜。 */
-function deliveryFormatError(kind: string, missing: string[]) {
+function deliveryFormatError(project: string, kind: string, missing: string[]) {
   const expected: Record<string, string> = {
     patch_file: "*.patch 或 *.diff（代码补丁）",
     receipt_file: "RECEIPT.md 或 *-receipt.*（执行回执）",
@@ -2946,7 +3184,14 @@ function deliveryFormatError(kind: string, missing: string[]) {
   const codeOf = (m: string) => m.split(":")[0];
   return json({ error: "delivery_format_incomplete", kind,
                 missing, required: missing.map((m) => expected[codeOf(m)] ?? m),
-                hint: "代码类交付必须含可解析补丁、完整回执（base/branch/commit/box/fmt/clippy/tests/logs）与结构化自测计数；不合格直接拒收，请按 required 修正后重新提交。" }, 422);
+                retryable: false,
+                example: { kind: "patch", refs: ["<sha256>:patch.diff", "<sha256>:RECEIPT.md"],
+                           checks: { tests: { passed: 0, failed: 0 } } },
+                hint: "按 required 逐项补齐后重新提交；这是格式门，原样重试不会通过。",
+                use: {
+                  receipt_template: { method: "GET", path: `/p/${project}/receipt-template` },
+                  submit: { method: "POST", path: `/p/${project}/submissions` },
+                } }, 422);
 }
 
 /** 读一个任务的元数据；只走 DO 的内部接口，不把任务正文暴露给普通 agent。 */
@@ -3091,9 +3336,9 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
   const bind = await resolveSubmissionTask(env, project, agentId, b.task_id, false, true);
   if (bind.error) return bind.error;
   const missing = deliveryFormatMissing(kind, norm.refs).concat(deliveryChecksMissing(kind, b.checks));
-  if (missing.length) return deliveryFormatError(kind, missing);
+  if (missing.length) return deliveryFormatError(project, kind, missing);
   const contentMissing = await deliveryFormatContentMissing(env, project, kind, norm.refs, String(b.base_sha));
-  if (contentMissing.length) return deliveryFormatError(kind, contentMissing);
+  if (contentMissing.length) return deliveryFormatError(project, kind, contentMissing);
   const taskId = bind.taskId;
   const now = Date.now();
   const res = await env.DB.prepare(
@@ -3107,11 +3352,21 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
   if (res.meta.changes === 0) {
     // 幂等只对“同一个 agent 的同一份交付”成立；别的 agent 抢了 ID 必须拒绝。
     const old = await env.DB.prepare(
-      "SELECT agent_id FROM submissions WHERE project = ? AND submission_id = ?"
+      "SELECT agent_id,task_id,state,review_state FROM submissions WHERE project = ? AND submission_id = ?"
     ).bind(project, sid).first<any>();
-    if (old?.agent_id !== agentId) return err(409, "submission_id_conflict");
-    return json({ submission_id: sid, state: "delivered", deduped: true, seq: null,
-                  task_id: taskId, task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound });
+    if (old?.agent_id !== agentId) return err(409, "submission_id_conflict", {
+      hint: "submission_id 已被其它 agent 占用；换一个 ID，或使用内容哈希生成稳定 ID。",
+      use: { method: "POST", path: `/p/${project}/submissions`, body_template: { submission_id: "sub-<new-id>" } },
+    });
+    if (String(old?.state) === "archived" || String(old?.review_state) === "withdrawn") return err(409, "submission_archived", {
+      submission_id: sid, state: old?.state, review_state: old?.review_state,
+      hint: "这个 submission_id 已撤回归档，重试不能复活它；换新 ID 重新交付，或先 GET submissions 查看状态。",
+      use: { method: "POST", path: `/p/${project}/submissions`, body_template: { submission_id: "sub-<new-id>" } },
+    });
+    return json({ submission_id: sid, state: old?.state ?? "delivered", review_state: old?.review_state ?? "pending",
+                  deduped: true, seq: null, task_id: old?.task_id ?? taskId,
+                  task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
+                  next: submissionNext(project, sid, old?.task_id ?? taskId, old?.state ?? "delivered") });
   }
 
   const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
@@ -3125,9 +3380,9 @@ async function createSubmission(req: Request, env: Env, project: string, agentId
                            dedupe_key: `sub:${sid}` }),
   }));
   const seq = await seqRes.json<any>().catch(() => ({}));
-  return json({ submission_id: sid, state: "delivered", task_id: taskId,
+  return json({ submission_id: sid, state: "delivered", review_state: "pending", task_id: taskId,
                 task_assignee: bind.assigneeAtSubmit, auto_bound: bind.autoBound,
-                seq: seq.seq ?? null });
+                seq: seq.seq ?? null, next: submissionNext(project, sid, taskId, "delivered") });
 }
 
 /**
@@ -3572,6 +3827,25 @@ const ERROR_HINTS: Record<string, string> = {
   project_paused: "项目 status=paused，写操作被 423 拒绝；读接口仍可用。联系管理员恢复项目状态后重试。",
   unknown_action: "当前服务端没有这个 action。先读 GET /capabilities 和 GET /skill；节点给管理员发消息用 POST /p/{project}/publish，不要用 /send。",
   wrong_endpoint: "接口层级或方向用错了。先读本响应里的 hint/use，再按 /skill 的对应章节调用；不要靠猜 endpoint。",
+  no_task_available: "当前没有可领取任务。先 GET /p/{project}/tasks?mine=1 看名下任务；公共池 GET /p/{project}/tasks；还在 queued 的任务等系统下发。",
+  task_context_mismatch: "你拿的 task_id 不在当前 active 上下文。按 use.claim 先 claim，或 use.claim_next 领下一个；active_task_ids 是服务端认为你可交付的任务。",
+  task_not_claimed: "任务已下发但未 claim；先 POST /p/{project}/tasks/claim 带 task_id，再交付。",
+  task_not_assignee: "只能交付自己 owner 或被指派的任务；先 GET tasks?mine=1 核对，管理侧越单要 allow_overtake。",
+  task_done: "任务已完成；不要继续交付，用 claim-next 领下一个，或让管理员 reopen。",
+  task_not_found: "任务不存在；先 GET tasks?mine=1 找真实 task_id，不要用旧缓存。",
+  task_dead_letter: "任务已进死信，节点不能 claim；让管理员重试/重派，或领别的任务。",
+  task_retry_scheduled: "任务在失败退避中；到 retry_in_ms 后再 claim，不要立即刷接口。",
+  task_not_dispatched: "定向任务还在该节点队列，等前序任务释放自动下发；现在 claim 会被拒。",
+  already_done: "任务已完成，不能再次 claim；直接 claim-next。",
+  blocked: "任务被依赖/管理侧阻塞；等解除后系统重发，或让管理员 reopen。",
+  locked: "任务在别人名下且租约未过期；等 lease_until 到期再 claim，或换下一个任务。",
+  released_pending_collection: "任务已释放但还有待取交付；先等管理侧取件，或让管理员归档旧交付。",
+  agent_task_limit_exceeded: "名下 active 任务已满；先完成或释放部分任务，再领新任务。用 tasks?mine=1 看 task_ids。",
+  delivery_format_incomplete: "交付格式门拒收；按 required 补补丁/回执/自测计数，再重新提交；这是确定性失败，原样重试不会通过。",
+  submission_archived: "submission_id 已撤回归档，重试不能复活；换新 ID 重新交付，或先 GET submissions 看状态。",
+  submission_id_conflict: "submission_id 被别的 agent 占用；换新 ID，或使用内容哈希生成稳定 ID。",
+  already_reviewed: "交付已进入管理侧裁决，交付人不能再撤回；要重做请提交新交付，或让管理员归档。",
+  not_withdrawable: "只有 delivered 且未被取走/裁决的交付可撤回；先 GET submissions?mine=1 看 state/review_state。",
   db_unavailable: "D1/DO 暂时不可用，30 秒后重试；保留本地任务/游标，不要重复 claim、重复建任务或反复换 token。",
   bad_ticket: "WS ticket 一次性且约 90 秒有效；重新 GET /p/{project}/ws-ticket 换新票，不要复用旧票。",
   upgrade_required: "这是 WebSocket 升级请求；普通 HTTP 请求不要打到 /console/ws。",

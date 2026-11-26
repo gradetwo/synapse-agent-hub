@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import random
@@ -20,6 +21,20 @@ from urllib.parse import quote
 import requests
 
 __version__ = "0.5.11"
+
+class SynapseAPIError(RuntimeError):
+    """服务端 4xx/5xx：保留 code/hint/use，agent 可以直接照着下一步调用。"""
+    def __init__(self, status: int, payload: Any):
+        self.status = int(status)
+        self.payload = payload if isinstance(payload, dict) else {"error": str(payload)[:500]}
+        self.code = str(self.payload.get("error") or self.payload.get("code") or status)
+        self.hint = self.payload.get("hint")
+        self.use = self.payload.get("use")
+        msg = f"HTTP {self.status} {self.code}"
+        if self.hint: msg += f"｜{self.hint}"
+        if self.use: msg += f"｜next={json.dumps(self.use, ensure_ascii=False)}"
+        super().__init__(msg)
+
 def _state_dir() -> Path:
     new = os.environ.get("SYNAPSE_STATE_DIR") or os.environ.get("YANSHI_STATE_DIR")
     if new: return Path(new)
@@ -689,7 +704,7 @@ class Client:
         import re as _re
         return _re.sub(r"[\x00-\x08\x0b-\x1f\x7f\x9b]", "", s)
 
-    def deliver(self, msgs: list[dict]) -> int:
+    def _deliver_messages(self, msgs: list[dict]) -> int:
         """把新消息落到本地，让 agent 下一轮对话就能看见，无需轮询感知。
 
         三级投递：
@@ -737,6 +752,32 @@ class Client:
                 self._debug_log("warn", f"notify_cmd failed: {e}")
         return delivered
 
+    def deliver(self, msgs: list[dict] | None = None, *,
+                files: Iterable[str | Path] | None = None, kind: str = "patch",
+                title: str = "", base_sha: str | None = None,
+                checks: dict | None = None, notes: str = "", task_id: str | None = None,
+                submission_id: str | None = None) -> Any:
+        """一条龙交付：deliver(files=[patch, RECEIPT.md]) 上传 + 建交付。
+
+        兼容旧用法 deliver(msgs)：不传 files 时仍是消息落盘。
+        """
+        if files is None:
+            return self._deliver_messages(msgs or [])
+        uploaded: list[dict] = []
+        refs: list[dict] = []
+        for f in files:
+            up = self.upload(f)
+            uploaded.append(up)
+            refs.append(up["ref"])
+        try:
+            sub = self.submit(kind, title, refs, base_sha=base_sha, checks=checks,
+                              notes=notes, task_id=task_id, submission_id=submission_id)
+        except SynapseAPIError as e:
+            # 文件已上传但交付被拒：错误体带上已传文件，agent 不用重新上传。
+            e.payload["uploaded"] = uploaded
+            raise
+        return {**sub, "files": uploaded}
+
     def _notify_cmd(self) -> str | None:
         try:
             cfg = json.loads((self.state_dir / "config.json").read_text())
@@ -754,25 +795,43 @@ class Client:
                            "env": self._collect_env()})
 
     # ── 交付 ─────────────────────────────────────────────────
+    def _submission_id(self, kind: str, title: str, refs: list[dict],
+                       base_sha: str, task_id: str | None) -> str:
+        """内容稳定 ID：超时重试会命中同一条交付，而不是生成重复 submission。"""
+        seed = json.dumps({
+            "agent": self.agent_id, "task": task_id or "", "kind": kind,
+            "title": title, "base": base_sha,
+            "refs": sorted([str(r.get("sha256", "")) for r in refs]),
+        }, sort_keys=True, separators=(",", ":"))
+        clean = re.sub(r"[^a-zA-Z0-9._:-]", "-", self.agent_id)[:40]
+        return f"sub-{clean}-{hashlib.sha256(seed.encode()).hexdigest()[:16]}"
+
     def upload(self, path: str | Path) -> dict:
-        import hashlib
         p = Path(path)
         data = p.read_bytes()
         sha = hashlib.sha256(data).hexdigest()
         url = f"{self.endpoint}/p/{self.project}/artifact/{sha}"
         r = self._sess.put(url, data=data, headers=self._headers(), timeout=120)
         if r.status_code >= 400:
-            raise RuntimeError(f"upload failed {r.status_code}: {r.text[:200]}")
+            body: Any
+            try: body = r.json()
+            except Exception: body = {"error": f"upload_http_{r.status_code}", "text": r.text[:200]}
+            raise SynapseAPIError(r.status_code, body)
         return {"sha256": sha, "name": p.name, "bytes": len(data), "ref": {"sha256": sha, "name": p.name}}
 
     def submit(self, kind: str, title: str, refs: list[dict], base_sha: str | None = None,
-               checks: dict | None = None, notes: str = "", task_id: str | None = None) -> dict:
-        sid = f"sub-{self.agent_id}-{uuid.uuid4().hex[:8]}"
+               checks: dict | None = None, notes: str = "", task_id: str | None = None,
+               submission_id: str | None = None) -> dict:
+        base = base_sha or self._git_head()
+        if not base:
+            raise SynapseAPIError(422, {"error": "base_sha_required",
+                "hint": "传 base_sha，或在 git 仓库内运行；base 必须是 7-64 位十六进制。"})
+        task_id = task_id or self._active_task_id()
+        sid = submission_id or self._submission_id(kind, title, refs, base, task_id)
         body = {
             "submission_id": sid, "agent_id": self.agent_id, "kind": kind, "title": title,
-            "refs": refs, "base_sha": base_sha or self._git_head(), "checks": checks or {}, "notes": notes,
+            "refs": refs, "base_sha": base, "checks": checks or {}, "notes": notes,
         }
-        task_id = task_id or self._active_task_id()
         if task_id:
             body["task_id"] = task_id
         return self._post(f"/p/{self.project}/submissions", body)
@@ -807,6 +866,18 @@ class Client:
 
     def task(self, task_id: str) -> TaskLease:
         return TaskLease(self, task_id)
+
+    def claim_next(self) -> dict:
+        """原子领取下一个可执行任务（定向优先、再公共池）；省掉“列任务→挑→claim”三步。"""
+        r = self._post(f"/p/{self.project}/tasks/claim-next", {})
+        if r.get("ok") and r.get("task_id"):
+            self._active_task_set(str(r["task_id"]), int(r.get("seq") or 0),
+                                  str((r.get("task") or {}).get("title") or ""))
+        return r
+
+    def bootstrap(self) -> dict:
+        """一次拿身份/配额/名下任务/下一步；启动时替代 whoami + tasks + inbox 三次探测。"""
+        return self._get(f"/p/{self.project}/bootstrap")
 
     def fail_task(self, task_id: str, error: str, retryable: bool = True) -> dict:
         """上报执行失败：服务端按 max_attempts 决定退避重试或进死信；成功后清本地 active task。"""
@@ -882,10 +953,10 @@ class Client:
                 time.sleep(1.5 * (i + 1))
         else:
             raise requests.ConnectionError(f"POST {path} 网络失败：{last}")
-        if r.status_code == 401: raise RuntimeError("token revoked or unknown; re-issue token")
-        if r.status_code == 403: raise RuntimeError("scope/project mismatch")
-        if r.status_code == 426: raise RuntimeError("sdk too old; pip install -U synapse-agent")
-        r.raise_for_status()
+        if r.status_code >= 400:
+            try: body = r.json()
+            except Exception: body = {"error": f"http_{r.status_code}", "text": r.text[:300]}
+            raise SynapseAPIError(r.status_code, body)
         return r.json()
 
     def _get(self, path: str) -> dict:
@@ -894,7 +965,10 @@ class Client:
         for i in range(4):
             try:
                 r = self._sess.get(f"{self.endpoint}{path}", headers=self._headers(), timeout=40)
-                r.raise_for_status()
+                if r.status_code >= 400:
+                    try: body = r.json()
+                    except Exception: body = {"error": f"http_{r.status_code}", "text": r.text[:300]}
+                    raise SynapseAPIError(r.status_code, body)
                 return r.json()
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.SSLError,
                     requests.exceptions.ChunkedEncodingError,
