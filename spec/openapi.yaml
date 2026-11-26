@@ -293,6 +293,8 @@ components:
         max_storage_mb: { type: integer }
         max_msgs_per_min: { type: integer }
         retention_days: { type: integer }
+        github_repo: { type: [string, 'null'], description: '项目级基线仓库；null 表示继承 Worker 环境变量' }
+        github_branch: { type: [string, 'null'], description: '项目级基线分支；null 表示继承 Worker 环境变量' }
         created_at: { type: integer }
 paths:
   /p/{project}/publish:
@@ -687,7 +689,7 @@ paths:
       responses: { '200': { description: ok + created + quotas；重复创建返回 created=false，不改已有配额 } }
   /admin/projects/{project}:
     patch:
-      summary: 修改已有项目的显示名、状态和四项配额（项目 ID 不可改）
+      summary: 修改已有项目的显示名、状态、四项配额和项目级基线仓库（项目 ID 不可改）
       parameters:
         - name: project
           in: path
@@ -705,10 +707,12 @@ paths:
                 max_storage_mb: { type: integer, minimum: 1, maximum: 10240 }
                 max_msgs_per_min: { type: integer, minimum: 1, maximum: 1000 }
                 retention_days: { type: integer, minimum: 1, maximum: 3650 }
+                github_repo: { type: string, description: 'owner/repo；空串表示继承 Worker 环境变量' }
+                github_branch: { type: string, description: '分支；空串表示继承 Worker 环境变量' }
       responses:
         '200': { description: '{ ok, changed, before, after, updated_by, updated_at }' }
         '404': { description: project_not_found }
-        '422': { description: bad_project_status | bad_project_quota }
+        '422': { description: bad_project_status | bad_project_quota | bad_github_repo | bad_github_branch }
   /admin/projects/{project}/audit:
     get:
       summary: 项目配置变更审计（最近 N 条，按时间倒序）
@@ -722,25 +726,6 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
       responses:
         '200': { description: '{ ok, project, entries: [{ action, actor, at, before, after }], migration_required? }' }
-  /admin/config/github:
-    get:
-      summary: 读取基线仓库覆盖配置（GITHUB_REPO / GITHUB_BRANCH 的有效值与来源）
-      responses:
-        '200': { description: '{ repo, branch, repo_source, branch_source, env_repo, env_branch, token_configured, updated_by, updated_at }' }
-    patch:
-      summary: 设置基线仓库覆盖；repo/branch 传空串则恢复环境变量默认
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                repo: { type: string, description: 'owner/repo；空串恢复 env 默认' }
-                branch: { type: string, description: '分支；空串恢复 env 默认' }
-      responses:
-        '200': { description: ok + 有效配置 }
-        '422': { description: bad_github_repo | bad_github_branch }
-        '503': { description: settings_unavailable }
   /admin/visibility:
     get:
       summary: 读取可见性策略

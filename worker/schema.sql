@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS projects (
   max_storage_mb  INTEGER NOT NULL DEFAULT 2048,
   max_msgs_per_min INTEGER NOT NULL DEFAULT 60,
   retention_days  INTEGER NOT NULL DEFAULT 30,
+  -- 项目级基线仓库；NULL/空表示继承 Worker 环境变量
+  github_repo     TEXT,
+  github_branch   TEXT,
   created_at      INTEGER NOT NULL,
   created_by      TEXT NOT NULL DEFAULT 'admin',
   updated_by      TEXT,

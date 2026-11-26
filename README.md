@@ -101,9 +101,9 @@ D1/R2，也不会重跑 `schema.sql`。详见 [`BUILD.md`](./BUILD.md)。
 
 ### 基线仓库
 
-`GITHUB_REPO` / `GITHUB_BRANCH` 默认来自 Worker 环境变量；部署后可在管理台「项目 → 基线仓库」里覆盖，覆盖值写入 D1，立即用于项目健康、补丁适用性和 `base_sha` 校验。清空覆盖即恢复环境默认。
+每个项目使用自己的基线仓库：在管理台「项目 → 项目卡 → 配置」里填写 `仓库 / 分支`，留空则继承 Worker 环境变量 `GITHUB_REPO` / `GITHUB_BRANCH`，分支最终缺省为 `main`。项目级配置写入 `projects.github_repo/github_branch`，立即用于该项目的项目健康、补丁适用性和 `base_sha` 校验，不会影响其他项目。
 
-私有仓库的 `GITHUB_TOKEN` 仍只通过 secret 管理，不提供管理台明文读写：
+私有仓库的 `GITHUB_TOKEN` 仍只通过 secret 管理，管理台不提供明文读写：
 
 ```bash
 npx wrangler secret put GITHUB_TOKEN

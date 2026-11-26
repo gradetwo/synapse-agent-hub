@@ -24,23 +24,13 @@ HB_PERIOD = 60
 LOCK = threading.RLock()
 PROJECTS = {"yanshi": {"project": "yanshi", "display_name": "偃师", "status": "active",
                         "max_agents": 200, "max_storage_mb": 2048, "max_msgs_per_min": 60,
-                        "retention_days": 30, "created_at": int(time.time() * 1000),
+                        "retention_days": 30, "github_repo": None, "github_branch": None,
+                        "created_at": int(time.time() * 1000),
                         "created_by": "admin", "updated_by": "admin",
                         "updated_at": int(time.time() * 1000)}}
 PROJECT_AUDIT = []
-REPO_ENV = {"repo": "gradetwo/synapse-agent-hub", "branch": "main"}
-REPO_CONFIG = {"repo": REPO_ENV["repo"], "branch": REPO_ENV["branch"],
-               "updated_by": "env", "updated_at": None}
 POLICY = {"mode": "all", "projects": []}
-
-def repo_payload():
-    source = "env" if REPO_CONFIG.get("updated_by") == "env" else "admin"
-    return {"ok": True, "repo": REPO_CONFIG["repo"], "branch": REPO_CONFIG["branch"],
-            "repo_source": source, "branch_source": source,
-            "env_repo": REPO_ENV["repo"], "env_branch": REPO_ENV["branch"],
-            "token_configured": False,
-            "updated_by": REPO_CONFIG.get("updated_by") or "",
-            "updated_at": REPO_CONFIG.get("updated_at")}
+REPO_ENV = {"repo": "gradetwo/synapse-agent-hub", "branch": "main"}
 STATE = {}          # project -> dict(seq, msgs, dedupe, hb, tasks, acks, bc, superseded)
 SUBS = {}           # (project, sid) -> dict
 BLOBS = {}          # (project, sha) -> bytes
@@ -138,8 +128,6 @@ class H(BaseHTTPRequestHandler):
                 return self._out(payload)
             if seg == ["admin", "visibility"]:
                 return self._out(POLICY)
-            if seg == ["admin", "config", "github"]:
-                return self._out(repo_payload())
             if len(seg) == 4 and seg[1] == "projects" and seg[3] == "audit":
                 project = seg[2]
                 entries = [a for a in PROJECT_AUDIT if a["project"] == project][-20:]
@@ -153,10 +141,13 @@ class H(BaseHTTPRequestHandler):
                 s = st(seg[2])
                 return self._out({"seq": s["seq"], "agents": [], "tasks": []})
             if len(seg) == 5 and seg[1] == "p" and seg[3] == "repo" and seg[4] == "status":
-                cfg = repo_payload()
-                return self._out({"repo": cfg["repo"], "branch": cfg["branch"],
-                                  "repo_source": cfg["repo_source"], "branch_source": cfg["branch_source"],
-                                  "token_configured": cfg["token_configured"],
+                p = PROJECTS.get(seg[2], {})
+                repo = p.get("github_repo") or REPO_ENV["repo"]
+                branch = p.get("github_branch") or REPO_ENV["branch"]
+                return self._out({"repo": repo, "branch": branch,
+                                  "repo_source": "project" if p.get("github_repo") else "env",
+                                  "branch_source": "project" if p.get("github_branch") else "default",
+                                  "token_configured": False,
                                   "target_sha": "abcdef1234567890", "error": None,
                                   "last_project_check": "abcdef1234567890",
                                   "last_project_check_at": int(time.time() * 1000)})
@@ -196,20 +187,6 @@ class H(BaseHTTPRequestHandler):
         if not auth["ok"]:
             return self._out({"error": "missing_token"}, 401)
         b = self._body()
-        if seg == ["admin", "config", "github"]:
-            repo = str(b.get("repo", "")).strip()
-            branch = str(b.get("branch", "")).strip() or "main"
-            if repo and not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
-                return self._out({"error": "bad_github_repo"}, 422)
-            if not re.match(r"^[A-Za-z0-9._/-]{1,100}$", branch) or ".." in branch:
-                return self._out({"error": "bad_github_branch"}, 422)
-            if not repo:
-                REPO_CONFIG.update(repo=REPO_ENV["repo"], branch=REPO_ENV["branch"],
-                                   updated_by="env", updated_at=None)
-            else:
-                REPO_CONFIG.update(repo=repo, branch=branch, updated_by="admin",
-                                   updated_at=int(time.time() * 1000))
-            return self._out(repo_payload())
         if len(seg) == 3 and seg[1] == "projects":
             project = seg[2]
             p = PROJECTS.get(project)
@@ -221,6 +198,16 @@ class H(BaseHTTPRequestHandler):
             if status not in ("active", "paused", "archived"):
                 return self._out({"error": "bad_project_status"}, 422)
             p["status"] = status
+            if "github_repo" in b:
+                repo = str(b.get("github_repo") or "").strip()
+                if repo and not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
+                    return self._out({"error": "bad_github_repo"}, 422)
+                p["github_repo"] = repo or None
+            if "github_branch" in b:
+                branch = str(b.get("github_branch") or "").strip()
+                if branch and (not re.match(r"^[A-Za-z0-9._/-]{1,100}$", branch) or ".." in branch):
+                    return self._out({"error": "bad_github_branch"}, 422)
+                p["github_branch"] = branch or None
             for k, lo, hi in (("max_agents", 1, 1000), ("max_storage_mb", 1, 10240),
                               ("max_msgs_per_min", 1, 1000), ("retention_days", 1, 3650)):
                 if k in b:
@@ -338,6 +325,8 @@ class H(BaseHTTPRequestHandler):
                     "max_storage_mb": b.get("max_storage_mb", 2048),
                     "max_msgs_per_min": b.get("max_msgs_per_min", 60),
                     "retention_days": b.get("retention_days", 30),
+                    "github_repo": b.get("github_repo") or None,
+                    "github_branch": b.get("github_branch") or None,
                     "created_at": now, "created_by": "admin", "updated_by": "admin",
                     "updated_at": now,
                 }
@@ -356,6 +345,16 @@ class H(BaseHTTPRequestHandler):
                 if status not in ("active", "paused", "archived"):
                     return self._out({"error": "bad_project_status"}, 422)
                 p["status"] = status
+                if "github_repo" in b:
+                    repo = str(b.get("github_repo") or "").strip()
+                    if repo and not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
+                        return self._out({"error": "bad_github_repo"}, 422)
+                    p["github_repo"] = repo or None
+                if "github_branch" in b:
+                    branch = str(b.get("github_branch") or "").strip()
+                    if branch and (not re.match(r"^[A-Za-z0-9._/-]{1,100}$", branch) or ".." in branch):
+                        return self._out({"error": "bad_github_branch"}, 422)
+                    p["github_branch"] = branch or None
                 for k, lo, hi in (("max_agents", 1, 1000), ("max_storage_mb", 1, 10240),
                                   ("max_msgs_per_min", 1, 1000), ("retention_days", 1, 3650)):
                     if k in b:

@@ -609,11 +609,6 @@ if (location.search.includes("reset=1")) {
   .healthTile .warnv,.healthTile .badv{color:var(--warn-soft)}
   .healthActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 14px 12px}
   .healthActions .scopeHint{margin:0}
-  #repoCfgForm .row{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr)}
-  #repoCfgForm .projAction{grid-template-columns:auto auto minmax(0,1fr);align-items:center}
-  #repoCfgForm .projAction .scopeHint{margin:0}
-  #repoCfgToken{color:var(--dim-2);background:var(--surface-input)}
-  #repoCfgSource{margin:0;min-height:38px;display:flex;align-items:center}
   @media(max-width:1000px){.healthGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media(max-width:700px){
     .card>h2{flex-wrap:wrap;row-gap:5px}
@@ -629,7 +624,6 @@ if (location.search.includes("reset=1")) {
     .healthGrid{grid-template-columns:1fr;padding:0 10px 8px}
     .healthActions{padding:0 10px 10px}
     .projAuditRows{max-height:180px}
-    #repoCfgForm .row,#repoCfgForm .projAction{grid-template-columns:1fr}
   }
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
 .dashTile.clickable{cursor:pointer}
@@ -1003,6 +997,10 @@ if (location.search.includes("reset=1")) {
           </select></label>
         </div>
         <div class="row">
+          <label>基线仓库（owner/repo，留空继承环境）<input id="peRepo" placeholder="gradetwo/synapse-agent-hub" autocomplete="off"></label>
+          <label>基线分支（留空继承环境/main）<input id="peBranch" placeholder="main" autocomplete="off"></label>
+        </div>
+        <div class="row">
           <label>Agent 上限<input id="peAgents" type="number" min="1" max="1000" step="1"></label>
           <label>存储上限（MB）<input id="peStorage" type="number" min="1" max="10240" step="1"></label>
         </div>
@@ -1013,7 +1011,7 @@ if (location.search.includes("reset=1")) {
         <div class="row projAction">
           <button class="primary" type="button" id="peSave">保存修改</button>
           <button class="ghost" type="button" id="peCancel">取消</button>
-          <span class="scopeHint" id="peHint">项目 ID 不可改；暂停会拒绝写请求，归档只保留只读入口。</span>
+          <span class="scopeHint" id="peHint">项目 ID 不可改；基线留空继承环境变量；暂停会拒绝写请求，归档只保留只读入口。</span>
         </div>
       </div>
       <div class="projAudit">
@@ -1048,28 +1046,8 @@ if (location.search.includes("reset=1")) {
     <div class="healthGrid" id="healthGrid"><div class="empty" style="grid-column:1/-1">选择具体项目后加载</div></div>
     <div class="healthActions">
       <button class="ghost" type="button" id="healthApply">检查当前基线适用性</button>
-      <button class="ghost" type="button" id="healthRepoCfg">配置基线仓库</button>
+      <button class="ghost" type="button" id="healthRepoCfg">配置当前项目</button>
       <span class="scopeHint" id="healthHint">适用性会检查当前项目已交付的 patch/bundle，可能耗时。</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>基线仓库 <span class="muted" id="repoCfgStat"></span></h2>
-    <div class="scopeHint" style="margin:-2px 14px 8px">项目健康、补丁适用性和 base_sha 校验都使用这里配置的远端仓库；默认读取 Worker 环境变量，可在管理台覆盖。Token 仍只通过 <code>wrangler secret</code> 管理，不会回传明文。</div>
-    <div class="form" id="repoCfgForm">
-      <div class="row">
-        <label>仓库（owner/repo）<input id="repoCfgRepo" autocomplete="off" placeholder="gradetwo/synapse-agent-hub"></label>
-        <label>分支<input id="repoCfgBranch" autocomplete="off" placeholder="main"></label>
-      </div>
-      <div class="row">
-        <label>Token 状态<input id="repoCfgToken" disabled></label>
-        <label>配置来源<span class="scopeHint" id="repoCfgSource"></span></label>
-      </div>
-      <div class="row projAction">
-        <button class="primary" type="button" id="repoCfgSave">保存基线配置</button>
-        <button class="ghost" type="button" id="repoCfgReset">恢复环境默认</button>
-        <span class="scopeHint" id="repoCfgHint">保存后，项目健康与适用性检查会立即使用新仓库。</span>
-      </div>
     </div>
   </div>
 
@@ -1564,7 +1542,6 @@ let ALL_PROJECTS = [];            // 包含被可见性策略隐藏的项目（�
 let PROJECTS_HIDDEN = 0;
 let editingProject = "";          // 正在编辑的项目 ID
 let PROJECT_HEALTH = null;        // 项目健康缓存
-let REPO_CONFIG = null;           // 基线仓库配置缓存
 let refreshEpoch = 0;              // 切换项目/并发刷新时，旧请求只能静默丢弃
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
@@ -1800,7 +1777,7 @@ async function loadProjects() {
   updateScopeLabel();
   fillDetailProjects();
   connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
-  if (ACTIVE_TAB === "project") { loadProjectHealth(); loadRepoConfig(); }
+  if (ACTIVE_TAB === "project") loadProjectHealth();
 }
 
 function projectStatusMeta(status) {
@@ -1837,14 +1814,16 @@ function renderProjectList() {
       `存储 ${numOrDash(p.max_storage_mb)} MB`,
       `消息 ${numOrDash(p.max_msgs_per_min)}/分`,
       `保留 ${numOrDash(p.retention_days)} 天`,
-    ].map((t) => `<span>${esc(t)}</span>`).join("");
+      (p.github_repo || p.github_branch)
+        ? `基线 ${p.github_repo || "继承仓库"}${p.github_branch ? "@" + p.github_branch : ""}` : "",
+    ].filter(Boolean).map((t) => `<span>${esc(t)}</span>`).join("");
     return `<article class="projItem">
       <div class="projTop"><b>${name}</b><span class="badge ${st.badge}">${st.label}</span>
         ${p.project === current ? '<span class="badge approved">当前</span>' : ''}
         <span class="mono spacer">${pid}</span></div>
       <div class="projQuota">${quota}</div>
       <div class="projFoot"><span class="muted">创建 ${esc(created)}${p.created_by ? ` · ${esc(String(p.created_by).slice(0, 40))}` : ""}</span>
-        <span class="projBtns"><button class="ghost mini" type="button" data-proj-edit="${pid}" title="修改名称、状态和配额">配置</button>
+        <span class="projBtns"><button class="ghost mini" type="button" data-proj-edit="${pid}" title="修改项目配置（配额、生命周期、项目基线仓库）">配置</button>
         ${["paused", "archived"].includes(String(p.status || "").toLowerCase())
           ? `<span class="muted">${String(p.status).toLowerCase() === "archived" ? "只读存档" : "暂停中"}</span>`
           : `<button class="mini" type="button" data-goto-project="${pid}" title="切到该项目">切到项目</button>`}</span></div>
@@ -1953,9 +1932,7 @@ for (const id of ["visAll", "visList"]) {
 }
 $("healthReload").onclick = () => loadProjectHealth(true);
 $("healthApply").onclick = checkApplicability;
-$("healthRepoCfg").onclick = openRepoConfig;
-$("repoCfgSave").onclick = saveRepoConfig;
-$("repoCfgReset").onclick = resetRepoConfig;
+$("healthRepoCfg").onclick = openCurrentProjectConfig;
 
 function projectById(id) {
   return (ALL_PROJECTS || []).find((p) => p.project === id)
@@ -1975,11 +1952,13 @@ function openProjectEditor(id) {
   $("peId").textContent = p.project;
   $("peName").value = decEsc(p.display_name || p.project);
   $("peStatus").value = String(p.status || "active").toLowerCase();
+  $("peRepo").value = p.github_repo ? decEsc(p.github_repo) : "";
+  $("peBranch").value = p.github_branch ? decEsc(p.github_branch) : "";
   $("peAgents").value = hasNum(p.max_agents) ? p.max_agents : 200;
   $("peStorage").value = hasNum(p.max_storage_mb) ? p.max_storage_mb : 2048;
   $("peMsgs").value = hasNum(p.max_msgs_per_min) ? p.max_msgs_per_min : 60;
   $("peRetention").value = hasNum(p.retention_days) ? p.retention_days : 30;
-  $("peHint").textContent = "项目 ID 不可改；暂停会拒绝写请求，归档只保留只读入口。";
+  $("peHint").textContent = "项目 ID 不可改；基线字段留空则继承 Worker 环境变量；暂停会拒绝写请求，归档只保留只读入口。";
   $("projEditForm").hidden = false;
   loadProjectAudit(p.project);
   setTimeout(() => {
@@ -2003,11 +1982,13 @@ function auditTime(at) {
 }
 
 function auditOneLine(entry) {
-  const changed = ["display_name", "status", "max_agents", "max_storage_mb", "max_msgs_per_min", "retention_days"]
+  const changed = ["display_name", "status", "max_agents", "max_storage_mb", "max_msgs_per_min",
+                   "retention_days", "github_repo", "github_branch"]
     .filter((k) => String((entry.before || {})[k] ?? "") !== String((entry.after || {})[k] ?? ""));
   const labels = {
     display_name: "名称", status: "状态", max_agents: "Agent",
     max_storage_mb: "存储 MB", max_msgs_per_min: "消息/分", retention_days: "保留天",
+    github_repo: "基线仓库", github_branch: "基线分支",
   };
   const val = (k, v) => {
     if (v === undefined || v === null || v === "") return "—";
@@ -2079,6 +2060,8 @@ async function saveProject() {
       display_name: ($("peName").value || "").trim() || id,
       status, max_agents: agents, max_storage_mb: storage,
       max_msgs_per_min: msgs, retention_days: retention,
+      github_repo: ($("peRepo").value || "").trim(),
+      github_branch: ($("peBranch").value || "").trim(),
     });
     PROJECT_HEALTH = null;
     await loadProjects();
@@ -2302,104 +2285,13 @@ async function checkApplicability() {
   }
 }
 
-function repoSourceLabel(src) {
-  return src === "admin" ? "管理台覆盖"
-    : src === "env" ? "环境变量"
-    : src === "default" ? "默认 main"
-    : "未配置";
-}
-
-function renderRepoConfig(d) {
-  const cfg = d || REPO_CONFIG || {};
-  $("repoCfgStat").textContent = cfg.repo ? `${cfg.repo} @ ${cfg.branch}` : "未配置";
-  $("repoCfgRepo").value = cfg.repo || "";
-  $("repoCfgBranch").value = cfg.branch || "main";
-  $("repoCfgToken").value = cfg.token_configured
-    ? "已配置（wrangler secret）" : "未配置（公开仓库可用）";
-  $("repoCfgSource").textContent = `仓库：${repoSourceLabel(cfg.repo_source)} · 分支：${repoSourceLabel(cfg.branch_source)}`;
-  $("repoCfgHint").textContent = cfg.updated_at
-    ? `管理台覆盖更新于 ${auditTime(cfg.updated_at)}${cfg.updated_by ? ` · ${cfg.updated_by}` : ""}`
-    : "当前使用环境默认；保存后立即生效。";
-}
-
-async function loadRepoConfig() {
-  const hint = $("repoCfgHint");
-  if (hint) hint.textContent = "读取基线配置…";
-  try {
-    const d = await api("/admin/config/github");
-    REPO_CONFIG = d || {};
-    renderRepoConfig(REPO_CONFIG);
-  } catch (e) {
-    if (!(e instanceof AuthError) && hint) hint.textContent = `读取失败：${e.message || e}`;
-  }
-}
-
-async function saveRepoConfig() {
-  const repo = ($("repoCfgRepo").value || "").trim();
-  const branch = ($("repoCfgBranch").value || "").trim() || "main";
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
-    $("repoCfgHint").textContent = "仓库格式应为 owner/repo，例如 gradetwo/synapse-agent-hub";
+function openCurrentProjectConfig() {
+  if (!current || current === "*") {
+    showToast("先选择具体项目，再配置它的基线仓库", 4000);
     return;
   }
-  if (!/^[A-Za-z0-9._/-]{1,100}$/.test(branch) || branch.includes("..") || branch.startsWith("/") || branch.endsWith("/")) {
-    $("repoCfgHint").textContent = "分支不合法";
-    return;
-  }
-  const btn = $("repoCfgSave");
-  btn.disabled = true;
-  btn.textContent = "保存中…";
-  $("repoCfgHint").textContent = "正在保存…";
-  try {
-    const d = await api("/admin/config/github", "PATCH", { repo, branch });
-    REPO_CONFIG = d || {};
-    renderRepoConfig(REPO_CONFIG);
-    PROJECT_HEALTH = null;
-    if (current && current !== "*") await loadProjectHealth(true);
-    showToast(`基线仓库已切换为 ${repo} @ ${branch}`, 6000);
-  } catch (e) {
-    if (!(e instanceof AuthError)) {
-      $("repoCfgHint").textContent = `保存失败：${e.message || e}`;
-      showToast(`保存基线配置失败：${e.message || e}`, 9000);
-    }
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "保存基线配置";
-  }
-}
-
-async function resetRepoConfig() {
-  if (!confirm("清空管理台覆盖，恢复 Worker 环境变量中的 GITHUB_REPO / GITHUB_BRANCH？")) return;
-  const btn = $("repoCfgReset");
-  btn.disabled = true;
-  $("repoCfgHint").textContent = "正在恢复…";
-  try {
-    const d = await api("/admin/config/github", "PATCH", { repo: "", branch: "" });
-    REPO_CONFIG = d || {};
-    renderRepoConfig(REPO_CONFIG);
-    PROJECT_HEALTH = null;
-    if (current && current !== "*") await loadProjectHealth(true);
-    showToast("已恢复环境默认基线配置", 5000);
-  } catch (e) {
-    if (!(e instanceof AuthError)) {
-      $("repoCfgHint").textContent = `恢复失败：${e.message || e}`;
-      showToast(`恢复基线配置失败：${e.message || e}`, 9000);
-    }
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-function openRepoConfig() {
-  if (ACTIVE_TAB !== "project") {
-    const tab = document.querySelector('[data-tab="project"]');
-    if (tab) tab.click();
-  }
-  setCardOpen("基线仓库", true);
-  loadRepoConfig();
-  setTimeout(() => {
-    const form = $("repoCfgForm");
-    if (form) form.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, 30);
+  openProjectEditor(current);
+  showToast(`正在配置 ${current} 的基线仓库`, 3500);
 }
 
 function updateScopeLabel() {
@@ -5549,7 +5441,7 @@ function decorateCards() {
     // 标题只取 h2 的首个文本节点，避免把动态状态/计数带进 localStorage 的折叠 key。
     const title = ((h.firstChild && h.firstChild.nodeType === 3 ? h.firstChild.textContent : h.textContent) || "")
       .trim().replace(/[▸▾⤢⤡]/g, "").trim();
-    const keep = /^(概览|项目管理|项目健康|基线仓库|名册|注册审批|签发 token|效率观测)/.test(title);
+    const keep = /^(概览|项目管理|项目健康|名册|注册审批|签发 token|效率观测)/.test(title);
     const key = `hub.fold2.${title}`;
     let folded = !keep;
     try {
@@ -5792,7 +5684,7 @@ function bindFilters() {
 
 const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "效率观测", "名册"] },
-  { id: "project",  label: "项目", cards: ["项目管理", "项目健康", "基线仓库"] },
+  { id: "project",  label: "项目", cards: ["项目管理", "项目健康"] },
   { id: "task",     label: "任务", cards: ["任务", "效率观测"] },
   { id: "issue",    label: "Issue", cards: ["Issue"] },
   { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
@@ -5854,7 +5746,7 @@ function bindTabs() {
       b.classList.toggle("on", b.dataset.tab === g.id));
     localStorage.setItem("hub.tab", g.id);
     if (g.id === "msg") markMsgSeen();
-    if (g.id === "project") { loadProjectHealth(); loadRepoConfig(); }
+    if (g.id === "project") loadProjectHealth();
     // 切到某页时如果该页所有卡片都是收起的，自动展开第一张；否则用户只会看到一排标题。
     const groupCards = cardsAll().filter((c) => {
       const t = titleOf(c);

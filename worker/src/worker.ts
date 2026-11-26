@@ -478,9 +478,10 @@ export default {
       "SELECT project, retention_days FROM projects WHERE status='active'"
     ).all<{ project: string; retention_days: number }>();
     ctx.waitUntil((async () => {
-      // 0077：main 前进后重查未归档补丁；只有 main SHA 变化才扫，避免每分钟空跑。
-      const main = await repoMainSha(env).catch(() => ({ sha: null, error: "repo_main_unavailable", cached: false }));
       for (const r of rows.results) {
+        // 0077：main 前进后重查未归档补丁；每个项目可能有自己的基线仓库/分支。
+        const main = await repoMainSha(env, r.project)
+          .catch(() => ({ sha: null, error: "repo_main_unavailable", cached: false }));
         try {
           const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + r.project));
           await stub.fetch(new Request("https://do/cron/tick", {
@@ -818,8 +819,8 @@ function normalizeGithubBranch(v: any): string {
 type GithubRuntimeConfig = {
   repo: string;
   branch: string;
-  repoSource: "admin" | "env" | "unset";
-  branchSource: "admin" | "env" | "default";
+  repoSource: "project" | "env" | "unset";
+  branchSource: "project" | "env" | "default";
   envRepo: string;
   envBranch: string;
   tokenConfigured: boolean;
@@ -827,76 +828,34 @@ type GithubRuntimeConfig = {
   updatedAt: number | null;
 };
 
-async function readGithubOverride(env: Env): Promise<any> {
-  try {
-    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
-      .bind("config:github").first<any>();
-    if (!row?.value) return {};
-    const parsed = JSON.parse(String(row.value));
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch { return {}; }
-}
-
-async function githubConfig(env: Env): Promise<GithubRuntimeConfig> {
-  const override = await readGithubOverride(env);
+// 项目级基线仓库：projects.github_repo/github_branch 覆盖环境变量；
+// 留空时继承 GITHUB_REPO / GITHUB_BRANCH，仍没有分支则 main。
+async function githubConfig(env: Env, project = ""): Promise<GithubRuntimeConfig> {
+  let row: any = null;
+  if (project) {
+    try {
+      row = await env.DB.prepare(
+        "SELECT github_repo, github_branch, updated_by, updated_at FROM projects WHERE project = ?"
+      ).bind(project).first<any>();
+    } catch { /* 旧库未迁移时按环境变量 */ }
+  }
   const envRepo = normalizeGithubRepo(env.GITHUB_REPO);
   const envBranch = normalizeGithubBranch(env.GITHUB_BRANCH);
-  const dbRepo = normalizeGithubRepo(override.repo);
-  const dbBranch = normalizeGithubBranch(override.branch);
-  const repo = dbRepo || envRepo;
-  const branch = dbBranch || envBranch || "main";
+  const projectRepo = normalizeGithubRepo(row?.github_repo);
+  const projectBranch = normalizeGithubBranch(row?.github_branch);
+  const repo = projectRepo || envRepo;
+  const branch = projectBranch || envBranch || "main";
+  const projectConfig = !!(projectRepo || projectBranch);
   return {
     repo,
     branch,
-    repoSource: dbRepo ? "admin" : (envRepo ? "env" : "unset"),
-    branchSource: dbBranch ? "admin" : (envBranch ? "env" : "default"),
+    repoSource: projectRepo ? "project" : (envRepo ? "env" : "unset"),
+    branchSource: projectBranch ? "project" : (envBranch ? "env" : "default"),
     envRepo,
     envBranch,
     tokenConfigured: !!String(env.GITHUB_TOKEN ?? "").trim(),
-    updatedBy: String(override.updated_by ?? "").slice(0, 120),
-    updatedAt: Number(override.updated_at ?? 0) || null,
-  };
-}
-
-async function saveGithubConfig(
-  env: Env, input: { repo?: unknown; branch?: unknown }, actor: string,
-): Promise<{ ok: true; config: GithubRuntimeConfig } | { ok: false; error: string }> {
-  const current = await readGithubOverride(env);
-  const next: any = { ...current };
-  if (input.repo !== undefined) {
-    const raw = String(input.repo ?? "").trim();
-    if (raw && !normalizeGithubRepo(raw)) return { ok: false, error: "bad_github_repo" };
-    if (raw) next.repo = raw; else delete next.repo;
-  }
-  if (input.branch !== undefined) {
-    const raw = String(input.branch ?? "").trim();
-    if (raw && !normalizeGithubBranch(raw)) return { ok: false, error: "bad_github_branch" };
-    if (raw) next.branch = raw; else delete next.branch;
-  }
-  try {
-    if (!next.repo && !next.branch) {
-      await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("config:github").run();
-    } else {
-      next.updated_by = String(actor || "admin").slice(0, 120);
-      next.updated_at = Date.now();
-      await env.DB.prepare(
-        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
-      ).bind("config:github", JSON.stringify(next), next.updated_at).run();
-    }
-  } catch {
-    return { ok: false, error: "settings_unavailable" };
-  }
-  return { ok: true, config: await githubConfig(env) };
-}
-
-function githubConfigPayload(cfg: GithubRuntimeConfig) {
-  return {
-    repo: cfg.repo, branch: cfg.branch,
-    repo_source: cfg.repoSource, branch_source: cfg.branchSource,
-    env_repo: cfg.envRepo, env_branch: cfg.envBranch,
-    token_configured: cfg.tokenConfigured,
-    updated_by: cfg.updatedBy, updated_at: cfg.updatedAt,
+    updatedBy: projectConfig ? String(row?.updated_by ?? "").slice(0, 120) : "",
+    updatedAt: projectConfig ? (Number(row?.updated_at ?? 0) || null) : null,
   };
 }
 
@@ -910,6 +869,8 @@ function projectConfigOf(row: any) {
     max_storage_mb: Number(row?.max_storage_mb ?? 2048),
     max_msgs_per_min: Number(row?.max_msgs_per_min ?? 60),
     retention_days: Number(row?.retention_days ?? 30),
+    github_repo: String(row?.github_repo ?? ""),
+    github_branch: String(row?.github_branch ?? ""),
   };
 }
 
@@ -929,7 +890,8 @@ async function auditProjectChange(
 }
 
 function projectConfigChanged(before: any, after: any) {
-  return ["display_name", "status", "max_agents", "max_storage_mb", "max_msgs_per_min", "retention_days"]
+  return ["display_name", "status", "max_agents", "max_storage_mb", "max_msgs_per_min",
+          "retention_days", "github_repo", "github_branch"]
     .some((k) => before[k] !== after[k]);
 }
 
@@ -1612,6 +1574,7 @@ async function admin(req: Request, env: Env, url: URL) {
       await auditProjectChange(env, project, "create", actor, {}, {
         project, display_name: displayName, status: "active", max_agents: maxAgents,
         max_storage_mb: maxStorage, max_msgs_per_min: maxMsgs, retention_days: retention,
+        github_repo: "", github_branch: "",
       });
     }
     return Response.json({
@@ -1636,6 +1599,16 @@ async function admin(req: Request, env: Env, url: URL) {
     const displayName = b.display_name === undefined
       ? String(row.display_name ?? project)
       : String(b.display_name ?? "").trim().slice(0, 80) || project;
+    const repoRaw = b.github_repo === undefined
+      ? String(row.github_repo ?? "").trim() : String(b.github_repo ?? "").trim();
+    const branchRaw = b.github_branch === undefined
+      ? String(row.github_branch ?? "").trim() : String(b.github_branch ?? "").trim();
+    const githubRepo = repoRaw ? normalizeGithubRepo(repoRaw) : "";
+    const githubBranch = branchRaw ? normalizeGithubBranch(branchRaw) : "";
+    if (repoRaw && !githubRepo)
+      return err(422, "bad_github_repo", { hint: "github_repo 格式应为 owner/repo，留空则继承环境变量" });
+    if (branchRaw && !githubBranch)
+      return err(422, "bad_github_branch", { hint: "github_branch 只能含字母、数字、. _ / -，且不能有 ..；留空则继承环境变量" });
     const badQuota = (key: string) => err(422, "bad_project_quota", {
       hint: `${key} 必须是范围内的整数`,
     });
@@ -1656,7 +1629,8 @@ async function admin(req: Request, env: Env, url: URL) {
     const before = projectConfigOf(row);
     const after = { project, display_name: displayName, status,
                     max_agents: next.max_agents, max_storage_mb: next.max_storage_mb,
-                    max_msgs_per_min: next.max_msgs_per_min, retention_days: next.retention_days };
+                    max_msgs_per_min: next.max_msgs_per_min, retention_days: next.retention_days,
+                    github_repo: githubRepo, github_branch: githubBranch };
     if (!projectConfigChanged(before, after)) {
       return Response.json({ ok: true, changed: false, project, before, after,
                              updated_by: row.updated_by ?? null, updated_at: row.updated_at ?? null });
@@ -1664,10 +1638,11 @@ async function admin(req: Request, env: Env, url: URL) {
     const now = Date.now();
     await env.DB.prepare(
       `UPDATE projects SET display_name = ?, status = ?, max_agents = ?, max_storage_mb = ?,
-         max_msgs_per_min = ?, retention_days = ?, updated_by = ?, updated_at = ?
+         max_msgs_per_min = ?, retention_days = ?, github_repo = ?, github_branch = ?,
+         updated_by = ?, updated_at = ?
        WHERE project = ?`
     ).bind(displayName, status, next.max_agents, next.max_storage_mb, next.max_msgs_per_min,
-           next.retention_days, actor, now, project).run();
+           next.retention_days, githubRepo || null, githubBranch || null, actor, now, project).run();
     await auditProjectChange(env, project, "update", actor, before, after);
     return Response.json({ ok: true, changed: true, project, before, after,
                            updated_by: actor, updated_at: now });
@@ -1698,22 +1673,6 @@ async function admin(req: Request, env: Env, url: URL) {
     return json({ ok: true, project, entries, migration_required: migrationRequired });
   }
 
-  // 基线仓库配置：repo/branch 写入 D1 覆盖 env；token 只读标记，仍由 secret 管理。
-  if (p === "/admin/config/github" && req.method === "GET") {
-    return json({ ok: true, ...githubConfigPayload(await githubConfig(env)) });
-  }
-  if (p === "/admin/config/github" && (req.method === "PATCH" || req.method === "POST")) {
-    const b: any = await req.json().catch(() => ({}));
-    const saved = await saveGithubConfig(env, { repo: b.repo, branch: b.branch }, actor);
-    if (!saved.ok) {
-      const hint = saved.error === "bad_github_repo" ? "仓库格式应为 owner/repo"
-        : saved.error === "bad_github_branch" ? "分支只能含字母、数字、. _ / -，且不能有 .."
-        : "settings 表不可用，无法保存基线配置";
-      return err(saved.error === "settings_unavailable" ? 503 : 422, saved.error, { hint });
-    }
-    return json({ ok: true, ...githubConfigPayload(saved.config) });
-  }
-
   if (p === "/ver") return json({ ...(await versionPayload()), at: Date.now() });
 
   // /admin/p/{project}/…
@@ -1726,8 +1685,8 @@ async function admin(req: Request, env: Env, url: URL) {
     const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
 
     if (action === "repo/status" && req.method === "GET") {
-      const cfg = await githubConfig(env);
-      const main = await repoMainSha(env);
+      const cfg = await githubConfig(env, project);
+      const main = await repoMainSha(env, project);
       const key = `applymain:${project}`;
       const last = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
         .bind(key).first<any>().catch(() => null);
@@ -1740,7 +1699,7 @@ async function admin(req: Request, env: Env, url: URL) {
     if (action === "repo/applicability" && req.method === "POST") {
       const b: any = await req.json().catch(() => ({}));
       let target = String(b.target_sha ?? "").trim().toLowerCase();
-      if (!target) target = (await repoMainSha(env)).sha ?? "";
+      if (!target) target = (await repoMainSha(env, project)).sha ?? "";
       if (!/^[a-f0-9]{7,64}$/.test(target))
         return err(422, "target_sha_not_hex", { hint: "target_sha 7-64 位十六进制；也可留空用当前配置的基线分支。" });
       const out = await checkCollectedApplies(env, project, target);
@@ -3491,8 +3450,8 @@ function validateReceiptText(text: string, baseSha: string): string[] {
 }
 
 /** S2：base 提交在远端仓库是否存在。配置 GITHUB_REPO 时启用；限流/网络不明时不误杀交付。 */
-async function baseCommitExists(env: Env, sha: string): Promise<boolean | null> {
-  const { repo } = await githubConfig(env);
+async function baseCommitExists(env: Env, project: string, sha: string): Promise<boolean | null> {
+  const { repo } = await githubConfig(env, project);
   if (!repo) return null;
   const key = `basecheck:${repo}:${String(sha).toLowerCase()}`;
   try {
@@ -3738,8 +3697,8 @@ async function githubRepoText(
   }
 }
 
-async function repoMainSha(env: Env): Promise<{ sha: string | null; error?: string; cached: boolean }> {
-  const { repo, branch } = await githubConfig(env);
+async function repoMainSha(env: Env, project = ""): Promise<{ sha: string | null; error?: string; cached: boolean }> {
+  const { repo, branch } = await githubConfig(env, project);
   if (!repo)
     return { sha: null, error: "repo_not_configured", cached: false };
   const key = `repo:main:${repo}:${branch}`;
@@ -3892,7 +3851,7 @@ async function checkSubmissionApplyRow(
     checked_at: Date.now(), checked_by: checkedBy, checked_hunks: 0,
     failed_files: [], failed_lines: [], failures: [], summary: "尚未检查适用性",
   };
-  const { repo } = await githubConfig(env);
+  const { repo } = await githubConfig(env, project);
   if (!repo) return { ...base, error: "repo_not_configured", summary: "未配置基线仓库，无法自动检查" };
   const ref = patchRefFromRow(row);
   if (!ref) return { ...base, state: "error", error: "patch_ref_missing", summary: "交付里找不到 .patch/.diff 文件" };
@@ -4008,7 +3967,7 @@ async function submissionApplies(
   let target = requested.toLowerCase();
   // 不指定 target 时，默认查当前 main；只有远端不可用才退回已存目标。
   if (!target) {
-    const main = await repoMainSha(env);
+    const main = await repoMainSha(env, project);
     target = (main.sha ?? String(row.apply_target_sha ?? "")).toLowerCase();
   }
   // 节点用 git apply --check 上报的权威结果不能被 GET 的静态检查覆盖；
@@ -4140,7 +4099,7 @@ async function deliveryFormatContentMissing(
   if (patchText) {
     const bad = validatePatchText(patchText);
     if (bad) issues.push(bad);
-    const exists = await baseCommitExists(env, baseSha);
+    const exists = await baseCommitExists(env, project, baseSha);
     if (exists === false) issues.push("base_sha_not_remote");
   }
   const receiptText = receiptRef ? await read(receiptRef, "receipt") : null;
