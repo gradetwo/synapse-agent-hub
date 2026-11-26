@@ -23,11 +23,121 @@ if (location.search.includes("reset=1")) {
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="apple-touch-icon" href="/dl/icon-192.png">
 <title>Synapse · 控制台</title>
+<script>
+// 主题三态：auto（跟随设备/系统）/ light / dark。必须在 <style> 前执行，避免首屏闪深色。
+(function () {
+  const KEY = "hub.theme";
+  const VALID = ["auto", "light", "dark"];
+  const mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+  const readPref = () => {
+    try { const v = localStorage.getItem(KEY); return VALID.includes(v) ? v : "auto"; }
+    catch { return "auto"; }
+  };
+  const resolve = (pref) => pref === "auto" ? (mq && mq.matches ? "light" : "dark") : pref;
+  let preference = readPref();
+  function apply(pref, notify) {
+    preference = VALID.includes(pref) ? pref : "auto";
+    const theme = resolve(preference);
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.themePref = preference;
+    document.documentElement.style.colorScheme = theme;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute("content", theme === "light" ? "#f5f7fb" : "#0e1116");
+    const status = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
+    if (status) status.setAttribute("content", theme === "light" ? "default" : "black-translucent");
+    if (notify) document.dispatchEvent(new CustomEvent("synapse:themechange", { detail: { preference, theme } }));
+  }
+  window.SynapseTheme = {
+    get preference() { return preference; },
+    get resolved() { return document.documentElement.dataset.theme || resolve(preference); },
+    set(pref) {
+      preference = VALID.includes(pref) ? pref : "auto";
+      try { localStorage.setItem(KEY, preference); } catch {}
+      apply(preference, true);
+    },
+    cycle() {
+      // auto → 与系统相反的手工模式 → 与系统相同的手工模式 → auto。
+      // 这样自动模式下第一次点击一定有可见变化，也不会丢失回到 auto 的入口。
+      const sys = resolve("auto");
+      if (preference === "auto") this.set(sys === "light" ? "dark" : "light");
+      else if (preference !== sys) this.set(sys);
+      else this.set("auto");
+    },
+  };
+  apply(preference, false);
+  if (mq) {
+    const onSystemChange = () => { if (preference === "auto") apply("auto", true); };
+    if (mq.addEventListener) mq.addEventListener("change", onSystemChange);
+    else if (mq.addListener) mq.addListener(onSystemChange);
+  }
+  window.addEventListener("storage", (e) => {
+    if (e.key === KEY) apply(readPref(), true);
+  });
+})();
+</script>
 <style>
   :root{
+    color-scheme:dark;
     --bg:#0e1116; --panel:#151a21; --line:#232a33; --fg:#e6ebf2; --dim:#8b95a5;
     --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#4c8dff; --radius:10px;
+    /* 界面色：深色为默认，浅色由下方 [data-theme="light"] 覆盖 */
+    --canvas:#0b0f14; --surface-input:#1b222b; --surface-1:#121820;
+    --surface-sheet:#0e1218; --surface-sheet-head:#12171f; --surface-tabs:#0e1319;
+    --surface-2:#10161e; --surface-hover:#12171e;
+    --surface-accent-hover:#121d2a; --surface-accent:#132234; --surface-accent-strong:#1b2b3f;
+    --surface-ok:#101b13; --surface-ok-2:#13251a; --surface-ok-3:#1a3522;
+    --surface-warn:#241b0e; --surface-warn-2:#33250f;
+    --surface-bad:#211012; --surface-bad-2:#261517; --surface-bad-3:#351c1e;
+    --line-soft:#1d2530; --line-strong:#2b3644; --line-faint:#18212b;
+    --fg-strong:#eaf0f8; --fg-soft:#d7e0ea; --fg-code:#b7c4d2; --fg-chip:#9fb0c3;
+    --dim-2:#7d8798; --dim-3:#5d6675;
+    --accent-text:#6aa9ff; --accent-border:#2f6da8; --accent-border-soft:#24406e;
+    --ok-text:#56d364; --ok-soft:#86d99e; --ok-border:#1d3a25; --ok-border-strong:#2f6a43;
+    --warn-text:#ffd58a; --warn-bright:#ffe5ae; --warn-dim:#c9a45c; --warn-soft:#ffbd6b;
+    --warn-border:#674b18; --warn-border-strong:#a87922; --on-warn:#171006;
+    --bad-text:#ff9b9b; --bad-soft:#ff7b72; --bad-border:#5b2626;
+    --purple:#a78bfa; --unknown:#555;
+    --warn-glow:rgba(210,153,34,.08); --overlay:rgba(0,0,0,.55);
+    --gate-bg:rgba(9,12,16,.96); --shadow-soft:rgba(0,0,0,.45); --shadow-strong:rgba(0,0,0,.6);
+    /* 图形色：canvas 不能读取 CSS 变量，JS 通过 getComputedStyle 取这里的最终值 */
+    --chart-msg:#6aa9ff; --chart-sub:#56d364; --chart-issue:#d29922;
+    --chart-grid:#1d2530; --chart-empty:#5d6675; --chart-fg:#e6ebf2; --chart-dim:#7d8798;
+    --chart-cpu:#6aa9ff; --chart-mem:#8ee08e; --chart-disk:#ffc46a;
+    --chart-task-open:#8b98a9; --chart-task-claimed:#6aa9ff; --chart-task-released:#ffd58a;
+    --chart-task-blocked:#ff9b9b; --chart-task-done:#86d99e; --chart-task-failed:#ff7b72;
+    --chart-task-other:#8b98a9; --chart-purple:#a78bfa;
   }
+  :root[data-theme="light"]{
+    color-scheme:light;
+    --bg:#f5f7fb; --panel:#ffffff; --line:#e3e8f0; --fg:#172033; --dim:#667085;
+    --ok:#15803d; --warn:#b45309; --bad:#dc2626; --accent:#2563eb;
+    --canvas:#ffffff; --surface-input:#ffffff; --surface-1:#f8fafc;
+    --surface-sheet:#ffffff; --surface-sheet-head:#f8fafc; --surface-tabs:#f8fafc;
+    --surface-2:#ffffff; --surface-hover:#f3f6fa;
+    --surface-accent-hover:#eef5ff; --surface-accent:#eff6ff; --surface-accent-strong:#dbeafe;
+    --surface-ok:#f0fdf4; --surface-ok-2:#dcfce7; --surface-ok-3:#bbf7d0;
+    --surface-warn:#fffbeb; --surface-warn-2:#fef3c7;
+    --surface-bad:#fef2f2; --surface-bad-2:#fee2e2; --surface-bad-3:#fee2e2;
+    --line-soft:#e8ecf2; --line-strong:#d8e0eb; --line-faint:#edf1f6;
+    --fg-strong:#111827; --fg-soft:#334155; --fg-code:#475569; --fg-chip:#475569;
+    --dim-2:#667085; --dim-3:#6b7280;
+    --accent-text:#2563eb; --accent-border:#93c5fd; --accent-border-soft:#bfdbfe;
+    --ok-text:#15803d; --ok-soft:#15803d; --ok-border:#bbf7d0; --ok-border-strong:#86efac;
+    --warn-text:#b45309; --warn-bright:#92400e; --warn-dim:#92400e; --warn-soft:#b45309;
+    --warn-border:#fcd34d; --warn-border-strong:#f59e0b; --on-warn:#78350f;
+    --bad-text:#b91c1c; --bad-soft:#7f1d1d; --bad-border:#fecaca;
+    --purple:#7c3aed; --unknown:#94a3b8;
+    --warn-glow:rgba(180,83,9,.08); --gate-bg:rgba(248,250,252,.96); --overlay:rgba(15,23,42,.28); --shadow-soft:rgba(15,23,42,.12); --shadow-strong:rgba(15,23,42,.18);
+    --chart-msg:#2563eb; --chart-sub:#16a34a; --chart-issue:#b45309;
+    --chart-grid:#e2e8f0; --chart-empty:#6b7280; --chart-fg:#111827; --chart-dim:#667085;
+    --chart-cpu:#2563eb; --chart-mem:#16a34a; --chart-disk:#b45309;
+    --chart-task-open:#64748b; --chart-task-claimed:#2563eb; --chart-task-released:#b45309;
+    --chart-task-blocked:#dc2626; --chart-task-done:#15803d; --chart-task-failed:#dc2626;
+    --chart-task-other:#64748b; --chart-purple:#7c3aed;
+  }
+  :root[data-theme="light"] .alertbar button.primary{background:#f59e0b;border-color:#f59e0b;color:#451a03}
+  :root[data-theme="light"] .gate{background:var(--gate-bg)}
+  :root[data-theme="light"] .overlay{background:var(--overlay)}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
@@ -38,14 +148,17 @@ if (location.search.includes("reset=1")) {
   #build{max-width:290px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #scope{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #btnMore{display:none}
+  #btnTheme{display:flex;align-items:center;height:34px;width:auto;min-width:76px;padding:0 9px;gap:5px;justify-content:center;font-size:12px;line-height:1;border-color:var(--line-strong);background:var(--surface-input)}
+  #btnTheme .themeIcon{font-size:16px;line-height:1}
+  #btnTheme:hover{border-color:var(--accent-border);color:var(--accent-text)}
   .muted{color:var(--dim);font-size:12px}
   .seg{margin-left:auto;display:flex;gap:8px;align-items:center}
-  select,button,input,textarea{font:inherit;color:var(--fg);background:#1b222b;
+  select,button,input,textarea{font:inherit;color:var(--fg);background:var(--surface-input);
        border:1px solid var(--line);border-radius:8px;padding:7px 10px}
   button{cursor:pointer;transition:border-color .15s ease,color .15s ease,background .15s ease,opacity .15s ease}
   button:disabled{opacity:.45;cursor:not-allowed}
-  button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #2f6da8;outline-offset:2px}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#0b0f14;font-weight:600}
+  button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent-border);outline-offset:2px}
+  button.primary{background:var(--accent);border-color:var(--accent);color:var(--canvas);font-weight:600}
   button.ghost{background:transparent}
   .wrap{padding:16px 18px;display:grid;gap:16px;max-width:1280px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
@@ -53,37 +166,37 @@ if (location.search.includes("reset=1")) {
            color:var(--dim);border-bottom:1px solid var(--line);font-weight:500;display:flex;gap:10px}
   .card>h2 span{margin-left:auto;text-transform:none;letter-spacing:0}
   table{width:100%;border-collapse:collapse}
-  th,td{padding:9px 14px;text-align:left;border-bottom:1px solid #1c232c;white-space:nowrap}
+  th,td{padding:9px 14px;text-align:left;border-bottom:1px solid var(--line-soft);white-space:nowrap}
   th{font-size:11px;color:var(--dim);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
-  tr:hover td{background:#11161d}
+  tr:hover td{background:var(--surface-hover)}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
-  .alive{background:var(--ok)} .late{background:var(--warn)} .offline{background:var(--bad)} .unk{background:#555}
+  .alive{background:var(--ok)} .late{background:var(--warn)} .offline{background:var(--bad)} .unk{background:var(--unknown)}
   .idle td{opacity:.5}
   .num{text-align:right;font-variant-numeric:tabular-nums}
   .warnv{color:var(--warn)} .badv{color:var(--bad)}
   .badge{font-size:11px;padding:1px 8px;border-radius:20px;border:1px solid var(--line);color:var(--dim)}
-  .badge.delivered{color:var(--accent);border-color:#24406e}
-  .badge.collected{color:var(--ok);border-color:#1d3a25}
+  .badge.delivered{color:var(--accent);border-color:var(--accent-border-soft)}
+  .badge.collected{color:var(--ok);border-color:var(--ok-border)}
   .badge.archived{opacity:.55}
   /* 任务台账：状态必须一眼可辨，不要只靠颜色（手机/色弱） */
-  .badge.open{color:#9aa4b2;border-color:#2a333f}
-  .badge.claimed{color:#8fb8ff;border-color:#24406e;background:#101a2a}
-  .badge.released{color:#ffd58a;border-color:#674b18;background:#241b0e}
-  .badge.blocked{color:#ff9b9b;border-color:#5b2626;background:#211012}
-  .badge.done{color:#86d99e;border-color:#1d3a25;background:#101b13}
-  .badge.failed{color:#ffb3ad;border-color:#6b2b2b;background:#241012}
-  .badge.pending{color:#ffd58a;border-color:#674b18;background:#241b0e}
-  .badge.accepted{color:#8fb8ff;border-color:#24406e;background:#101a2a}
-  .badge.approved{color:#86d99e;border-color:#1d3a25;background:#101b13}
-  .badge.rejected{color:#ff9b9b;border-color:#5b2626;background:#211012}
-  .badge.overtake{color:#ffb86b;border-color:#6b4218;background:#24180e}
-  .badge.issue-open{color:#ffd58a;border-color:#674b18;background:#241b0e}
-  .badge.issue-closed{color:#86d99e;border-color:#1d3a25;background:#101b13}
-  .badge.issue-merged{color:#8fb8ff;border-color:#24406e;background:#101a2a}
-  .badge.pri-low{color:#8b95a5;border-color:#2a333f}
-  .badge.pri-normal{color:#9aa4b2;border-color:#2a333f}
-  .badge.pri-high{color:#ffb86b;border-color:#6b4218}
-  .badge.pri-urgent{color:#ff9b9b;border-color:#5b2626;background:#211012}
+  .badge.open{color:var(--dim-2);border-color:var(--line-strong)}
+  .badge.claimed{color:var(--accent-text);border-color:var(--accent-border-soft);background:var(--surface-accent)}
+  .badge.released{color:var(--warn-text);border-color:var(--warn-border);background:var(--surface-warn)}
+  .badge.blocked{color:var(--bad-text);border-color:var(--bad-border);background:var(--surface-bad)}
+  .badge.done{color:var(--ok-soft);border-color:var(--ok-border);background:var(--surface-ok)}
+  .badge.failed{color:var(--bad-text);border-color:var(--bad-border);background:var(--surface-bad)}
+  .badge.pending{color:var(--warn-text);border-color:var(--warn-border);background:var(--surface-warn)}
+  .badge.accepted{color:var(--accent-text);border-color:var(--accent-border-soft);background:var(--surface-accent)}
+  .badge.approved{color:var(--ok-soft);border-color:var(--ok-border);background:var(--surface-ok)}
+  .badge.rejected{color:var(--bad-text);border-color:var(--bad-border);background:var(--surface-bad)}
+  .badge.overtake{color:var(--warn-soft);border-color:var(--warn-border);background:var(--surface-warn)}
+  .badge.issue-open{color:var(--warn-text);border-color:var(--warn-border);background:var(--surface-warn)}
+  .badge.issue-closed{color:var(--ok-soft);border-color:var(--ok-border);background:var(--surface-ok)}
+  .badge.issue-merged{color:var(--accent-text);border-color:var(--accent-border-soft);background:var(--surface-accent)}
+  .badge.pri-low{color:var(--dim);border-color:var(--line-strong)}
+  .badge.pri-normal{color:var(--dim-2);border-color:var(--line-strong)}
+  .badge.pri-high{color:var(--warn-soft);border-color:var(--warn-border)}
+  .badge.pri-urgent{color:var(--bad-text);border-color:var(--bad-border);background:var(--surface-bad)}
   .taskForm .row{grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr)}
   .taskForm .row3{display:grid;grid-template-columns:minmax(0,1fr) 104px;gap:10px;align-items:center}
   .taskForm .row3 > .muted{grid-column:1/-1;font-size:11px;line-height:1.5}
@@ -93,19 +206,19 @@ if (location.search.includes("reset=1")) {
   @media(max-width:640px){.taskForm .row,.taskForm .row3{grid-template-columns:1fr}.taskRow select{max-width:100%}}
   /* 待取交付的全局提醒：不是普通提示条，必须一直可见直到取走 */
   .alertbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;
-    border:1px solid #674b18;border-radius:var(--radius);background:#241b0e;color:#ffd58a;
-    box-shadow:0 0 0 1px rgba(210,153,34,.08) inset}
+    border:1px solid var(--warn-border);border-radius:var(--radius);background:var(--surface-warn);color:var(--warn-text);
+    box-shadow:0 0 0 1px var(--warn-glow) inset}
   .alertbar[hidden]{display:none!important}
   .alertbar .grow{flex:1;min-width:220px}
-  .alertbar b{color:#ffe5ae}
-  .alertbar .hint{color:#c9a45c;font-size:12px}
+  .alertbar b{color:var(--warn-bright)}
+  .alertbar .hint{color:var(--warn-dim);font-size:12px}
   .alertbar .acts{display:flex;gap:8px;flex-wrap:wrap}
-  .alertbar button{border-color:#674b18;background:#33250f;color:#ffe5ae}
-  .alertbar button.primary{background:#d29922;border-color:#d29922;color:#171006}
+  .alertbar button{border-color:var(--warn-border);background:var(--surface-warn-2);color:var(--warn-bright)}
+  .alertbar button.primary{background:var(--warn);border-color:var(--warn);color:var(--on-warn)}
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;
     max-width:min(560px,92vw);padding:10px 14px;border-radius:9px;
-    background:#1b222b;border:1px solid #674b18;color:#ffe5ae;font-size:13px;
-    box-shadow:0 10px 30px rgba(0,0,0,.45)}
+    background:var(--surface-input);border:1px solid var(--warn-border);color:var(--warn-bright);font-size:13px;
+    box-shadow:0 10px 30px var(--shadow-soft)}
   .toast[hidden]{display:none!important}
   .form{display:grid;gap:10px;padding:14px}
   .form label{display:grid;gap:5px;font-size:12px;color:var(--dim)}
@@ -118,12 +231,14 @@ if (location.search.includes("reset=1")) {
   .foot{padding:10px 18px;color:var(--dim);font-size:11px;border-top:1px solid var(--line)}
   textarea{min-height:58px;resize:vertical}
   /* 未认证时整页锁住：不显示任何业务界面 */
-  .gate{position:fixed;inset:0;background:rgba(9,12,16,.96);display:none;
+  .gate{position:fixed;inset:0;background:var(--gate-bg);display:none;
         align-items:center;justify-content:center;z-index:50}
   body.locked .gate{display:flex}
   body.locked .wrap,body.locked .bar .seg{display:none}
-  .gate .box{width:min(420px,90vw);background:var(--panel);border:1px solid var(--line);
+  .gate .box{position:relative;width:min(420px,90vw);background:var(--panel);border:1px solid var(--line);
         border-radius:12px;padding:22px;display:grid;gap:12px}
+  .gate .gateTheme{position:absolute;top:10px;right:10px;width:32px;height:32px;min-width:32px!important;
+        padding:0;border-color:var(--line-strong);background:var(--surface-1);font-size:16px}
   .gate h2{margin:0;font-size:15px;font-weight:600}
   .gate p{margin:0;color:var(--dim);font-size:12px;line-height:1.6}
   .gate input{width:100%;padding:9px 11px;font-family:ui-monospace,Menlo,monospace}
@@ -132,39 +247,39 @@ if (location.search.includes("reset=1")) {
 
   /* 概览：手机上一眼看到数字 */
   .roster tbody tr.clickable{cursor:pointer}
-  .roster tbody tr.clickable:hover{background:#12171e}
+  .roster tbody tr.clickable:hover{background:var(--surface-hover)}
   .card.collapsed .cardBody{display:none}
-  .card.maxed{position:fixed;inset:8px;z-index:15;max-height:none;overflow:auto;box-shadow:0 18px 60px rgba(0,0,0,.6)}
-  .card.maxed>h2{position:sticky;top:0;z-index:2;background:#0e1218;padding:8px 0;margin:0 0 6px;
-    border-bottom:1px solid #1c2430}
+  .card.maxed{position:fixed;inset:8px;z-index:15;max-height:none;overflow:auto;box-shadow:0 18px 60px var(--shadow-strong)}
+  .card.maxed>h2{position:sticky;top:0;z-index:2;background:var(--surface-sheet);padding:8px 0;margin:0 0 6px;
+    border-bottom:1px solid var(--line-soft)}
   /* 最大化时给一个"永远在屏幕里"的退出按钮，手机上也点得到 */
   #maxExit{display:none;position:fixed;right:12px;z-index:15;
     top:calc(env(safe-area-inset-top) + 12px);padding:8px 14px;border-radius:10px;
-    border:1px solid #2f6da8;background:#132234;color:#eaf0f8;font:600 13px/1 -apple-system,sans-serif}
+    border:1px solid var(--accent-border);background:var(--surface-accent);color:var(--fg-strong);font:600 13px/1 -apple-system,sans-serif}
   body.has-max #maxExit{display:block}
   body.has-max,body.has-sheet{overflow:hidden}
   .cardTools{margin-left:auto;display:flex;gap:6px}
-  thead th{position:sticky;top:0;background:#0b0f14;z-index:1;box-shadow:0 1px 0 #1c2430}
-  .tabs{position:sticky;top:0;z-index:5;display:flex;gap:6px;padding:8px 0;background:linear-gradient(#0b0f14 70%,transparent);overflow-x:auto}
-  .tabs button{flex:0 0 auto;padding:7px 14px;border-radius:8px;border:1px solid #202836;background:#0e1319;color:#9aa4b2;font-size:13px}
-  .tabs button.on{color:#eaf0f8;border-color:#2f6da8;background:#132234}
-  .tabs .cnt{color:#7d8798;font-size:11px;margin-left:4px}
+  thead th{position:sticky;top:0;background:var(--canvas);z-index:1;box-shadow:0 1px 0 var(--line-soft)}
+  .tabs{position:sticky;top:0;z-index:5;display:flex;gap:6px;padding:8px 0;background:linear-gradient(var(--canvas) 70%,transparent);overflow-x:auto}
+  .tabs button{flex:0 0 auto;padding:7px 14px;border-radius:8px;border:1px solid var(--line-soft);background:var(--surface-tabs);color:var(--dim-2);font-size:13px}
+  .tabs button.on{color:var(--fg-strong);border-color:var(--accent-border);background:var(--surface-accent)}
+  .tabs .cnt{color:var(--dim-2);font-size:11px;margin-left:4px}
   .sndForm{display:grid;gap:10px;padding:12px 14px 14px}
   .quick{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}
   .sndTop{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(120px,.75fr) auto;gap:8px;align-items:center}
   .sndTop select,.sndTop button{width:100%;min-height:38px}
   .sndTop button{min-width:74px}
   .sndLabel{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:8px;margin-top:2px}
-  .sndLabel span{font-size:11px;color:#7d8798}
+  .sndLabel span{font-size:11px;color:var(--dim-2)}
   .sndFields{display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:8px}
   .sndFields input,.sndFields select,.sndForm textarea{width:100%;box-sizing:border-box}
   .sndForm textarea{min-height:88px}
   .sndActions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .sndActions button{min-width:88px}
   .permBar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0 8px}
-  .permRole{font-size:12.5px;color:#9aa4b2;border:1px solid #232a33;border-radius:6px;padding:4px 8px}
-  .permRole.admin{color:#eaf0f8;border-color:#2f6da8;background:#132234}
-  .permTtl{display:flex;align-items:center;gap:6px;font-size:12px;color:#7d8798}
+  .permRole{font-size:12.5px;color:var(--dim-2);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+  .permRole.admin{color:var(--fg-strong);border-color:var(--accent-border);background:var(--surface-accent)}
+  .permTtl{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim-2)}
   .permTtl select{min-height:34px;padding:4px 8px}
   .permGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .permGrid .primary{grid-column:1 / -1;min-height:40px}
@@ -175,10 +290,10 @@ if (location.search.includes("reset=1")) {
   .mini{padding:1px 7px;font-size:12px;line-height:18px;border-radius:6px}
   .card h2{display:flex;align-items:center;gap:8px}
   .overlay[hidden]{display:none!important}
-  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:20;padding:16px}
-  .sheet{background:#0e1218;border:1px solid #222a35;border-radius:12px;width:min(920px,96vw);max-height:88vh;
+  .overlay{position:fixed;inset:0;background:var(--overlay);display:flex;align-items:center;justify-content:center;z-index:20;padding:16px}
+  .sheet{background:var(--surface-sheet);border:1px solid var(--line-soft);border-radius:12px;width:min(920px,96vw);max-height:88vh;
     display:flex;flex-direction:column;overflow:hidden;padding:0;min-width:0}
-  .sheetHead{padding:12px 16px;border-bottom:1px solid #1c2430;background:#12171f;flex:0 0 auto}
+  .sheetHead{padding:12px 16px;border-bottom:1px solid var(--line-soft);background:var(--surface-sheet-head);flex:0 0 auto}
   .sheetBody{overflow:auto;-webkit-overflow-scrolling:touch;padding:12px 16px 16px;flex:1 1 auto;min-height:0;min-width:0}
   .sheetHead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
   #trendMeta{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
@@ -193,7 +308,7 @@ if (location.search.includes("reset=1")) {
     .card.maxed{inset:0;border-radius:0;height:100dvh;
       padding:calc(6px + env(safe-area-inset-top)) 12px calc(18px + env(safe-area-inset-bottom))}
   }
-  canvas{width:100%;height:46px;display:block;background:#0b0f14;border:1px solid #1d2530;border-radius:8px}
+  canvas{width:100%;height:46px;display:block;background:var(--canvas);border:1px solid var(--line-soft);border-radius:8px}
   /* 详情页趋势压成一条三列窄带：移动端不再纵向占三屏 */
   .charts{grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:8px}
   .charts .cap{font-size:10px;margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -212,30 +327,30 @@ if (location.search.includes("reset=1")) {
   @media(max-width:520px){.permBar .permActions{margin-left:0;width:100%}.permBar .permActions button{flex:1}}
   /* 详情页细粒度权限：一行可勾选的 chip，保存只改 scopes、不重签 token */
   .scopeGrid{display:flex;flex-wrap:wrap;gap:6px}
-  .scopeGrid label{display:flex;align-items:center;gap:5px;padding:5px 8px;border:1px solid #232a33;
-    border-radius:7px;background:#151b23;font-size:12px;cursor:pointer;user-select:none}
-  .scopeGrid label.on{border-color:#3b5b86;background:#172234}
+  .scopeGrid label{display:flex;align-items:center;gap:5px;padding:5px 8px;border:1px solid var(--line);
+    border-radius:7px;background:var(--surface-1);font-size:12px;cursor:pointer;user-select:none}
+  .scopeGrid label.on{border-color:var(--accent-border-soft);background:var(--surface-accent)}
   .scopeGrid label .cap{display:inline;margin:0;font-size:10.5px;text-transform:none;letter-spacing:0}
   .scopeGrid input{width:auto;height:14px;min-height:0;margin:0;flex:0 0 auto}
-  .scopeHint{font-size:11px;color:#7d8798}
+  .scopeHint{font-size:11px;color:var(--dim-2)}
   /* 注册审批：权限折叠成 chip，动作只留 ✓/✕，Agent ID 可就地改 */
   .enrIdInput{width:148px;min-width:122px;padding:5px 8px;font:12.5px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;box-sizing:border-box}
-  .enrIdHint{display:block;font-size:10px;color:#7d8798;margin-top:2px}
+  .enrIdHint{display:block;font-size:10px;color:var(--dim-2);margin-top:2px}
   .scopeDetails{display:inline-block;max-width:330px;vertical-align:top}
-  .scopeDetails summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;color:#cbd5e1}
+  .scopeDetails summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg-soft)}
   .scopeDetails summary::-webkit-details-marker{display:none}
-  .scopeDetails summary .lead{color:#7d8798}
-  .scopeDetails[open] summary{color:#e6edf5}
+  .scopeDetails summary .lead{color:var(--dim-2)}
+  .scopeDetails[open] summary{color:var(--fg-strong)}
   .scopeChips{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;max-width:330px}
-  .scopeChip{font-size:11px;line-height:1.5;padding:2px 6px;border:1px solid #263343;border-radius:999px;background:#151d27;color:#9fb0c3;white-space:nowrap}
+  .scopeChip{font-size:11px;line-height:1.5;padding:2px 6px;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-1);color:var(--fg-chip);white-space:nowrap}
   .scopeChip.raw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .enrActions{display:flex;gap:6px}
   .actIcon{width:32px;height:32px;min-width:32px!important;padding:0;font-size:17px;line-height:1;border-radius:8px;
     display:inline-flex;align-items:center;justify-content:center}
-  .actIcon.ok{color:#56d364;border-color:#2f6a43;background:#13251a}
-  .actIcon.ok:hover{background:#1a3522}
-  .actIcon.no{color:#ff7b72;border-color:#6b2f32;background:#261517}
-  .actIcon.no:hover{background:#351c1e}
+  .actIcon.ok{color:var(--ok-text);border-color:var(--ok-border-strong);background:var(--surface-ok-2)}
+  .actIcon.ok:hover{background:var(--surface-ok-3)}
+  .actIcon.no{color:var(--bad-soft);border-color:var(--bad-border);background:var(--surface-bad-2)}
+  .actIcon.no:hover{background:var(--surface-bad-3)}
   .enrTableWrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
   @media(max-width:720px){
     /* 手机端审批不再横向滚表格：每条申请变成一张小块，✓/✕ 永远在右侧可见 */
@@ -244,7 +359,7 @@ if (location.search.includes("reset=1")) {
     .enrTableWrap{overflow:visible}
     #enr{display:grid;gap:8px}
     #enr tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;
-      padding:10px;border:1px solid #202936;border-radius:10px;background:#11161d}
+      padding:10px;border:1px solid var(--line-soft);border-radius:10px;background:var(--surface-1)}
     #enr td{padding:0;border:0;display:block}
     #enr td:nth-child(1){grid-column:1;grid-row:1}
     #enr td:nth-child(5){grid-column:2;grid-row:1;align-self:center}
@@ -261,65 +376,65 @@ if (location.search.includes("reset=1")) {
   .sheetHead #dName{min-width:0;overflow-wrap:anywhere}
   .sheetHead #dMeta{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
   .agentStats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin:2px 0 10px}
-  .agentStat{background:#151b23;border:1px solid #222c38;border-radius:9px;padding:8px 9px;min-width:0}
-  .agentStat .k{font-size:10.5px;color:#8b98a9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .agentStat .v{font-size:19px;font-weight:700;color:#e6edf5;line-height:1.2;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .agentStat .s{font-size:10.5px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .agentStat.ok .v{color:#7ee787}.agentStat.warn .v{color:#ffa657}.agentStat.accent .v{color:#79c0ff}
+  .agentStat{background:var(--surface-1);border:1px solid var(--line-soft);border-radius:9px;padding:8px 9px;min-width:0}
+  .agentStat .k{font-size:10.5px;color:var(--dim-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agentStat .v{font-size:19px;font-weight:700;color:var(--fg-strong);line-height:1.2;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agentStat .s{font-size:10.5px;color:var(--dim-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agentStat.ok .v{color:var(--ok-soft)}.agentStat.warn .v{color:var(--warn-soft)}.agentStat.accent .v{color:var(--accent-text)}
   /* Client 详情：最后一次启动现场。auto=false 时用橙色，避免被当成普通元信息。 */
-  .launchCard{background:#11161d;border:1px solid #202936;border-radius:9px;padding:9px 10px;margin:0 0 10px;min-width:0}
+  .launchCard{background:var(--surface-1);border:1px solid var(--line-soft);border-radius:9px;padding:9px 10px;margin:0 0 10px;min-width:0}
   .launchTop{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .launchTop .cap{margin:0;flex:1;min-width:120px}
-  .launchBadge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid #2a333f;color:#9aa4b2;white-space:nowrap}
-  .launchBadge.off{color:#ffbd6b;border-color:#674b18;background:#241b0e}
-  .launchBadge.on{color:#86d99e;border-color:#1d3a25;background:#101b13}
-  .launchBadge.unknown{color:#9aa4b2;border-color:#2a333f}
-  .launchMeta{font-size:11px;color:#7d8798;margin:4px 0 7px;overflow-wrap:anywhere}
+  .launchBadge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line-strong);color:var(--dim-2);white-space:nowrap}
+  .launchBadge.off{color:var(--warn-soft);border-color:var(--warn-border);background:var(--surface-warn)}
+  .launchBadge.on{color:var(--ok-soft);border-color:var(--ok-border);background:var(--surface-ok)}
+  .launchBadge.unknown{color:var(--dim-2);border-color:var(--line-strong)}
+  .launchMeta{font-size:11px;color:var(--dim-2);margin:4px 0 7px;overflow-wrap:anywhere}
   .launchGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px 12px}
   .launchKv{min-width:0}
-  .launchKv span{display:block;font-size:10.5px;color:#7d8798;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .launchKv b{display:block;font-size:11.5px;font-weight:500;color:#d7e0ea;overflow-wrap:anywhere;margin-top:1px}
-  .launchKv b.warnv{color:#ffbd6b}
+  .launchKv span{display:block;font-size:10.5px;color:var(--dim-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .launchKv b{display:block;font-size:11.5px;font-weight:500;color:var(--fg-soft);overflow-wrap:anywhere;margin-top:1px}
+  .launchKv b.warnv{color:var(--warn-soft)}
   .ctrlGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px 12px;margin:7px 0}
-  .ctrlGrid label{display:block;font-size:10.5px;color:#7d8798}
-  .ctrlGrid select,.ctrlGrid input{width:100%;margin-top:3px;background:#0b0f14;color:#d7e0ea;border:1px solid #2a333f;border-radius:6px;padding:5px 6px;font-size:11.5px}
+  .ctrlGrid label{display:block;font-size:10.5px;color:var(--dim-2)}
+  .ctrlGrid select,.ctrlGrid input{width:100%;margin-top:3px;background:var(--canvas);color:var(--fg-soft);border:1px solid var(--line-strong);border-radius:6px;padding:5px 6px;font-size:11.5px}
   .ctrlBtns{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-  .ctrlHint{font-size:11px;color:#7d8798;margin-top:7px;overflow-wrap:anywhere}
-  .ctrlHint.warnv{color:#ffbd6b}
-  .diagList{max-height:260px;overflow:auto;margin-top:6px;border-top:1px solid #202936}
-  .diagItem{padding:6px 0;border-bottom:1px solid #1a222c;font-size:11px;overflow-wrap:anywhere}
-  .diagItem b{color:#ffbd6b;font-weight:500}
-  .diagItem span{color:#7d8798;margin-right:6px}
-  .diagItem pre{margin:3px 0 0;white-space:pre-wrap;color:#9aa4b2;font-size:10.5px}
-  .launchDetails{margin-top:8px;background:#0b0f14}
+  .ctrlHint{font-size:11px;color:var(--dim-2);margin-top:7px;overflow-wrap:anywhere}
+  .ctrlHint.warnv{color:var(--warn-soft)}
+  .diagList{max-height:260px;overflow:auto;margin-top:6px;border-top:1px solid var(--line-soft)}
+  .diagItem{padding:6px 0;border-bottom:1px solid var(--line-faint);font-size:11px;overflow-wrap:anywhere}
+  .diagItem b{color:var(--warn-soft);font-weight:500}
+  .diagItem span{color:var(--dim-2);margin-right:6px}
+  .diagItem pre{margin:3px 0 0;white-space:pre-wrap;color:var(--dim-2);font-size:10.5px}
+  .launchDetails{margin-top:8px;background:var(--canvas)}
   .launchDetails .launchSection{margin-top:7px}
-  .launchPre{margin:3px 0 0;padding:7px 8px;border:1px solid #1d2530;border-radius:6px;background:#0b0f14;
-    color:#b7c4d2;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
+  .launchPre{margin:3px 0 0;padding:7px 8px;border:1px solid var(--line-soft);border-radius:6px;background:var(--canvas);
+    color:var(--fg-code);font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
     overflow-wrap:anywhere;max-height:180px;overflow:auto}
   .agentViz{display:grid;grid-template-columns:1.02fr 1fr;gap:10px}
-  .vizBox{background:#11161d;border:1px solid #202936;border-radius:9px;padding:9px 10px;min-width:0}
+  .vizBox{background:var(--surface-1);border:1px solid var(--line-soft);border-radius:9px;padding:9px 10px;min-width:0}
   .vizBox .cap{margin-bottom:5px}
   .donut{height:112px;background:transparent;border:0;border-radius:0}
-  .vizLegend{display:flex;flex-wrap:wrap;gap:5px 9px;font-size:11px;color:#9aa7b7;margin-top:4px}
+  .vizLegend{display:flex;flex-wrap:wrap;gap:5px 9px;font-size:11px;color:var(--dim-2);margin-top:4px}
   .vizLegend span{display:inline-flex;align-items:center;gap:4px}
   .vizDot{width:8px;height:8px;border-radius:50%;display:inline-block}
   .workBars{display:grid;gap:8px;padding:3px 0}
-  .workBar .t{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;color:#9aa7b7}
-  .workBar .t b{color:#e6edf5;font-size:12px}
-  .barTrack{height:7px;border-radius:999px;background:#1c2530;overflow:hidden;margin-top:4px}
-  .barFill{height:100%;border-radius:999px;background:#4c8dff}
+  .workBar .t{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--dim-2)}
+  .workBar .t b{color:var(--fg-strong);font-size:12px}
+  .barTrack{height:7px;border-radius:999px;background:var(--line-soft);overflow:hidden;margin-top:4px}
+  .barFill{height:100%;border-radius:999px;background:var(--accent)}
   .workList{max-height:300px;overflow:auto;-webkit-overflow-scrolling:touch}
-  .workList .workRow{display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid #18212b;font-size:12.5px}
+  .workList .workRow{display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--line-faint);font-size:12.5px}
   .workList .workRow:last-child{border-bottom:0}
-  .workList .tid{font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#8fa6c0;white-space:nowrap}
-  .workList .wtitle{color:#d7e0ea;flex:1;min-width:120px;overflow-wrap:anywhere}
-  .workList .when{font-size:11px;color:#7d8798;margin-left:auto;white-space:nowrap}
-  .permDetails{border:1px solid #202936;border-radius:9px;background:#0f151c;padding:8px 10px;margin-top:10px}
-  .permDetails summary{cursor:pointer;font-size:12.5px;color:#9fb0c3;list-style:none;display:flex;align-items:center;gap:8px}
+  .workList .tid{font:11.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim-2);white-space:nowrap}
+  .workList .wtitle{color:var(--fg-soft);flex:1;min-width:120px;overflow-wrap:anywhere}
+  .workList .when{font-size:11px;color:var(--dim-2);margin-left:auto;white-space:nowrap}
+  .permDetails{border:1px solid var(--line-soft);border-radius:9px;background:var(--surface-1);padding:8px 10px;margin-top:10px}
+  .permDetails summary{cursor:pointer;font-size:12.5px;color:var(--fg-chip);list-style:none;display:flex;align-items:center;gap:8px}
   .permDetails summary::-webkit-details-marker{display:none}
-  .permDetails[open] summary{color:#e6edf5;margin-bottom:6px}
-  .permDetails summary .lead{color:#7d8798;font-size:11px}
-  #dPermSummary{font-size:11px;color:#7d8798}
+  .permDetails[open] summary{color:var(--fg-strong);margin-bottom:6px}
+  .permDetails summary .lead{color:var(--dim-2);font-size:11px}
+  #dPermSummary{font-size:11px;color:var(--dim-2)}
   @media(max-width:720px){
     .scopeGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
     .scopeGrid label{min-width:0;flex-wrap:wrap}
@@ -332,95 +447,95 @@ if (location.search.includes("reset=1")) {
     .workList .when{margin-left:0}
   }
 
-  .cap{font-size:11px;color:#7d8798;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
+  .cap{font-size:11px;color:var(--dim-2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
   .list{font-size:12.5px}
-  .list .row{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid #151b23}
+  .list .row{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--line-faint)}
   .list .row .badge{flex:0 0 auto}
-  .who{display:flex;flex-wrap:wrap;gap:8px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#11161d}
-  .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid #232a33;border-radius:8px;background:#151b23}
+  .who{display:flex;flex-wrap:wrap;gap:8px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface-1)}
+  .whoItem{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 9px;border:1px solid var(--line);border-radius:8px;background:var(--surface-input)}
   .whoItem input{width:auto;height:15px;min-height:0;margin:0;flex:0 0 auto}
   .stats{display:grid;gap:8px;margin-top:8px;grid-template-columns:repeat(7,minmax(0,1fr))}
   .obsKpis{display:grid;gap:8px;grid-template-columns:repeat(6,minmax(0,1fr));padding:0 14px 12px}
   .obsKpis .stat{min-width:0}
   .obsGrid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,.65fr);gap:10px;padding:0 14px 14px}
-  .obsPanel{min-width:0;background:#121820;border:1px solid #1d2530;border-radius:10px;padding:10px}
+  .obsPanel{min-width:0;background:var(--surface-1);border:1px solid var(--line-soft);border-radius:10px;padding:10px}
   .obsPanel .dashHead{margin-bottom:7px}
   .obsLane{display:grid;grid-template-columns:minmax(110px,1fr) 46px 44px 44px 72px 58px;gap:8px;align-items:center;
-    padding:7px 8px;border-top:1px solid #1d2530;font-size:11px}
+    padding:7px 8px;border-top:1px solid var(--line-soft);font-size:11px}
   .obsLane:first-child{border-top:0}
-  .obsLane .bar{height:5px;background:#202a36;border-radius:3px;overflow:hidden}
+  .obsLane .bar{height:5px;background:var(--line-soft);border-radius:3px;overflow:hidden}
   .obsLane .bar i{display:block;height:100%;background:var(--accent)}
   .obsDead{display:grid;gap:6px;max-height:260px;overflow:auto}
-  .obsDead button{text-align:left;background:#161e27;border:1px solid #2a3543;border-radius:7px;padding:7px 8px;color:var(--fg)}
-  .obsDead .tid{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#9ecbff}
-  .obsDead .err{color:#ffb3ad;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .obsDead button{text-align:left;background:var(--surface-1);border:1px solid var(--line-strong);border-radius:7px;padding:7px 8px;color:var(--fg)}
+  .obsDead .tid{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--accent-text)}
+  .obsDead .err{color:var(--bad-text);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   @media(max-width:1100px){.obsKpis{grid-template-columns:repeat(3,1fr)}.obsGrid{grid-template-columns:1fr}}
-  .stat{position:relative;background:#1b222b;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;overflow:hidden}
+  .stat{position:relative;background:var(--surface-input);border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;overflow:hidden}
   .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:transparent}
   .stat.ok::before{background:var(--ok)}
   .stat.warn::before{background:var(--warn)}
   .stat.accent::before{background:var(--accent)}
-  .stat.warn .v{color:#ffd58a}
-  .stat.accent .v{color:#8fb8ff}
-  .stat:hover{border-color:#2b3644}
+  .stat.warn .v{color:var(--warn-text)}
+  .stat.accent .v{color:var(--accent-text)}
+  .stat:hover{border-color:var(--line-strong)}
   .stat .k{color:var(--dim);font-size:11px;letter-spacing:.02em}
   .stat .v{font-size:19px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
   .stat .sub{display:block;font-size:10px;color:var(--dim);font-weight:400;margin-top:1px}
   .ovBody{padding:0 14px 14px}
   .dashGrid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr) minmax(0,1.3fr);gap:10px;margin-top:10px}
-  .dashTile{min-width:0;background:#121820;border:1px solid #1d2530;border-radius:10px;padding:10px}
+  .dashTile{min-width:0;background:var(--surface-1);border:1px solid var(--line-soft);border-radius:10px;padding:10px}
   .dashHead{display:flex;align-items:center;gap:8px;margin-bottom:7px;color:var(--dim);
     font-size:11px;letter-spacing:.4px;text-transform:uppercase}
   .dashHead span{margin-left:auto;text-transform:none;letter-spacing:0;font-size:11px}
   .miniRow{display:grid;grid-template-columns:32px minmax(0,1fr) 38px;align-items:center;gap:6px}
   .miniRow .lab{font-size:11px;color:var(--dim)}
   .miniRow .num{font-size:11px;color:var(--fg);text-align:right;font-variant-numeric:tabular-nums}
-  .stack{display:flex;width:100%;height:12px;border-radius:999px;overflow:hidden;background:#0b0f14;border:1px solid #1d2530}
+  .stack{display:flex;width:100%;height:12px;border-radius:999px;overflow:hidden;background:var(--canvas);border:1px solid var(--line-soft)}
   .stack .seg{height:100%;min-width:2px}
-  .stack .stackEmpty{display:flex;align-items:center;padding-left:7px;color:#5d6675;font-size:10px}
+  .stack .stackEmpty{display:flex;align-items:center;padding-left:7px;color:var(--dim-3);font-size:10px}
   .legend{display:flex;flex-wrap:wrap;gap:5px 9px;margin-top:7px}
   .legend button{display:inline-flex;align-items:center;gap:5px;padding:2px 6px;border:0;border-radius:6px;
-    min-height:0;background:transparent;color:#8b95a5;font-size:11px;line-height:18px;white-space:nowrap}
-  .legend button:hover{background:#19212b;color:var(--fg)}
-  .legend button.on{background:#132234;color:#eaf0f8}
+    min-height:0;background:transparent;color:var(--dim);font-size:11px;line-height:18px;white-space:nowrap}
+  .legend button:hover{background:var(--surface-hover);color:var(--fg)}
+  .legend button.on{background:var(--surface-accent);color:var(--fg-strong)}
   .legend button.zero{opacity:.45}
   .legend i{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
   .legend b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
   .dashWarn{width:100%;margin-top:8px;padding:5px 9px;text-align:left;border-radius:7px;
-    border:1px solid #674b18;background:#241b0e;color:#ffd58a;font-size:11px;min-height:28px}
+    border:1px solid var(--warn-border);background:var(--surface-warn);color:var(--warn-text);font-size:11px;min-height:28px}
   .dashWarn[hidden]{display:none!important}
-  .dashWarn:hover{border-color:#a87922;color:#ffe5ae}
+  .dashWarn:hover{border-color:var(--warn-border-strong);color:var(--warn-bright)}
   .projStrip{display:flex;gap:8px;overflow-x:auto;margin-top:10px;padding-bottom:2px}
   .projStrip[hidden]{display:none!important}
   .projChip{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:6px 10px;
-    border:1px solid #232a33;border-radius:8px;background:#121820;color:var(--fg);min-height:34px}
+    border:1px solid var(--line);border-radius:8px;background:var(--surface-1);color:var(--fg);min-height:34px}
   .projChip b{font-size:12px;font-weight:600}
   .projChip span{font-size:11px;color:var(--dim);white-space:nowrap}
-  .projChip:hover{border-color:#2f6da8;background:#132234}
+  .projChip:hover{border-color:var(--accent-border);background:var(--surface-accent)}
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
 .dashTile.clickable{cursor:pointer}
-.dashTile.clickable:hover,.dashTile.clickable:focus-visible{border-color:#2f6da8;background:#121d2a;outline:0}
-.dashMore{font-size:10px;color:#8fb8ff;border:1px solid #24406e;border-radius:6px;padding:2px 6px;white-space:nowrap}
+.dashTile.clickable:hover,.dashTile.clickable:focus-visible{border-color:var(--accent-border);background:var(--surface-accent-hover);outline:0}
+.dashMore{font-size:10px;color:var(--accent-text);border:1px solid var(--accent-border-soft);border-radius:6px;padding:2px 6px;white-space:nowrap}
 .trendToolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 10px}
-.trendSeg{display:inline-flex;align-items:center;gap:2px;padding:2px;border:1px solid #1d2530;border-radius:8px;background:#10161e}
-.trendSeg button{background:transparent;border:0;border-radius:6px;padding:5px 10px;min-height:28px;font-size:12px;color:#8b95a5}
-.trendSeg button.on{background:#1b2b3f;color:#eaf0f8}
+.trendSeg{display:inline-flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--line-soft);border-radius:8px;background:var(--surface-2)}
+.trendSeg button{background:transparent;border:0;border-radius:6px;padding:5px 10px;min-height:28px;font-size:12px;color:var(--dim)}
+.trendSeg button.on{background:var(--surface-accent-strong);color:var(--fg-strong)}
 .trendSegSmall button{padding:3px 8px;min-height:24px;font-size:11px}
 .trendStatGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:8px 0 12px}
-.trendStat{background:#121820;border:1px solid #1d2530;border-radius:9px;padding:8px 10px;min-width:0}
-.trendStat .k{font-size:10px;color:#7d8798;letter-spacing:.03em}
+.trendStat{background:var(--surface-1);border:1px solid var(--line-soft);border-radius:9px;padding:8px 10px;min-width:0}
+.trendStat .k{font-size:10px;color:var(--dim-2);letter-spacing:.03em}
 .trendStat .v{font-size:18px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums;white-space:nowrap}
-.trendStat .s{font-size:10px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.trendChartWrap{position:relative;background:#0b0f14;border:1px solid #1d2530;border-radius:10px;padding:7px 6px 2px;overflow:hidden}
+.trendStat .s{font-size:10px;color:var(--dim-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trendChartWrap{position:relative;background:var(--canvas);border:1px solid var(--line-soft);border-radius:10px;padding:7px 6px 2px;overflow:hidden}
 .trendChartWrap canvas{height:220px;border:0;background:transparent;display:block}
-.trendTip{position:absolute;z-index:3;pointer-events:none;background:#172234;border:1px solid #2f6da8;border-radius:7px;
-  color:#eaf0f8;font-size:11px;line-height:1.5;padding:5px 8px;box-shadow:0 8px 22px rgba(0,0,0,.45);white-space:nowrap}
+.trendTip{position:absolute;z-index:3;pointer-events:none;background:var(--surface-accent);border:1px solid var(--accent-border);border-radius:7px;
+  color:var(--fg-strong);font-size:11px;line-height:1.5;padding:5px 8px;box-shadow:0 8px 22px var(--shadow-soft);white-space:nowrap}
 .trendMiniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
-.trendMiniCard{text-align:left;background:#121820;border:1px solid #1d2530;border-radius:9px;padding:8px;min-width:0}
-.trendMiniCard:hover,.trendMiniCard.on{border-color:#2f6da8;background:#121d2a}
-.trendMiniCard .cap{display:flex;justify-content:space-between;align-items:center;gap:4px;font-size:10px;color:#8b95a5;white-space:nowrap}
+.trendMiniCard{text-align:left;background:var(--surface-1);border:1px solid var(--line-soft);border-radius:9px;padding:8px;min-width:0}
+.trendMiniCard:hover,.trendMiniCard.on{border-color:var(--accent-border);background:var(--surface-accent-hover)}
+.trendMiniCard .cap{display:flex;justify-content:space-between;align-items:center;gap:4px;font-size:10px;color:var(--dim);white-space:nowrap}
 .trendMiniCard .val{font-size:16px;font-weight:600;margin-top:3px;font-variant-numeric:tabular-nums}
-.trendMiniCard .sub{font-size:9px;color:#7d8798;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trendMiniCard .sub{font-size:9px;color:var(--dim-2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .trendMiniCard canvas{height:48px;border:0;background:transparent;display:block;margin-top:3px}
 .activityHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
 .activityHead .cap{margin:0;flex:1;min-width:150px}
@@ -461,11 +576,13 @@ if (location.search.includes("reset=1")) {
   @media(max-width:640px){
     #scope{display:none}
     .bar{position:static;flex-wrap:wrap;gap:8px;padding:10px 0}
-    .seg{width:100%;display:grid;grid-template-columns:minmax(0,1fr) 64px 46px;gap:8px}
+    .seg{width:100%;display:grid;grid-template-columns:minmax(0,1fr) 44px 64px 46px;gap:8px}
     .seg #liveDot{grid-column:1/-1;justify-self:start;padding:5px 9px!important;grid-row:1}
     .seg #proj{grid-column:1;min-width:0;grid-row:2}
-    .seg #btnReload{grid-column:2;grid-row:2}
-    .seg #btnMore{grid-column:3;display:block;padding:0;font-size:20px;line-height:1;grid-row:2}
+    .seg #btnTheme{grid-column:2;grid-row:2;justify-self:stretch;width:100%!important;min-width:0!important;height:44px!important;padding:0}
+    .seg #btnTheme .themeText{display:none}
+    .seg #btnReload{grid-column:3;grid-row:2}
+    .seg #btnMore{grid-column:4;display:block;padding:0;font-size:20px;line-height:1;grid-row:2}
     .seg #btnSettings,.seg #btnPurge,.seg #foldAll,.seg #autoRef{display:none}
     .seg.more-open #btnSettings,.seg.more-open #btnPurge,.seg.more-open #foldAll,.seg.more-open #autoRef{
       display:block;grid-column:1/-1;width:100%
@@ -496,13 +613,14 @@ if (location.search.includes("reset=1")) {
     .list .row .subid{overflow-wrap:anywhere}
     .sheetHead button{min-width:72px}
     /* 触控反馈 */
-    tr.clickable:active{background:#161d26}
+    tr.clickable:active{background:var(--surface-hover)}
     button:active{transform:scale(.98)}
   }
 </style>
 
 <div class="gate" id="gate">
   <div class="box">
+    <button class="ghost iconBtn gateTheme" id="gateTheme" type="button" title="主题：跟随系统" aria-label="切换主题">◐</button>
     <h2>需要管理访问凭证</h2>
     <p id="gateMsg">输入 admin token 后才能查看项目、名册与交付箱。凭证只存在本机浏览器。</p>
     <input id="gateInput" type="password" placeholder="admin token" autocomplete="off">
@@ -518,7 +636,7 @@ if (location.search.includes("reset=1")) {
   <span class="muted" id="scope">—</span>
   <span class="muted" id="build" title="构建标识">build —</span>
   <div class="seg">
-    <span class="mono" id="liveDot" title="实时通道状态" style="cursor:pointer;border:1px solid #232a33;border-radius:6px;padding:6px 10px">○ 轮询</span>
+    <span class="mono" id="liveDot" title="实时通道状态" style="cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:6px 10px">○ 轮询</span>
     <select id="proj" title="项目"></select>
     <button class="ghost" id="btnReload" title="立即刷新各面板">刷新</button>
     <button class="ghost" id="btnSettings">可见性</button>
@@ -530,6 +648,7 @@ if (location.search.includes("reset=1")) {
       <option value="60">1 分钟</option>
       <option value="300">5 分钟</option>
     </select>
+    <button class="ghost" id="btnTheme" type="button" title="主题：跟随系统" aria-label="切换主题"><span class="themeIcon">◐</span><span class="themeText">自动</span></button>
   </div>
 </div>
 
@@ -868,7 +987,7 @@ if (location.search.includes("reset=1")) {
   <div class="sheet">
     <div class="sheetHead"><b id="issueDetailTitle">Issue</b><span class="muted" id="issueDetailMeta"></span>
       <button class="ghost iconBtn" id="issueDetailClose" aria-label="关闭" title="关闭">×</button></div>
-    <div class="sheetBody"><pre id="issueDetailBody" style="margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1"></pre></div>
+    <div class="sheetBody"><pre id="issueDetailBody" style="margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg-soft)"></pre></div>
   </div>
 </div>
 
@@ -1013,6 +1132,21 @@ if (location.search.includes("reset=1")) {
 <div id="toast" class="toast" hidden></div>
 <script>
 const KEY = "hub.admin.token";
+// canvas 不解析 CSS 变量：每次绘制时读取根节点上的最终主题色，切换主题后重绘即可换色。
+const CHART_FALLBACK = {
+  "--chart-msg": "#6aa9ff", "--chart-sub": "#56d364", "--chart-issue": "#d29922",
+  "--chart-grid": "#1d2530", "--chart-empty": "#5d6675", "--chart-fg": "#e6ebf2", "--chart-dim": "#7d8798",
+  "--chart-cpu": "#6aa9ff", "--chart-mem": "#8ee08e", "--chart-disk": "#ffc46a",
+  "--chart-task-open": "#8b98a9", "--chart-task-claimed": "#6aa9ff", "--chart-task-released": "#ffd58a",
+  "--chart-task-blocked": "#ff9b9b", "--chart-task-done": "#86d99e", "--chart-task-failed": "#ff7b72",
+  "--chart-task-other": "#8b98a9", "--chart-purple": "#a78bfa",
+};
+function chartColor(name) {
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || CHART_FALLBACK[name] || "#7d8798";
+  } catch { return CHART_FALLBACK[name] || "#7d8798"; }
+}
 let token = "";
 try { localStorage.removeItem(KEY); } catch {}
 // 统一转义：服务端数据一律不可信，进 DOM 前先变成实体
@@ -1053,9 +1187,9 @@ let IDLE_CFG_DIRTY = false;        // 用户正在编辑时不被自动刷新覆
 let ANALYTICS = { daily: [], submission_states: {}, issue_states: {}, totals: {} };
 let ANALYTICS_STATE = "loading";   // loading / ready / error：0 只能来自 ready
 const TREND_METRICS = {
-  messages: { label: "消息", color: "#6aa9ff" },
-  submissions: { label: "交付", color: "#56d364" },
-  issues: { label: "Issue", color: "#d29922" },
+  messages: { label: "消息", get color() { return chartColor("--chart-msg"); } },
+  submissions: { label: "交付", get color() { return chartColor("--chart-sub"); } },
+  issues: { label: "Issue", get color() { return chartColor("--chart-issue"); } },
 };
 let TREND_VIEW = {
   open: false, mode: "global", agent: null, scope: "", days: 7,
@@ -1541,7 +1675,7 @@ function taskRow(t, isAll) {
   prBadge.style.marginLeft = "4px";
   prBadge.title = "P0 最高；排队 30 分钟自动提升一级";
   prBadge.textContent = pr === null ? "P?" : `P${pr}`;
-  if (pr !== null && pr <= 1) prBadge.style.color = pr === 0 ? "#ffb3ad" : "#ffd58a";
+  if (pr !== null && pr <= 1) prBadge.style.color = pr === 0 ? "var(--bad-text)" : "var(--warn-text)";
   cells[1].append(prBadge);
   if (Number(t.attempts ?? 0) > 0) {
     const at = document.createElement("span");
@@ -1987,7 +2121,7 @@ async function showTaskTimeline(taskId) {
         || (e.data?.submission_id ? `submission ${e.data.submission_id}` : "")
         || (e.data?.issue_id ? `issue ${e.data.issue_id}` : "")
         || (e.data?.queue_position ? `队列 #${e.data.queue_position}` : "");
-      return `<div class="row" style="align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid #1d2530">
+      return `<div class="row" style="align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px solid var(--line-soft)">
         <div class="muted mono" style="min-width:132px;font-size:10px">${esc(at)}</div>
         <div style="min-width:82px"><span class="badge">${esc(typeLabel[e.type] || e.type)}</span></div>
         <div style="min-width:64px" class="mono">${esc(actor)}</div>
@@ -2970,7 +3104,7 @@ function drawDonut(cv, parts, centerText, emptyText = "暂无数据") {
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
   const total = parts.reduce((a, p) => a + Math.max(0, p.value), 0);
   if (!total) {
-    g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
+    g.fillStyle = chartColor("--chart-empty"); g.font = "11px -apple-system,sans-serif";
     g.textAlign = "center"; g.fillText(emptyText, w / 2, h / 2);
     return;
   }
@@ -2986,9 +3120,9 @@ function drawDonut(cv, parts, centerText, emptyText = "暂无数据") {
     g.stroke();
     angle += a;
   }
-  g.fillStyle = "#e6ebf2"; g.font = "600 17px -apple-system,sans-serif";
+  g.fillStyle = chartColor("--chart-fg"); g.font = "600 17px -apple-system,sans-serif";
   g.textAlign = "center"; g.fillText(String(total), cx, cy + 2);
-  g.fillStyle = "#7d8798"; g.font = "10px -apple-system,sans-serif";
+  g.fillStyle = chartColor("--chart-dim"); g.font = "10px -apple-system,sans-serif";
   g.fillText(centerText || "", cx, cy + 17);
 }
 
@@ -3000,7 +3134,7 @@ function drawTrend(cv, daily, emptyText = "暂无活动") {
   const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, w, h);
   const rows = (daily || []).slice(-7);
   if (!rows.length) {
-    g.fillStyle = "#5d6675"; g.font = "11px -apple-system,sans-serif";
+    g.fillStyle = chartColor("--chart-empty"); g.font = "11px -apple-system,sans-serif";
     g.textAlign = "center"; g.fillText(emptyText, w / 2, h / 2);
     return;
   }
@@ -3008,12 +3142,12 @@ function drawTrend(cv, daily, emptyText = "暂无活动") {
     Number(x.submissions) || 0, Number(x.issues) || 0)));
   const pad = { l: 5, r: 5, t: 13, b: 17 };
   const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
-  g.strokeStyle = "#1d2530"; g.lineWidth = 1;
+  g.strokeStyle = chartColor("--chart-grid"); g.lineWidth = 1;
   [0, 0.5, 1].forEach((p) => {
     const y = pad.t + ph * p;
     g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
   });
-  g.fillStyle = "#7d8798"; g.font = "8px ui-monospace,monospace"; g.textAlign = "right";
+  g.fillStyle = chartColor("--chart-dim"); g.font = "8px ui-monospace,monospace"; g.textAlign = "right";
   g.fillText(String(max), w - pad.r, 9);
   const gw = pw / rows.length, bw = Math.max(2, gw * 0.2);
   rows.forEach((row, i) => {
@@ -3022,13 +3156,13 @@ function drawTrend(cv, daily, emptyText = "暂无活动") {
     const iss = Number(row.issues) || 0;
     const mh = (m / max) * ph, sh = (s / max) * ph, ih = (iss / max) * ph;
     const left = x - (bw * 3 + 2) / 2;
-    g.fillStyle = "#6aa9ff";
+    g.fillStyle = chartColor("--chart-msg");
     g.fillRect(left, pad.t + ph - mh, bw, mh);
-    g.fillStyle = "#56d364";
+    g.fillStyle = chartColor("--chart-sub");
     g.fillRect(left + bw + 1, pad.t + ph - sh, bw, sh);
-    g.fillStyle = "#d29922";
+    g.fillStyle = chartColor("--chart-issue");
     g.fillRect(left + (bw + 1) * 2, pad.t + ph - ih, bw, ih);
-    g.fillStyle = "#7d8798"; g.font = "8px ui-monospace,monospace"; g.textAlign = "center";
+    g.fillStyle = chartColor("--chart-dim"); g.font = "8px ui-monospace,monospace"; g.textAlign = "center";
     g.fillText(String(row.day || "").slice(5), x, h - 5);
   });
 }
@@ -3073,7 +3207,7 @@ function drawTrendSeries(cv, daily, key, opts = {}) {
   const rows = trendRows({ daily });
   const vals = rows.map((r) => Number(r[key] ?? 0));
   if (!rows.length) {
-    g.fillStyle = "#7d8798"; g.font = "11px ui-monospace,monospace"; g.textAlign = "center";
+    g.fillStyle = chartColor("--chart-dim"); g.font = "11px ui-monospace,monospace"; g.textAlign = "center";
     g.fillText("暂无数据", w / 2, h / 2);
     return;
   }
@@ -3083,13 +3217,13 @@ function drawTrendSeries(cv, daily, key, opts = {}) {
   const ph = Math.max(1, h - pad.t - pad.b);
   const px = (i) => pad.l + (rows.length === 1 ? pw / 2 : (i / (rows.length - 1)) * pw);
   const py = (v) => pad.t + ph - (Number(v) / max) * ph;
-  g.strokeStyle = "#1d2530"; g.lineWidth = 1;
+  g.strokeStyle = chartColor("--chart-grid"); g.lineWidth = 1;
   if (!mini) {
     for (let i = 0; i <= 4; i++) {
       const y = pad.t + ph - (i / 4) * ph;
       g.beginPath(); g.moveTo(pad.l, y); g.lineTo(pad.l + pw, y); g.stroke();
     }
-    g.fillStyle = "#7d8798"; g.font = "10px ui-monospace,monospace"; g.textAlign = "right";
+    g.fillStyle = chartColor("--chart-dim"); g.font = "10px ui-monospace,monospace"; g.textAlign = "right";
     g.fillText(String(Math.round(max)), pad.l - 5, pad.t + 3);
     g.fillText(String(Math.round(max / 2)), pad.l - 5, pad.t + ph / 2 + 3);
     g.fillText("0", pad.l - 5, pad.t + ph + 3);
@@ -3286,6 +3420,71 @@ function bindTrendChartHover() {
   cv.onpointerleave = () => { const tip = $("trendTip"); if (tip) tip.hidden = true; };
 }
 
+function themeLabel() {
+  const t = window.SynapseTheme;
+  if (!t) return "主题";
+  const pref = t.preference, mode = t.resolved === "light" ? "浅色" : "深色";
+  return pref === "auto" ? `跟随系统（当前${mode}）` : mode;
+}
+function syncThemeButton() {
+  const t = window.SynapseTheme;
+  if (!t) return;
+  const pref = t.preference, mode = t.resolved;
+  const icon = pref === "auto" ? "◐" : mode === "light" ? "☀" : "☾";
+  const label = themeLabel();
+  const short = pref === "auto" ? "自动" : mode === "light" ? "浅色" : "深色";
+  for (const btn of [$("btnTheme"), $("gateTheme")]) {
+    if (!btn) continue;
+    const iconEl = btn.querySelector(".themeIcon");
+    if (iconEl) iconEl.textContent = icon; else btn.textContent = icon;
+    const textEl = btn.querySelector(".themeText");
+    if (textEl) textEl.textContent = short;
+    btn.title = `主题：${label}，点击切换`;
+    btn.setAttribute("aria-label", `切换主题，当前${label}`);
+    btn.dataset.themePref = pref;
+  }
+}
+function redrawDetailTheme() {
+  const ov = $("detail");
+  if (!LAST_DETAIL || !detailAgent || !ov || ov.hidden) return;
+  const d = LAST_DETAIL;
+  if (d.agent?.agent_id && d.agent.agent_id !== detailAgent) return;
+  const live = (window._agents || []).find((a) => a.agent_id === detailAgent
+    && (current === "*" || (a.project || current) === current));
+  const hb = (d.hb || []).slice().reverse();
+  const hbVal = (k) => hb.map((x) => hasNum(x[k]) ? Number(x[k]) : null);
+  renderAgentWork(d, live);
+  drawLine($("cCpu"), hbVal("cpu_pct"), chartColor("--chart-cpu"));
+  drawLine($("cMem"), hbVal("mem_used_mb"), chartColor("--chart-mem"));
+  drawLine($("cDisk"), hbVal("disk_used_pct"), chartColor("--chart-disk"));
+  renderAgentActivity(d.activity || { days: detailDays, available: false, daily: [] });
+}
+function redrawThemeViews() {
+  syncThemeButton();
+  renderDashboard();
+  if (TREND_VIEW.open) renderTrendSheet();
+  redrawDetailTheme();
+}
+let themeRedrawTimer = null;
+function bindThemeControl() {
+  syncThemeButton();
+  const toggle = () => {
+    if (!window.SynapseTheme) return;
+    window.SynapseTheme.cycle();
+    syncThemeButton();
+    showToast(`主题：${themeLabel()}`, 3000);
+  };
+  for (const id of ["btnTheme", "gateTheme"]) {
+    const btn = $(id);
+    if (btn) btn.onclick = toggle;
+  }
+  document.addEventListener("synapse:themechange", () => {
+    syncThemeButton();
+    clearTimeout(themeRedrawTimer);
+    themeRedrawTimer = setTimeout(redrawThemeViews, 20);
+  });
+}
+
 function renderStack(el, parts) {
   if (!el) return;
   const known = parts.filter((p) => !p.unknown);
@@ -3330,12 +3529,12 @@ function renderDashboard() {
   const scopeEl = $("dashScope");
   if (scopeEl) scopeEl.textContent = scope + (partials.length ? ` · ${partials.join("；")}` : "");
   const taskParts = [
-    { key: "open", label: "待领取", color: "#7d8798", value: 0 },
-    { key: "claimed", label: "执行中", color: "#6aa9ff", value: 0 },
-    { key: "released", label: "待取", color: "#d29922", value: 0 },
-    { key: "blocked", label: "阻塞", color: "#f85149", value: 0 },
-    { key: "failed", label: "死信", color: "#ff7b72", value: 0 },
-    { key: "done", label: "完成", color: "#56d364", value: 0 },
+    { key: "open", label: "待领取", color: chartColor("--chart-task-open"), value: 0 },
+    { key: "claimed", label: "执行中", color: chartColor("--chart-task-claimed"), value: 0 },
+    { key: "released", label: "待取", color: chartColor("--chart-task-released"), value: 0 },
+    { key: "blocked", label: "阻塞", color: chartColor("--chart-task-blocked"), value: 0 },
+    { key: "failed", label: "死信", color: chartColor("--chart-task-failed"), value: 0 },
+    { key: "done", label: "完成", color: chartColor("--chart-task-done"), value: 0 },
   ];
   if (taskReady) {
     for (const t of (TASK_ROWS || [])) {
@@ -3388,9 +3587,9 @@ function renderDashboard() {
   const subStates = analyticsReady ? ANALYTICS.submission_states : null;
   const subUnknown = !subStates || typeof subStates !== "object";
   const subParts = [
-    { key: "delivered", label: "待取", color: "#6aa9ff", value: subUnknown ? 0 : (Number(subStates.delivered) || 0), unknown: subUnknown },
-    { key: "collected", label: "已取", color: "#56d364", value: subUnknown ? 0 : (Number(subStates.collected) || 0), unknown: subUnknown },
-    { key: "archived", label: "归档", color: "#7d8798", value: subUnknown ? 0 : (Number(subStates.archived) || 0), unknown: subUnknown },
+    { key: "delivered", label: "待取", color: chartColor("--chart-msg"), value: subUnknown ? 0 : (Number(subStates.delivered) || 0), unknown: subUnknown },
+    { key: "collected", label: "已取", color: chartColor("--chart-sub"), value: subUnknown ? 0 : (Number(subStates.collected) || 0), unknown: subUnknown },
+    { key: "archived", label: "归档", color: chartColor("--chart-dim"), value: subUnknown ? 0 : (Number(subStates.archived) || 0), unknown: subUnknown },
   ];
   const subTotal = subUnknown ? null : subParts.reduce((a, p) => a + p.value, 0);
   $("dashSubTotal").textContent = subUnknown ? "—" : `${subTotal}`;
@@ -3400,9 +3599,9 @@ function renderDashboard() {
   const issueStates = analyticsReady ? ANALYTICS.issue_states : null;
   const issueUnknown = !issueStates || typeof issueStates !== "object";
   const issueParts = [
-    { key: "open", label: "待处理", color: "#d29922", value: issueUnknown ? 0 : (Number(issueStates.open) || 0), unknown: issueUnknown },
-    { key: "closed", label: "已关闭", color: "#56d364", value: issueUnknown ? 0 : (Number(issueStates.closed) || 0), unknown: issueUnknown },
-    { key: "merged", label: "已合并", color: "#6aa9ff", value: issueUnknown ? 0 : (Number(issueStates.merged) || 0), unknown: issueUnknown },
+    { key: "open", label: "待处理", color: chartColor("--chart-issue"), value: issueUnknown ? 0 : (Number(issueStates.open) || 0), unknown: issueUnknown },
+    { key: "closed", label: "已关闭", color: chartColor("--chart-sub"), value: issueUnknown ? 0 : (Number(issueStates.closed) || 0), unknown: issueUnknown },
+    { key: "merged", label: "已合并", color: chartColor("--chart-msg"), value: issueUnknown ? 0 : (Number(issueStates.merged) || 0), unknown: issueUnknown },
   ];
   const issueTotal = issueUnknown ? null : issueParts.reduce((a, p) => a + p.value, 0);
   $("dashIssueTotal").textContent = issueUnknown ? "—" : `${issueTotal}`;
@@ -3410,13 +3609,13 @@ function renderDashboard() {
   renderLegend($("dashIssueLegend"), issueParts, "issue");
 
   const agentParts = [
-    { key: "work:idle", label: "空闲", color: "#56d364", value: 0, unknown: !agentsReady },
-    { key: "work:work", label: "忙碌", color: "#6aa9ff", value: 0, unknown: !agentsReady },
-    { key: "work:blocked", label: "阻塞", color: "#d29922", value: 0, unknown: !agentsReady },
-    { key: "work:other", label: "其他", color: "#8b98a9", value: 0, unknown: !agentsReady },
-    { key: "alive:late", label: "迟到", color: "#d29922", value: 0, unknown: !agentsReady },
-    { key: "alive:offline", label: "失联", color: "#f85149", value: 0, unknown: !agentsReady },
-    { key: "alive:unknown", label: "未知", color: "#8b98a9", value: 0, unknown: !agentsReady },
+    { key: "work:idle", label: "空闲", color: chartColor("--chart-task-done"), value: 0, unknown: !agentsReady },
+    { key: "work:work", label: "忙碌", color: chartColor("--chart-task-claimed"), value: 0, unknown: !agentsReady },
+    { key: "work:blocked", label: "阻塞", color: chartColor("--chart-issue"), value: 0, unknown: !agentsReady },
+    { key: "work:other", label: "其他", color: chartColor("--chart-task-other"), value: 0, unknown: !agentsReady },
+    { key: "alive:late", label: "迟到", color: chartColor("--chart-issue"), value: 0, unknown: !agentsReady },
+    { key: "alive:offline", label: "失联", color: chartColor("--chart-task-failed"), value: 0, unknown: !agentsReady },
+    { key: "alive:unknown", label: "未知", color: chartColor("--chart-task-other"), value: 0, unknown: !agentsReady },
   ];
   if (agentsReady) {
     for (const a of (window._agents || [])) {
@@ -3446,9 +3645,9 @@ function renderDashboard() {
   drawTrend($("dashTrendChart"), daily, analyticsReady ? "暂无活动" : "趋势数据不可用");
   const trendLegend = $("dashTrendLegend");
   if (trendLegend) trendLegend.innerHTML =
-    `<span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#6aa9ff"></i>消息</span>
-     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#56d364"></i>交付</span>
-     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:#d29922"></i>Issue</span>`;
+    `<span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:var(--chart-msg)"></i>消息</span>
+     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:var(--chart-sub)"></i>交付</span>
+     <span class="muted" style="display:inline-flex;gap:5px;align-items:center"><i style="width:7px;height:7px;border-radius:2px;background:var(--chart-issue)"></i>Issue</span>`;
 }
 
 let dashResizeTimer = null;
@@ -3480,7 +3679,7 @@ function drawLine(cv, vals, color) {
   }
   g.stroke();
   // 三列窄图里 "now … / max …" 会相互覆盖；当前值和峰值分开贴左右角，小屏也不糊
-  g.fillStyle = "#7d8798"; g.font = "9px ui-monospace,monospace"; g.textAlign = "left";
+  g.fillStyle = chartColor("--chart-dim"); g.font = "9px ui-monospace,monospace"; g.textAlign = "left";
   const last = points[points.length - 1].v;
   if (w >= 150) {
     g.fillText(`now ${Math.round(last)} / max ${Math.round(max)}`, 5, 11);
@@ -3490,7 +3689,13 @@ function drawLine(cv, vals, color) {
   }
 }
 
-const TASK_COLORS = { open: "#8b98a9", claimed: "#6aa9ff", released: "#ffd58a", blocked: "#ff9b9b", done: "#86d99e" };
+const TASK_COLORS = {
+  get open() { return chartColor("--chart-task-open"); },
+  get claimed() { return chartColor("--chart-task-claimed"); },
+  get released() { return chartColor("--chart-task-released"); },
+  get blocked() { return chartColor("--chart-task-blocked"); },
+  get done() { return chartColor("--chart-task-done"); },
+};
 
 function fmtLast(ms) {
   if (!hasNum(ms)) return "—";
@@ -3546,7 +3751,7 @@ function renderAgentWork(d, live) {
     { key: "released", label: "待取", value: released ?? 0, color: TASK_COLORS.released, unknown: taskUnknown },
     { key: "blocked", label: "阻塞", value: blocked ?? 0, color: TASK_COLORS.blocked, unknown: taskUnknown },
     { key: "done", label: "已完成", value: done ?? 0, color: TASK_COLORS.done, unknown: taskUnknown },
-    { key: "failed", label: "死信/失败", value: failed ?? 0, color: "#ff7b72", unknown: taskUnknown },
+    { key: "failed", label: "死信/失败", value: failed ?? 0, color: chartColor("--chart-task-failed"), unknown: taskUnknown },
   ];
   const taskList = d.tasks || [];
   $("dTaskTotal").textContent = total === null ? "统计不可用"
@@ -3568,8 +3773,8 @@ function renderAgentWork(d, live) {
   };
   $("dWorkBars").innerHTML = [
     bar("任务完成率", done, total, TASK_COLORS.done),
-    bar("交付通过率", approved, subTotal, "#6aa9ff"),
-    bar("Issue 关闭率", issueClosed, issueTotal, "#a78bfa"),
+    bar("交付通过率", approved, subTotal, chartColor("--chart-msg")),
+    bar("Issue 关闭率", issueClosed, issueTotal, chartColor("--chart-purple")),
     bar("阻塞任务", blocked, total, TASK_COLORS.blocked),
   ].join("");
 
@@ -3624,9 +3829,9 @@ function renderAgentActivity(activity) {
   const available = data.available !== false && Array.isArray(data.daily);
   const rows = available ? data.daily : [];
   const vals = (key) => rows.map((r) => Number(r[key] ?? 0));
-  drawLine($("cActMsg"), vals("messages"), "#6aa9ff");
-  drawLine($("cActSub"), vals("submissions"), "#56d364");
-  drawLine($("cActIssue"), vals("issues"), "#d29922");
+  drawLine($("cActMsg"), vals("messages"), chartColor("--chart-msg"));
+  drawLine($("cActSub"), vals("submissions"), chartColor("--chart-sub"));
+  drawLine($("cActIssue"), vals("issues"), chartColor("--chart-issue"));
   setActivityRange(days);
   if (!available) {
     $("dActivityMeta").textContent = `${days} 天 · 活动数据不可用`;
@@ -3874,6 +4079,7 @@ function renderAgentDiag(client, live, available) {
 }
 
 let detailAgent = null;
+let LAST_DETAIL = null;
 let detailRole = "agent";
 let detailReady = false;
 const DETAIL_ACTIONS = ["dReissue", "dGrant", "dDemote", "dRevoke", "dJoinProject", "dMoveProject", "dSaveScopes", "dIdleRemind", "dNotice", "dSaveMaxParallel"];
@@ -3940,6 +4146,7 @@ function openAgent(id, project, days = detailDays) {
   // 换 agent、或关掉详情再打开，才清。
   const sameAgentRefresh = id === detailAgent && ov && !ov.hidden;
   detailAgent = id;
+  if (!sameAgentRefresh) LAST_DETAIL = null;
   if (ov) { ov.hidden = false; ov.style.display = "flex"; document.body.classList.add("has-sheet"); ov.scrollTop = 0; }
   $("dName").textContent = id;
   $("dMeta").textContent = "加载中…";
@@ -3969,6 +4176,8 @@ function openAgent(id, project, days = detailDays) {
   if (idleRemindBtn) idleRemindBtn.hidden = true;
   setDetailReady(false);
   api(`/admin/p/${current}/agent/${encodeURIComponent(id)}?days=${detailDays}`).then((d) => {
+    if (id !== detailAgent) return;
+    LAST_DETAIL = d;
     setDetailReady(true);
     const hb = (d.hb || []).slice().reverse();
     const role = d.agent?.role || "agent";
@@ -4004,9 +4213,9 @@ function openAgent(id, project, days = detailDays) {
     renderScopeEditor(scopes);
     fillDetailProjects();
     const hbVal = (k) => hb.map((x) => hasNum(x[k]) ? Number(x[k]) : null);
-    drawLine($("cCpu"), hbVal("cpu_pct"), "#6aa9ff");
-    drawLine($("cMem"), hbVal("mem_used_mb"), "#8ee08e");
-    drawLine($("cDisk"), hbVal("disk_used_pct"), "#ffc46a");
+    drawLine($("cCpu"), hbVal("cpu_pct"), chartColor("--chart-cpu"));
+    drawLine($("cMem"), hbVal("mem_used_mb"), chartColor("--chart-mem"));
+    drawLine($("cDisk"), hbVal("disk_used_pct"), chartColor("--chart-disk"));
     renderAgentActivity(d.activity || { days: detailDays, available: false, daily: [] });
     $("dMsgs").innerHTML = d.messages_available === false
       ? `<div class="muted">消息读取失败</div>`
@@ -4705,7 +4914,7 @@ async function loadMsgs() {
       <td class="muted">${hasNum(m.ts || m.at) ? new Date(Number(m.ts || m.at)).toLocaleTimeString() : "—"}</td>
     </tr>
     <tr class="msgDetail" data-msg-detail="${m.seq}" hidden>
-      <td colspan="6"><pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">${JSON.stringify(m, null, 2)}</pre></td>
+      <td colspan="6"><pre style="margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg-soft)">${JSON.stringify(m, null, 2)}</pre></td>
     </tr>`;
   }).join("") : `<tr><td colspan="6" class="empty">暂无消息</td></tr>`;
   reapplyFilters();
@@ -4852,6 +5061,7 @@ function setProjectPanels(enabled) {
   const ov = $("detail");
   if (ov) { ov.hidden = true; ov.style.display = ""; document.body.classList.remove("has-sheet"); }
   detailAgent = null;
+  LAST_DETAIL = null;
   detailReady = false;
   setDetailReady(false);
 }
@@ -4919,7 +5129,7 @@ let liveGen = 0, liveMode = localStorage.getItem("hub.live") || "ws";
 function paintLive(on, note, why) {
   const el = $("liveDot"); if (!el) return;
   el.textContent = on ? "● 实时" : "○ " + (why || (liveMode === "ws" ? "连接中…" : "轮询"));
-  el.style.color = on ? "#3fb950" : /重连|超时|失败/.test(why || "") ? "#d29922" : "#8b95a5";
+  el.style.color = on ? "var(--ok)" : /重连|超时|失败/.test(why || "") ? "var(--warn)" : "var(--dim)";
   el.title = note + (on ? "（点击切到轮询）" : "（点击尝试实时）");
 }
 function scheduleRefresh(forceFresh = false) {
@@ -5400,6 +5610,7 @@ $("btnUnblockAll").onclick = async () => {
   await loadSec();
 };
 
+bindThemeControl();
 (async function boot() {
   let diag = "?";
   let buildTag = "?";
