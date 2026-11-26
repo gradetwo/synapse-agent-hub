@@ -609,6 +609,11 @@ if (location.search.includes("reset=1")) {
   .healthTile .warnv,.healthTile .badv{color:var(--warn-soft)}
   .healthActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:0 14px 12px}
   .healthActions .scopeHint{margin:0}
+  #repoCfgForm .row{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr)}
+  #repoCfgForm .projAction{grid-template-columns:auto auto minmax(0,1fr);align-items:center}
+  #repoCfgForm .projAction .scopeHint{margin:0}
+  #repoCfgToken{color:var(--dim-2);background:var(--surface-input)}
+  #repoCfgSource{margin:0;min-height:38px;display:flex;align-items:center}
   @media(max-width:1000px){.healthGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   @media(max-width:700px){
     .card>h2{flex-wrap:wrap;row-gap:5px}
@@ -624,6 +629,7 @@ if (location.search.includes("reset=1")) {
     .healthGrid{grid-template-columns:1fr;padding:0 10px 8px}
     .healthActions{padding:0 10px 10px}
     .projAuditRows{max-height:180px}
+    #repoCfgForm .row,#repoCfgForm .projAction{grid-template-columns:1fr}
   }
   .dashTile canvas{height:112px;border:0;background:transparent;display:block}
 .dashTile.clickable{cursor:pointer}
@@ -1041,8 +1047,29 @@ if (location.search.includes("reset=1")) {
       <button class="ghost mini" type="button" id="healthReload" style="margin-left:8px">刷新</button></div>
     <div class="healthGrid" id="healthGrid"><div class="empty" style="grid-column:1/-1">选择具体项目后加载</div></div>
     <div class="healthActions">
-      <button class="ghost" type="button" id="healthApply">检查当前 main 适用性</button>
+      <button class="ghost" type="button" id="healthApply">检查当前基线适用性</button>
+      <button class="ghost" type="button" id="healthRepoCfg">配置基线仓库</button>
       <span class="scopeHint" id="healthHint">适用性会检查当前项目已交付的 patch/bundle，可能耗时。</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>基线仓库 <span class="muted" id="repoCfgStat"></span></h2>
+    <div class="scopeHint" style="margin:-2px 14px 8px">项目健康、补丁适用性和 base_sha 校验都使用这里配置的远端仓库；默认读取 Worker 环境变量，可在管理台覆盖。Token 仍只通过 <code>wrangler secret</code> 管理，不会回传明文。</div>
+    <div class="form" id="repoCfgForm">
+      <div class="row">
+        <label>仓库（owner/repo）<input id="repoCfgRepo" autocomplete="off" placeholder="gradetwo/synapse-agent-hub"></label>
+        <label>分支<input id="repoCfgBranch" autocomplete="off" placeholder="main"></label>
+      </div>
+      <div class="row">
+        <label>Token 状态<input id="repoCfgToken" disabled></label>
+        <label>配置来源<span class="scopeHint" id="repoCfgSource"></span></label>
+      </div>
+      <div class="row projAction">
+        <button class="primary" type="button" id="repoCfgSave">保存基线配置</button>
+        <button class="ghost" type="button" id="repoCfgReset">恢复环境默认</button>
+        <span class="scopeHint" id="repoCfgHint">保存后，项目健康与适用性检查会立即使用新仓库。</span>
+      </div>
     </div>
   </div>
 
@@ -1537,6 +1564,7 @@ let ALL_PROJECTS = [];            // 包含被可见性策略隐藏的项目（�
 let PROJECTS_HIDDEN = 0;
 let editingProject = "";          // 正在编辑的项目 ID
 let PROJECT_HEALTH = null;        // 项目健康缓存
+let REPO_CONFIG = null;           // 基线仓库配置缓存
 let refreshEpoch = 0;              // 切换项目/并发刷新时，旧请求只能静默丢弃
 const BASE_TITLE = "Synapse · 控制台";
 let SUB_ROWS = [];                 // 最近一次交付箱快照（批量取件用）
@@ -1772,7 +1800,7 @@ async function loadProjects() {
   updateScopeLabel();
   fillDetailProjects();
   connectLive();          // 项目确定后才能连（URL 里要带项目名），否则首屏会停在"轮询"
-  if (ACTIVE_TAB === "project") loadProjectHealth();
+  if (ACTIVE_TAB === "project") { loadProjectHealth(); loadRepoConfig(); }
 }
 
 function projectStatusMeta(status) {
@@ -1925,6 +1953,9 @@ for (const id of ["visAll", "visList"]) {
 }
 $("healthReload").onclick = () => loadProjectHealth(true);
 $("healthApply").onclick = checkApplicability;
+$("healthRepoCfg").onclick = openRepoConfig;
+$("repoCfgSave").onclick = saveRepoConfig;
+$("repoCfgReset").onclick = resetRepoConfig;
 
 function projectById(id) {
   return (ALL_PROJECTS || []).find((p) => p.project === id)
@@ -2191,7 +2222,7 @@ function renderProjectHealth() {
   const ciLabel = ci ? ({ green: "通过", red: "失败", pending: "等待" }[ci.status] || ci.status) : "暂无事件";
   const tiles = [
     { cap: "基线仓库", value: repoError ? "读取失败" : (repo.target_sha ? shortSha(repo.target_sha) : "—"),
-      sub: repoError ? String(repoError) : `${repo.branch || "main"} · ${repo.last_project_check_at ? auditTime(repo.last_project_check_at) : "未检查"}`,
+      sub: repoError ? String(repoError) : `${repo.repo || "未配置"} · ${repo.branch || "main"} · ${repo.last_project_check_at ? auditTime(repo.last_project_check_at) : "未检查"}`,
       warn: !!repoError },
     { cap: "CI 状态", value: ciLabel,
       sub: ci ? `${ci.branch || "main"} · ${shortSha(ci.sha)} · ${auditTime(ci.at)}` : "消息流里没有 CI 事件",
@@ -2269,6 +2300,106 @@ async function checkApplicability() {
   } finally {
     btn.disabled = false;
   }
+}
+
+function repoSourceLabel(src) {
+  return src === "admin" ? "管理台覆盖"
+    : src === "env" ? "环境变量"
+    : src === "default" ? "默认 main"
+    : "未配置";
+}
+
+function renderRepoConfig(d) {
+  const cfg = d || REPO_CONFIG || {};
+  $("repoCfgStat").textContent = cfg.repo ? `${cfg.repo} @ ${cfg.branch}` : "未配置";
+  $("repoCfgRepo").value = cfg.repo || "";
+  $("repoCfgBranch").value = cfg.branch || "main";
+  $("repoCfgToken").value = cfg.token_configured
+    ? "已配置（wrangler secret）" : "未配置（公开仓库可用）";
+  $("repoCfgSource").textContent = `仓库：${repoSourceLabel(cfg.repo_source)} · 分支：${repoSourceLabel(cfg.branch_source)}`;
+  $("repoCfgHint").textContent = cfg.updated_at
+    ? `管理台覆盖更新于 ${auditTime(cfg.updated_at)}${cfg.updated_by ? ` · ${cfg.updated_by}` : ""}`
+    : "当前使用环境默认；保存后立即生效。";
+}
+
+async function loadRepoConfig() {
+  const hint = $("repoCfgHint");
+  if (hint) hint.textContent = "读取基线配置…";
+  try {
+    const d = await api("/admin/config/github");
+    REPO_CONFIG = d || {};
+    renderRepoConfig(REPO_CONFIG);
+  } catch (e) {
+    if (!(e instanceof AuthError) && hint) hint.textContent = `读取失败：${e.message || e}`;
+  }
+}
+
+async function saveRepoConfig() {
+  const repo = ($("repoCfgRepo").value || "").trim();
+  const branch = ($("repoCfgBranch").value || "").trim() || "main";
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    $("repoCfgHint").textContent = "仓库格式应为 owner/repo，例如 gradetwo/synapse-agent-hub";
+    return;
+  }
+  if (!/^[A-Za-z0-9._/-]{1,100}$/.test(branch) || branch.includes("..") || branch.startsWith("/") || branch.endsWith("/")) {
+    $("repoCfgHint").textContent = "分支不合法";
+    return;
+  }
+  const btn = $("repoCfgSave");
+  btn.disabled = true;
+  btn.textContent = "保存中…";
+  $("repoCfgHint").textContent = "正在保存…";
+  try {
+    const d = await api("/admin/config/github", "PATCH", { repo, branch });
+    REPO_CONFIG = d || {};
+    renderRepoConfig(REPO_CONFIG);
+    PROJECT_HEALTH = null;
+    if (current && current !== "*") await loadProjectHealth(true);
+    showToast(`基线仓库已切换为 ${repo} @ ${branch}`, 6000);
+  } catch (e) {
+    if (!(e instanceof AuthError)) {
+      $("repoCfgHint").textContent = `保存失败：${e.message || e}`;
+      showToast(`保存基线配置失败：${e.message || e}`, 9000);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "保存基线配置";
+  }
+}
+
+async function resetRepoConfig() {
+  if (!confirm("清空管理台覆盖，恢复 Worker 环境变量中的 GITHUB_REPO / GITHUB_BRANCH？")) return;
+  const btn = $("repoCfgReset");
+  btn.disabled = true;
+  $("repoCfgHint").textContent = "正在恢复…";
+  try {
+    const d = await api("/admin/config/github", "PATCH", { repo: "", branch: "" });
+    REPO_CONFIG = d || {};
+    renderRepoConfig(REPO_CONFIG);
+    PROJECT_HEALTH = null;
+    if (current && current !== "*") await loadProjectHealth(true);
+    showToast("已恢复环境默认基线配置", 5000);
+  } catch (e) {
+    if (!(e instanceof AuthError)) {
+      $("repoCfgHint").textContent = `恢复失败：${e.message || e}`;
+      showToast(`恢复基线配置失败：${e.message || e}`, 9000);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function openRepoConfig() {
+  if (ACTIVE_TAB !== "project") {
+    const tab = document.querySelector('[data-tab="project"]');
+    if (tab) tab.click();
+  }
+  setCardOpen("基线仓库", true);
+  loadRepoConfig();
+  setTimeout(() => {
+    const form = $("repoCfgForm");
+    if (form) form.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, 30);
 }
 
 function updateScopeLabel() {
@@ -5418,7 +5549,7 @@ function decorateCards() {
     // 标题只取 h2 的首个文本节点，避免把动态状态/计数带进 localStorage 的折叠 key。
     const title = ((h.firstChild && h.firstChild.nodeType === 3 ? h.firstChild.textContent : h.textContent) || "")
       .trim().replace(/[▸▾⤢⤡]/g, "").trim();
-    const keep = /^(概览|项目管理|项目健康|名册|注册审批|签发 token|效率观测)/.test(title);
+    const keep = /^(概览|项目管理|项目健康|基线仓库|名册|注册审批|签发 token|效率观测)/.test(title);
     const key = `hub.fold2.${title}`;
     let folded = !keep;
     try {
@@ -5661,7 +5792,7 @@ function bindFilters() {
 
 const GROUPS = [
   { id: "overview", label: "总览", cards: ["概览", "效率观测", "名册"] },
-  { id: "project",  label: "项目", cards: ["项目管理", "项目健康"] },
+  { id: "project",  label: "项目", cards: ["项目管理", "项目健康", "基线仓库"] },
   { id: "task",     label: "任务", cards: ["任务", "效率观测"] },
   { id: "issue",    label: "Issue", cards: ["Issue"] },
   { id: "idle",     label: "待唤醒", cards: ["空闲监测"] },
@@ -5723,7 +5854,7 @@ function bindTabs() {
       b.classList.toggle("on", b.dataset.tab === g.id));
     localStorage.setItem("hub.tab", g.id);
     if (g.id === "msg") markMsgSeen();
-    if (g.id === "project") loadProjectHealth();
+    if (g.id === "project") { loadProjectHealth(); loadRepoConfig(); }
     // 切到某页时如果该页所有卡片都是收起的，自动展开第一张；否则用户只会看到一排标题。
     const groupCards = cardsAll().filter((c) => {
       const t = titleOf(c);

@@ -799,6 +799,107 @@ async function projectQuota(env: Env, project: string) {
   };
 }
 
+// ── 基线仓库配置：默认读 Worker 环境变量，可在管理台写入 D1 覆盖 ─────
+// GITHUB_TOKEN 仍只走 secret；管理台只显示“已配置/未配置”，不回传值。
+const GITHUB_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const GITHUB_BRANCH_RE = /^[A-Za-z0-9._/-]{1,100}$/;
+
+function normalizeGithubRepo(v: any): string {
+  const s = String(v ?? "").trim();
+  return GITHUB_REPO_RE.test(s) ? s : "";
+}
+
+function normalizeGithubBranch(v: any): string {
+  const s = String(v ?? "").trim();
+  if (!GITHUB_BRANCH_RE.test(s) || s.includes("..") || s.startsWith("/") || s.endsWith("/")) return "";
+  return s;
+}
+
+type GithubRuntimeConfig = {
+  repo: string;
+  branch: string;
+  repoSource: "admin" | "env" | "unset";
+  branchSource: "admin" | "env" | "default";
+  envRepo: string;
+  envBranch: string;
+  tokenConfigured: boolean;
+  updatedBy: string;
+  updatedAt: number | null;
+};
+
+async function readGithubOverride(env: Env): Promise<any> {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
+      .bind("config:github").first<any>();
+    if (!row?.value) return {};
+    const parsed = JSON.parse(String(row.value));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch { return {}; }
+}
+
+async function githubConfig(env: Env): Promise<GithubRuntimeConfig> {
+  const override = await readGithubOverride(env);
+  const envRepo = normalizeGithubRepo(env.GITHUB_REPO);
+  const envBranch = normalizeGithubBranch(env.GITHUB_BRANCH);
+  const dbRepo = normalizeGithubRepo(override.repo);
+  const dbBranch = normalizeGithubBranch(override.branch);
+  const repo = dbRepo || envRepo;
+  const branch = dbBranch || envBranch || "main";
+  return {
+    repo,
+    branch,
+    repoSource: dbRepo ? "admin" : (envRepo ? "env" : "unset"),
+    branchSource: dbBranch ? "admin" : (envBranch ? "env" : "default"),
+    envRepo,
+    envBranch,
+    tokenConfigured: !!String(env.GITHUB_TOKEN ?? "").trim(),
+    updatedBy: String(override.updated_by ?? "").slice(0, 120),
+    updatedAt: Number(override.updated_at ?? 0) || null,
+  };
+}
+
+async function saveGithubConfig(
+  env: Env, input: { repo?: unknown; branch?: unknown }, actor: string,
+): Promise<{ ok: true; config: GithubRuntimeConfig } | { ok: false; error: string }> {
+  const current = await readGithubOverride(env);
+  const next: any = { ...current };
+  if (input.repo !== undefined) {
+    const raw = String(input.repo ?? "").trim();
+    if (raw && !normalizeGithubRepo(raw)) return { ok: false, error: "bad_github_repo" };
+    if (raw) next.repo = raw; else delete next.repo;
+  }
+  if (input.branch !== undefined) {
+    const raw = String(input.branch ?? "").trim();
+    if (raw && !normalizeGithubBranch(raw)) return { ok: false, error: "bad_github_branch" };
+    if (raw) next.branch = raw; else delete next.branch;
+  }
+  try {
+    if (!next.repo && !next.branch) {
+      await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind("config:github").run();
+    } else {
+      next.updated_by = String(actor || "admin").slice(0, 120);
+      next.updated_at = Date.now();
+      await env.DB.prepare(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+      ).bind("config:github", JSON.stringify(next), next.updated_at).run();
+    }
+  } catch {
+    return { ok: false, error: "settings_unavailable" };
+  }
+  return { ok: true, config: await githubConfig(env) };
+}
+
+function githubConfigPayload(cfg: GithubRuntimeConfig) {
+  return {
+    repo: cfg.repo, branch: cfg.branch,
+    repo_source: cfg.repoSource, branch_source: cfg.branchSource,
+    env_repo: cfg.envRepo, env_branch: cfg.envBranch,
+    token_configured: cfg.tokenConfigured,
+    updated_by: cfg.updatedBy, updated_at: cfg.updatedAt,
+  };
+}
+
 /** 项目配置的可审计快照；不要把 SQL 行的扩展字段带进 JSON。 */
 function projectConfigOf(row: any) {
   return {
@@ -1597,6 +1698,22 @@ async function admin(req: Request, env: Env, url: URL) {
     return json({ ok: true, project, entries, migration_required: migrationRequired });
   }
 
+  // 基线仓库配置：repo/branch 写入 D1 覆盖 env；token 只读标记，仍由 secret 管理。
+  if (p === "/admin/config/github" && req.method === "GET") {
+    return json({ ok: true, ...githubConfigPayload(await githubConfig(env)) });
+  }
+  if (p === "/admin/config/github" && (req.method === "PATCH" || req.method === "POST")) {
+    const b: any = await req.json().catch(() => ({}));
+    const saved = await saveGithubConfig(env, { repo: b.repo, branch: b.branch }, actor);
+    if (!saved.ok) {
+      const hint = saved.error === "bad_github_repo" ? "仓库格式应为 owner/repo"
+        : saved.error === "bad_github_branch" ? "分支只能含字母、数字、. _ / -，且不能有 .."
+        : "settings 表不可用，无法保存基线配置";
+      return err(saved.error === "settings_unavailable" ? 503 : 422, saved.error, { hint });
+    }
+    return json({ ok: true, ...githubConfigPayload(saved.config) });
+  }
+
   if (p === "/ver") return json({ ...(await versionPayload()), at: Date.now() });
 
   // /admin/p/{project}/…
@@ -1609,11 +1726,14 @@ async function admin(req: Request, env: Env, url: URL) {
     const stub = env.PROJECT_ROOM.get(env.PROJECT_ROOM.idFromName("v9:" + project));
 
     if (action === "repo/status" && req.method === "GET") {
+      const cfg = await githubConfig(env);
       const main = await repoMainSha(env);
       const key = `applymain:${project}`;
       const last = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
         .bind(key).first<any>().catch(() => null);
-      return json({ repo: env.GITHUB_REPO ?? null, branch: env.GITHUB_BRANCH ?? "main",
+      return json({ repo: cfg.repo || null, branch: cfg.branch,
+                    repo_source: cfg.repoSource, branch_source: cfg.branchSource,
+                    token_configured: cfg.tokenConfigured,
                     target_sha: main.sha, error: main.error ?? null,
                     last_project_check: last?.value ?? null, last_project_check_at: last?.updated_at ?? null });
     }
@@ -1622,7 +1742,7 @@ async function admin(req: Request, env: Env, url: URL) {
       let target = String(b.target_sha ?? "").trim().toLowerCase();
       if (!target) target = (await repoMainSha(env)).sha ?? "";
       if (!/^[a-f0-9]{7,64}$/.test(target))
-        return err(422, "target_sha_not_hex", { hint: "target_sha 7-64 位十六进制；也可留空用 GITHUB_REPO 当前 main。" });
+        return err(422, "target_sha_not_hex", { hint: "target_sha 7-64 位十六进制；也可留空用当前配置的基线分支。" });
       const out = await checkCollectedApplies(env, project, target);
       await env.DB.prepare(
         "INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) " +
@@ -3372,8 +3492,8 @@ function validateReceiptText(text: string, baseSha: string): string[] {
 
 /** S2：base 提交在远端仓库是否存在。配置 GITHUB_REPO 时启用；限流/网络不明时不误杀交付。 */
 async function baseCommitExists(env: Env, sha: string): Promise<boolean | null> {
-  const repo = String(env.GITHUB_REPO ?? "").trim();
-  if (!repo || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo)) return null;
+  const { repo } = await githubConfig(env);
+  if (!repo) return null;
   const key = `basecheck:${repo}:${String(sha).toLowerCase()}`;
   try {
     const cached = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
@@ -3619,10 +3739,9 @@ async function githubRepoText(
 }
 
 async function repoMainSha(env: Env): Promise<{ sha: string | null; error?: string; cached: boolean }> {
-  const repo = String(env.GITHUB_REPO ?? "").trim();
-  if (!repo || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo))
+  const { repo, branch } = await githubConfig(env);
+  if (!repo)
     return { sha: null, error: "repo_not_configured", cached: false };
-  const branch = String(env.GITHUB_BRANCH ?? "main").trim() || "main";
   const key = `repo:main:${repo}:${branch}`;
   try {
     const cached = await env.DB.prepare("SELECT value, updated_at FROM settings WHERE key = ?")
@@ -3773,8 +3892,8 @@ async function checkSubmissionApplyRow(
     checked_at: Date.now(), checked_by: checkedBy, checked_hunks: 0,
     failed_files: [], failed_lines: [], failures: [], summary: "尚未检查适用性",
   };
-  const repo = String(env.GITHUB_REPO ?? "").trim();
-  if (!repo) return { ...base, error: "repo_not_configured", summary: "未配置 GITHUB_REPO，无法自动检查" };
+  const { repo } = await githubConfig(env);
+  if (!repo) return { ...base, error: "repo_not_configured", summary: "未配置基线仓库，无法自动检查" };
   const ref = patchRefFromRow(row);
   if (!ref) return { ...base, state: "error", error: "patch_ref_missing", summary: "交付里找不到 .patch/.diff 文件" };
   let obj: R2ObjectBody | null = null;

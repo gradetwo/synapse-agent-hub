@@ -722,6 +722,25 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
       responses:
         '200': { description: '{ ok, project, entries: [{ action, actor, at, before, after }], migration_required? }' }
+  /admin/config/github:
+    get:
+      summary: 读取基线仓库覆盖配置（GITHUB_REPO / GITHUB_BRANCH 的有效值与来源）
+      responses:
+        '200': { description: '{ repo, branch, repo_source, branch_source, env_repo, env_branch, token_configured, updated_by, updated_at }' }
+    patch:
+      summary: 设置基线仓库覆盖；repo/branch 传空串则恢复环境变量默认
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repo: { type: string, description: 'owner/repo；空串恢复 env 默认' }
+                branch: { type: string, description: '分支；空串恢复 env 默认' }
+      responses:
+        '200': { description: ok + 有效配置 }
+        '422': { description: bad_github_repo | bad_github_branch }
+        '503': { description: settings_unavailable }
   /admin/visibility:
     get:
       summary: 读取可见性策略

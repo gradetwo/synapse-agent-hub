@@ -99,6 +99,16 @@ D1/R2，也不会重跑 `schema.sql`。详见 [`BUILD.md`](./BUILD.md)。
 - 每分钟 cron：回收过期任务租约、广播催确认
 - `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD`（Cloudflare Access 验签）
 
+### 基线仓库
+
+`GITHUB_REPO` / `GITHUB_BRANCH` 默认来自 Worker 环境变量；部署后可在管理台「项目 → 基线仓库」里覆盖，覆盖值写入 D1，立即用于项目健康、补丁适用性和 `base_sha` 校验。清空覆盖即恢复环境默认。
+
+私有仓库的 `GITHUB_TOKEN` 仍只通过 secret 管理，不提供管理台明文读写：
+
+```bash
+npx wrangler secret put GITHUB_TOKEN
+```
+
 ### Cloudflare Access
 
 控制台路径是 `/console`，浏览器 XHR 走 `/console/admin/*` 别名。Access 至少覆盖：
