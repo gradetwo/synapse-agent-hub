@@ -607,8 +607,14 @@ export class Client {
   bootstrap() {
     return this.get(`/p/${this.opts.project}/bootstrap`);
   }
-  releaseTask(taskId: string, state: "done" | "open" | "blocked" = "done") {
-    return this.post(`/p/${this.opts.project}/tasks/release`, { task_id: taskId, state });
+  releaseTask(taskId: string, state: "done" | "open" | "blocked" = "done",
+              reason?: string, unblockWhen?: string) {
+    const body: any = { task_id: taskId, state };
+    if (state === "blocked") {
+      if (reason?.trim()) body.reason = reason.trim();
+      if (unblockWhen?.trim()) body.unblock_when = unblockWhen.trim();
+    }
+    return this.post(`/p/${this.opts.project}/tasks/release`, body);
   }
   async failTask(taskId: string, error: string, retryable = true) {
     const r = await this.post(`/p/${this.opts.project}/tasks/fail`,
@@ -746,10 +752,11 @@ export class TaskLease {
     return this;
   }
 
-  async release(state: "done" | "open" | "blocked" = "done") {
+  async release(state: "done" | "open" | "blocked" = "done",
+                reason?: string, unblockWhen?: string) {
     this.stop();
     try {
-      return await this.client.releaseTask(this.taskId, state);
+      return await this.client.releaseTask(this.taskId, state, reason, unblockWhen);
     } finally {
       this.client.activeTaskClear(this.taskId);
       this.client.setWork({ state: "idle" });

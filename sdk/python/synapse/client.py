@@ -112,8 +112,12 @@ class TaskLease:
         if self._renew and self._renew.is_alive():
             self._renew.join(timeout=1)
         state = "done" if exc_type is None else "blocked"
+        payload = {"task_id": self.task_id, "state": state}
+        if state == "blocked":
+            payload["reason"] = f"exception:{getattr(exc_type, '__name__', 'exception')}"
+            payload["unblock_when"] = "修复异常后重新派发/认领"
         try:
-            self.c._post(f"/p/{self.c.project}/tasks/release", {"task_id": self.task_id, "state": state})
+            self.c._post(f"/p/{self.c.project}/tasks/release", payload)
         finally:
             self.c._active_task_clear(self.task_id)
             self.c.work(Work(state="idle"))

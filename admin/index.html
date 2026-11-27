@@ -2581,8 +2581,27 @@ function taskRow(t, isAll) {
   const stateBadge = document.createElement("span");
   const known = ["open", "claimed", "released", "blocked", "done", "failed"];
   stateBadge.className = `badge ${known.includes(st) ? st : "open"}`;
-  stateBadge.textContent = taskStateLabel(st, t);
+  stateBadge.textContent = st === "blocked" ? "阻塞等待" : taskStateLabel(st, t);
   cells[1].append(stateBadge);
+  if (st === "blocked") {
+    const reason = String(t.blocked_reason || "").trim();
+    const by = String(t.blocked_by || t.released_by || "").trim();
+    const unblock = String(t.unblock_when || "").trim();
+    const bits = [
+      "不要开工",
+      reason && reason !== "unspecified" ? `原因：${reason}` : "原因：未说明",
+      by ? `发起：${by}` : "",
+      unblock ? `解除：${unblock}` : "",
+    ].filter(Boolean);
+    stateBadge.title = bits.join("；");
+    const hint = document.createElement("div");
+    hint.className = "scopeHint";
+    hint.style.marginTop = "3px";
+    hint.style.maxWidth = "240px";
+    hint.style.whiteSpace = "normal";
+    hint.textContent = bits.join(" · ");
+    cells[0].append(hint);
+  }
   const pr = hasNum(t.priority) ? Math.max(0, Math.min(3, Number(t.priority))) : null;
   const prBadge = document.createElement("span");
   prBadge.className = "badge";
@@ -3013,8 +3032,14 @@ async function showTaskTimeline(taskId) {
   try {
     const d = await api(`/admin/p/${current}/tasks/timeline?task_id=${encodeURIComponent(taskId)}`);
     const t = d.task || {};
+    const blockedMeta = t.state === "blocked"
+      ? ` · 阻塞：${String(t.blocked_reason || "未说明")}`
+        + (t.blocked_by ? `（发起 ${t.blocked_by}）` : "")
+        + (t.unblock_when ? ` · 解除条件：${t.unblock_when}` : "")
+      : "";
     $("tlMeta").textContent = `${taskStateLabel(t.state, t)} · P${Number(t.priority ?? 2)} · `
-      + `${numOrDash(t.attempts)}/${numOrDash(t.max_attempts)} 次 · ${numOrDash(d.count)} 个事件`;
+      + `${numOrDash(t.attempts)}/${numOrDash(t.max_attempts)} 次 · ${numOrDash(d.count)} 个事件`
+      + blockedMeta;
     const typeLabel = {
       "task.created": "创建", "task.queued": "排队", "task.dispatched": "下发",
       "task.claimed": "领取", "task.retry_scheduled": "失败退避", "task.retried": "重新下发",

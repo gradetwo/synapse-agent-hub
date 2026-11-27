@@ -1495,6 +1495,32 @@ export class ProjectRoom implements DurableObject {
                                                resources: b.resources ?? {}, env: b.env ?? {} },
                                     ...(b.max_per_min ? { max_per_min: b.max_per_min } : {}),
                                     dedupe_key: `report:${b.report_id}:${b.agent_id}` });
+    // 兼容现有客户端：它们先 report 再 release(blocked)，报告里的 reason 原先只落在
+    // report 事件里。把最近一次 blocked report 回填到任务对象，任务详情和时间线之外
+    // 也能看到原因；新客户端可直接在 release body 里带 reason。
+    const reported = b.task && typeof b.task === "object" ? b.task : {};
+    const blockedTaskId = String(reported.task_id ?? "").trim();
+    if (blockedTaskId && String(reported.state ?? "").toLowerCase() === "blocked") {
+      const t: any = await this.st.get(`task:${blockedTaskId}`);
+      // 只能是当前 owner 或刚 release 的发起者，避免被原本定向的其它节点改写原因。
+      if (t && ["claimed", "blocked"].includes(String(t.state))
+          && (t.owner === b.agent_id || t.released_by === b.agent_id)) {
+        const reason = String(reported.reason ?? reported.blocked_reason ?? b.reason ?? "")
+          .trim().slice(0, 500);
+        const unblockWhen = String(reported.unblock_when ?? reported.unblockWhen ?? "")
+          .trim().slice(0, 500);
+        if (reason || unblockWhen) {
+          await this.st.put(`task:${blockedTaskId}`, {
+            ...t,
+            blocked_reason: reason || t.blocked_reason || "unspecified",
+            blocked_by: t.blocked_by ?? b.agent_id,
+            unblock_when: unblockWhen || t.unblock_when || null,
+            ...(t.state === "blocked" ? { blocked_at: Number(t.blocked_at ?? 0) || Date.now() } : {}),
+            updated_at: Date.now(),
+          });
+        }
+      }
+    }
     return json({ ok: true, seq });
   }
 
@@ -1551,10 +1577,19 @@ export class ProjectRoom implements DurableObject {
       return json({ error: "already_done", state: t.state,
         hint: "任务已完成，不能再次 claim；直接领下一个。",
         use: { claim_next: { method: "POST", path: `/p/${project}/tasks/claim-next`, required_scope: "tasks.claim" } } }, 409);
-    if (t.state === "blocked")
+    if (t.state === "blocked") {
+      const reason = String(t.blocked_reason ?? "").trim().slice(0, 200);
+      const unblockWhen = String(t.unblock_when ?? "").trim().slice(0, 200);
       return json({ error: "blocked", state: t.state,
-        hint: "任务被依赖/管理侧阻塞；等解除后由系统重新下发，或让管理员 reopen。",
+        blocked_at: Number(t.blocked_at ?? 0),
+        blocked_reason: reason || null,
+        blocked_by: t.blocked_by ?? t.released_by ?? null,
+        unblock_when: unblockWhen || null,
+        hint: reason
+          ? `任务被阻塞，先不要开工：${reason}${unblockWhen ? `；解除条件：${unblockWhen}` : ""}。等解除后由系统重新下发，或让管理员 reopen。`
+          : "任务被依赖/管理侧阻塞，先不要开工；等解除后由系统重新下发，或让管理员 reopen。",
         use: { mine: { method: "GET", path: `/p/${project}/tasks?mine=1` } } }, 409);
+    }
     if (t.state === "released") {
       // 误绑/错单自救：交付人 release 后仍可重新 claim 自己刚放下的任务，修正交付；
       // 仍待管理侧取件时不能把任务直接判 done，但也不该把 agent 永久锁在门外。
@@ -1765,12 +1800,48 @@ export class ProjectRoom implements DurableObject {
   private async release(b: any) {
     const t: any = await this.st.get(`task:${b.task_id}`);
     if (!t) return json({ error: "not_found" }, 404);
-    if (t.owner !== b.agent_id) return json({ error: "not_owner" }, 403);
     const want = b.state ?? "done";
     if (!["done", "open", "blocked"].includes(want))
       return json({ error: "bad_release_state", allowed: ["done", "open", "blocked"] }, 422);
-    if (t.state === want && !t.owner && t.released_by === b.agent_id)
-      return json({ ok: true, state: t.state, pending_submissions: t.pending_submissions ?? 0, already: true });
+    // 已 release 的任务 owner 为空：只允许原释放者、且目标状态与当前一致时做幂等/补元数据，
+    // 不能借此改动别人刚释放的任务。
+    if (t.owner !== b.agent_id
+        && !(t.owner === null && t.released_by === b.agent_id
+             && t.state === "blocked" && want === "blocked"))
+      return json({ error: "not_owner" }, 403);
+    const blockReason = String(b.reason ?? b.blocked_reason ?? "").trim().slice(0, 500);
+    const unblockWhen = String(b.unblock_when ?? b.unblockWhen ?? "").trim().slice(0, 500);
+    if (t.state === want && !t.owner && t.released_by === b.agent_id) {
+      // 旧任务已经 blocked、但没有原因时，允许 owner 再发一次 release(blocked, reason)
+      // 只补元数据；不重新计时，也不改变 pending/状态。
+      const metadataChanged = want === "blocked"
+        && ((blockReason && blockReason !== String(t.blocked_reason ?? ""))
+            || (unblockWhen && unblockWhen !== String(t.unblock_when ?? "")));
+      if (metadataChanged) {
+        const next = { ...t,
+                       blocked_reason: blockReason || t.blocked_reason || "unspecified",
+                       blocked_by: t.blocked_by ?? b.agent_id,
+                       unblock_when: unblockWhen || t.unblock_when || null,
+                       updated_at: Date.now() };
+        await this.st.put(`task:${b.task_id}`, next);
+        await this.append({ project: b.project, sender: b.agent_id, topic: "task", kind: "blocked",
+                            to: b.agent_id,
+                            payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
+                                       pending_submissions: next.pending_submissions ?? 0,
+                                       blocked_reason: next.blocked_reason,
+                                       blocked_by: next.blocked_by, unblock_when: next.unblock_when,
+                                       metadata_only: true },
+                            dedupe_key: `release-meta:${b.task_id}:${Date.now()}` });
+        return json({ ok: true, state: t.state, pending_submissions: next.pending_submissions ?? 0,
+                      already: true, metadata_updated: true,
+                      blocked_reason: next.blocked_reason, blocked_by: next.blocked_by,
+                      unblock_when: next.unblock_when });
+      }
+      return json({ ok: true, state: t.state, pending_submissions: t.pending_submissions ?? 0,
+                    already: true, blocked_reason: t.blocked_reason ?? null,
+                    blocked_by: t.blocked_by ?? t.released_by ?? null,
+                    unblock_when: t.unblock_when ?? null });
+    }
     let state = want;
     // 所有出口都重算待取数；state=open/blocked 也要保留真实 pending，
     // 否则 agent 放弃/阻塞后管理台会把“还有交付待取”误显示成 0。
@@ -1785,9 +1856,16 @@ export class ProjectRoom implements DurableObject {
                          pending_review: pendingReview,
                          updated_at: now, released_by: b.agent_id,
                          next_retry_at: null,
-                         ...(t.to ? { dispatch_state: "closed" } : {}) };
+                         ...(t.to ? { dispatch_state: "closed" } : {}),
+                         // 离开 blocked 时必须清掉旧原因，避免管理台/agent 看到过期状态。
+                         blocked_at: state === "blocked" ? now : 0,
+                         blocked_reason: state === "blocked"
+                           ? (blockReason || String(t.blocked_reason ?? "").trim() || "unspecified")
+                           : "",
+                         blocked_by: state === "blocked" ? (t.blocked_by ?? b.agent_id) : null,
+                         unblock_when: state === "blocked"
+                           ? (unblockWhen || t.unblock_when || null) : null };
     if (state === "done") { patch.closed_at = now; patch.closed_by = "agent"; }
-    if (state === "blocked") { patch.blocked_at = now; }
     const next = { ...t, ...patch };
     await this.st.put(`task:${b.task_id}`, next);
     if (state === "done") await this.closeIssueForTask(next);
@@ -1795,10 +1873,18 @@ export class ProjectRoom implements DurableObject {
                         to: b.agent_id,
                         payload: { task_id: b.task_id, title: t.title ?? "", body: t.body ?? "",
                                    pending_submissions: pending,
+                                   ...(state === "blocked" ? {
+                                     blocked_reason: next.blocked_reason,
+                                     blocked_by: next.blocked_by,
+                                     unblock_when: next.unblock_when,
+                                   } : {}),
                                    ...(state === "open" ? { abandoned_by: b.agent_id } : {}) },
                         dedupe_key: `release:${b.task_id}:${Date.now()}` });
     const promoted = await this.promoteQueue(project, t.to);
-    return json({ ok: true, state, pending_submissions: pending, promoted });
+    return json({ ok: true, state, pending_submissions: pending, promoted,
+                  blocked_reason: next.blocked_reason || null,
+                  blocked_by: next.blocked_by ?? null,
+                  unblock_when: next.unblock_when ?? null });
   }
 
   /**
@@ -1968,6 +2054,7 @@ export class ProjectRoom implements DurableObject {
       manual_retries: Number(t.manual_retries ?? 0) + 1,
       last_error: t.last_error ?? null, retried_at: now, updated_at: now,
       ...(t.to ? { dispatch_state: "queued" } : { dispatch_state: "closed" }),
+      blocked_at: 0, blocked_reason: "", blocked_by: null, unblock_when: null,
     };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     const reason = this.adminReason(b) || "管理员手动重试";
@@ -2079,6 +2166,24 @@ export class ProjectRoom implements DurableObject {
       ids.push(String(t.task_id ?? t.id ?? ""));
     }
     return { active_tasks: ids.length, task_ids: ids.filter(Boolean).slice(0, 20) };
+  }
+
+  /** blocked 不占 claim 配额，但代表“节点有明确待解除事项”，不能当成空闲。
+   * 只统计与本节点关联的 blocked 单（自己释放、被管理侧标为自己阻塞，或定向给自己）。 */
+  private async blockedTaskLoad(agentId: string): Promise<{ blocked_tasks: number; task_ids: string[]; reasons: string[] }> {
+    const rows = await this.st.list<any>({ prefix: "task:" });
+    const ids: string[] = [];
+    const reasons: string[] = [];
+    for (const t of rows.values()) {
+      if (!t || t.state !== "blocked") continue;
+      const toMe = Array.isArray(t.to) ? t.to.includes(agentId) : t.to === agentId;
+      if (t.released_by !== agentId && t.blocked_by !== agentId && t.owner !== agentId && !toMe) continue;
+      ids.push(String(t.task_id ?? t.id ?? ""));
+      const r = String(t.blocked_reason ?? "").trim();
+      if (r) reasons.push(r);
+    }
+    return { blocked_tasks: ids.length, task_ids: ids.filter(Boolean).slice(0, 20),
+             reasons: reasons.slice(0, 5) };
   }
 
   private async activeLoad(b: any) {
@@ -2209,7 +2314,8 @@ export class ProjectRoom implements DurableObject {
     const task = { ...t, state: "done", owner: null, lease_until: 0,
                    pending_submissions: pending, updated_at: now,
                    ...(t.to ? { dispatch_state: "closed" } : {}),
-                   closed_at: now, closed_by: "admin" };
+                   closed_at: now, closed_by: "admin",
+                   blocked_at: 0, blocked_reason: "", blocked_by: null, unblock_when: null };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     await this.closeIssueForTask(task);
     await this.append({ project, sender: "admin", topic: "task", kind: "done",
@@ -2239,7 +2345,8 @@ export class ProjectRoom implements DurableObject {
     const task = { ...t, state: "open", owner: null, lease_until: 0, to: null,
                    pending_submissions: pending, updated_at: now, reclaimed_at: now,
                    reclaimed_from: prevOwner, forced_reclaim: forced,
-                   ...(prevTo ? { dispatch_state: "closed" } : {}) };
+                   ...(prevTo ? { dispatch_state: "closed" } : {}),
+                   blocked_at: 0, blocked_reason: "", blocked_by: null, unblock_when: null };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     if (prevOwner) await this.notifyLeaseEvicted(project, t, null, reason, forced, "reclaimed_away");
     await this.append({ project, sender: "admin", topic: "task", kind: "reclaimed",
@@ -2284,7 +2391,8 @@ export class ProjectRoom implements DurableObject {
     const task = { ...t, state: "open", owner: null, lease_until: 0, to,
                    pending_submissions: pending, updated_at: now,
                    reassigned_at: now, reassigned_from: prevOwner ?? prevTo,
-                   forced_reassign: forced, dispatch_state: "queued" };
+                   forced_reassign: forced, dispatch_state: "queued",
+                   blocked_at: 0, blocked_reason: "", blocked_by: null, unblock_when: null };
     await this.st.put(`task:${t.task_id ?? t.id}`, task);
     if (prevOwner) await this.notifyLeaseEvicted(project, t, to, reason, forced, "reassigned_away");
     // 任务可能已下发但还没 claim（没有 owner）；旧窗口仍持有 active，需要一条
@@ -2600,12 +2708,14 @@ export class ProjectRoom implements DurableObject {
       const hbAge = now - Number(rec.last_hb_ms ?? 0);
       if (hbAge > IDLE_ONLINE_MS) continue;
       const load = await this.activeTaskLoad(agentId);
+      const blocked = await this.blockedTaskLoad(agentId);
       let row: any = byId.get(agentId) ?? {
         idle_since_ms: 0, reminded_at: 0, flagged_at: 0,
         last_task_list_ms: 0, last_issue_list_ms: 0, last_active_ms: 0,
       };
       let dirty = false;
-      if (load.active_tasks > 0) {
+      // blocked 单不是“没活干”：节点在等前置/裁决，继续发空闲提醒只会催它重复探测。
+      if (load.active_tasks > 0 || blocked.blocked_tasks > 0) {
         if (row.idle_since_ms || row.reminded_at || row.flagged_at) {
           row.idle_since_ms = row.reminded_at = row.flagged_at = 0;
           dirty = true;
@@ -2692,7 +2802,8 @@ export class ProjectRoom implements DurableObject {
       if (now - Number(rec.last_hb_ms ?? 0) > IDLE_ONLINE_MS) continue;
       if (Number(row.last_active_ms ?? 0) > Number(row.flagged_at ?? 0)) continue;
       const load = await this.activeTaskLoad(String(row.agent_id));
-      if (load.active_tasks > 0) continue;
+      const blocked = await this.blockedTaskLoad(String(row.agent_id));
+      if (load.active_tasks > 0 || blocked.blocked_tasks > 0) continue;
       agents.push({
         agent_id: row.agent_id,
         online: true,
@@ -2727,6 +2838,12 @@ export class ProjectRoom implements DurableObject {
     const load = await this.activeTaskLoad(agentId);
     if (load.active_tasks > 0)
       return json({ error: "agent_has_tasks", agent_id: agentId, active_tasks: load.active_tasks }, 409);
+    const blocked = await this.blockedTaskLoad(agentId);
+    if (blocked.blocked_tasks > 0)
+      return json({ error: "agent_has_blocked_tasks", agent_id: agentId,
+                    blocked_tasks: blocked.blocked_tasks, task_ids: blocked.task_ids,
+                    reasons: blocked.reasons,
+                    hint: "该节点有阻塞任务在等待前置/裁决，先处理阻塞或派新单；不要把它当空闲节点催办。" }, 409);
     const cfg = await this.idleConfig(project);
     if (!cfg.enabled) return json({ error: "idle_disabled" }, 409);
 

@@ -2095,8 +2095,21 @@ fn main() {
             if !["done", "open", "blocked"].contains(&state.as_str()) {
                 eprintln!("task-release --state 只能是 done|open|blocked"); std::process::exit(2);
             }
+            let mut payload = json!({ "task_id": id, "state": state });
+            if state == "blocked" {
+                let reason = args_map.get("reason").or_else(|| args_map.get("blocked-reason"))
+                    .map(|s| s.trim().to_string()).unwrap_or_default();
+                if reason.is_empty() {
+                    // 保持旧命令可用；服务端会优先用 report 回填的原因，再退到 unspecified。
+                    eprintln!("提示：建议加 --reason <原因>（例如 prerequisite_unmerged），否则节点只能看到“未说明”。");
+                }
+                let unblock = args_map.get("unblock-when").or_else(|| args_map.get("unblock_when"))
+                    .map(|s| s.trim().to_string()).unwrap_or_default();
+                if !reason.is_empty() { payload["reason"] = json!(reason); }
+                if !unblock.is_empty() { payload["unblock_when"] = json!(unblock); }
+            }
             match admin_post(&cfg, &agent, &base, &format!("/p/{}/tasks/release", cfg.project),
-                             json!({ "task_id": id, "state": state })) {
+                             payload) {
                 Ok(v) => {
                     active_task_clear(&cfg, Some(&id));
                     println!("{}", serde_json::to_string(&v).unwrap_or_default());

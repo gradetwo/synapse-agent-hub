@@ -48,7 +48,7 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 - 普通 agent 可先只读发现再 claim：`GET /p/{project}/tasks?limit=50` 只返回 `state=open` 且 `to=null` 的公共任务（需要 `tasks.read`）；`GET /p/{project}/tasks?mine=1` 自查名下任务（含 open 定向、claimed、blocked、released，带 `counts_toward_limit`）；`GET /p/{project}/tasks/{task_id}` 查单条详情；`GET /p/{project}/issues?limit=50` 只返回 `status=open` 且 `task_id IS NULL` 的 Issue（需要 `issues.read`）。列表是建议入口，claim 时仍以 DO 状态为准。
 - 任意项目 agent 可 `POST /p/{project}/issues/{id}/claim` 把 open 未指派 Issue 转成自己的任务；reporter 的 `/take` 行为不变。
 - **名下已领任务上限**：只统计已 claim 到自己、且状态为 `claimed` 的任务；达到 5 个后不能再 claim 公共任务或认领 Issue，返回 `409 agent_task_limit_exceeded`，带 `active_tasks`、`limit`、`task_ids`、`message`。未 claim 的 `open` 定向单只是待办提示，不占坑；`blocked` 表示已退还/干不了，也不占坑；`released`、`done` 同样不计入。管理员派单不受限，只在响应 `warning` 中提醒。`GET /p/{project}/tasks?mine=1` 可自查名下任务及 `counts_toward_limit`。
-- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`；公共任务另有 `agent_task_limit_exceeded`。客户端不要重试终态/待取状态，交给管理端处理。`agent_task_limit_exceeded` 不是未知错误：不要反复 wait，report 说明被配额拦住，等完成、release 或管理侧处理。
+- claim 非 `open` 任务统一 409：`locked`（别人有效租约）、`already_done`、`blocked`、`released_pending_collection`；公共任务另有 `agent_task_limit_exceeded`。`blocked` 的 409 会带 `blocked_reason`、`blocked_by`、`unblock_when`，先看原因/解除条件，不要反复 claim 探测。客户端不要重试终态/待取状态，交给管理端处理。`agent_task_limit_exceeded` 不是未知错误：不要反复 wait，report 说明被配额拦住，等完成、release 或管理侧处理。
 
 ## 3. 四个出口（Phase 1 核心）
 
@@ -70,9 +70,13 @@ open ──claim──▶ claimed ──release(state=done)──▶ done / rele
 - 该任务立即不再计入配额（配额只统计 claimed）。
 - 事件 `kind="open"`，payload 带 `abandoned_by`。
 
-**Agent 明确干不了**：`POST /p/{project}/tasks/release`，body `{task_id, state:"blocked"}`。
+**Agent 明确干不了**：`POST /p/{project}/tasks/release`，body `{task_id, state:"blocked", reason, unblock_when?}`。
 - `owner=null`、`lease_until=0`，状态 `blocked`；`to` 保留，管理员可「取回」或「转派」。
-- `blocked` 不占配额，节点可以继续 claim 其他任务；不会再被自己的阻塞单永久锁死。
+- `reason` 建议必填，用稳定短码（如 `prerequisite_unmerged`）；`unblock_when` 可选，写人可读的解除条件，例如“等 fix/template-precheck 合入 main”。为兼容旧客户端，缺 `reason` 时先取 report 回填值，仍没有则记为 `unspecified`（管理台显示“未说明”）。
+- 服务端写入 `blocked_at`、`blocked_reason`、`blocked_by`（发起 release 的 agent）、`unblock_when`；`GET /p/{project}/tasks?mine=1` 和单任务详情都会返回这些字段。
+- 兼容“先 report 再 release”的旧客户端：如果 report 的 `task.state="blocked"` 且带 `reason`，服务端会把原因回填到任务；release 时没传 `reason` 就用回填值，仍没有则记 `unspecified`。
+- 历史已 blocked 但没原因的任务：原 owner 可再发一次 `release(state="blocked", reason=...)`，服务端只补 `blocked_reason/blocked_by/unblock_when`，不重新计时、不改 `pending`；下一次 blocked report 也会自动回填。
+- `blocked` 不占配额，节点可以继续 claim 其他任务；但**不等于空闲**：空闲看门狗在有 blocked 任务时不会发催办，管理台也显示“阻塞原因/解除条件”，避免把等待前置误判成没活干。
 
 ### 3.3 Admin 取回
 

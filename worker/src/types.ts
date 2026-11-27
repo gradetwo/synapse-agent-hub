@@ -113,6 +113,12 @@ export interface Task {
   reassigned_at?: number;
   reassigned_from?: string | null;
   blocked_at?: number;
+  /** 最近一次 blocked 释放的原因；由 release 或后续 report 回填，供节点/管理台判断。 */
+  blocked_reason?: string;
+  /** 发起 blocked 的 agent；管理侧挂起时由管理端写入。 */
+  blocked_by?: string | null;
+  /** 解除阻塞的条件（自由文本），例如“等 fix/xxx 合入 main”。 */
+  unblock_when?: string | null;
   /** 合入回写：READY 补丁落到 main 后的提交与时间；只由管理端/CI 回写。 */
   merged_sha?: string | null;
   merged_at?: number;

@@ -476,8 +476,10 @@ paths:
               properties:
                 task_id: { type: string }
                 state: { type: string, enum: [done, open, blocked] }
+                reason: { type: string, maxLength: 500, description: state=blocked 时的阻塞原因（如 prerequisite_unmerged） }
+                unblock_when: { type: string, maxLength: 500, description: state=blocked 时的解除条件（自由文本） }
       responses:
-        '200': { description: ok }
+        '200': { description: ok；state=blocked 时返回 blocked_reason / blocked_by / unblock_when }
   /p/{project}/artifact/{sha256}:
     parameters:
       - $ref: '#/components/parameters/Project'

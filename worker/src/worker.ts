@@ -2754,6 +2754,9 @@ function agentTaskView(t: any, agentId: string) {
     pending_submissions: Number(t.pending_submissions ?? 0),
     pending_review: Number(t.pending_review ?? 0),
     blocked_at: t.blocked_at ?? 0,
+    blocked_reason: t.state === "blocked" ? (t.blocked_reason ?? "") : "",
+    blocked_by: t.state === "blocked" ? (t.blocked_by ?? t.released_by ?? null) : null,
+    unblock_when: t.state === "blocked" ? (t.unblock_when ?? null) : null,
     released_by: t.released_by ?? null,
     // 配额口径：只有已 claim 到自己名下的 claimed 任务占坑。
     counts_toward_limit: t.state === "claimed" && t.owner === agentId,
