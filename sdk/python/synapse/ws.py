@@ -71,8 +71,9 @@ def _open_socket(host: str, port: int, timeout: float) -> socket.socket:
         if not chunk:
             raise WSError("代理 CONNECT 被关闭")
         resp += chunk
-    if b" 200 " not in resp.split(b"\r\n")[0]:
-        raise WSError(f"代理拒绝 CONNECT：{resp.split(b'\r\n')[0][:80]!r}")
+    status_line = resp.split(b"\r\n", 1)[0]
+    if b" 200 " not in status_line:
+        raise WSError(f"代理拒绝 CONNECT：{status_line[:80]!r}")
     return s
 
 
@@ -114,8 +115,9 @@ class WSClient:
                 raise WSError("握手失败：连接被关闭")
             resp += chunk
         head, _, rest = resp.partition(b"\r\n\r\n")
-        if b"101" not in head.split(b"\r\n")[0]:
-            raise WSError(f"握手失败：{head.split(b'\r\n')[0].decode(errors='replace')}")
+        status_line = head.split(b"\r\n", 1)[0]
+        if b"101" not in status_line:
+            raise WSError(f"握手失败：{status_line.decode(errors='replace')}")
         expect = base64.b64encode(
             __import__("hashlib").sha1((key + GUID).encode()).digest()).decode()
         if expect.encode() not in head:
