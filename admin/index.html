@@ -2421,6 +2421,9 @@ function offlineChip() {
 
 function agentRow(a) {
   const w = a.work || {}, l = a.load || {}, dk = (l.disk || [{}])[0];
+  const errCount = Number(a.error_count ?? 0);
+  const errTotal = Number(a.error_count_total ?? errCount);
+  const errWindowMin = Math.max(1, Math.round(Number(a.error_window_ms ?? 30 * 60_000) / 60_000));
   const cls = a.alive === "alive" ? "alive" : a.alive === "late" ? "late" : "offline";
   const projectName = (allProjects.find((p) => p.project === a.project)?.display_name) || a.project;
   const { tr, cells } = makeTableRow(["", "muted", "", "", "num", "num", "num", "mono", "muted", ""]);
@@ -2432,7 +2435,7 @@ function agentRow(a) {
   tr.dataset.work = a.alive === "alive" ? String(w.state || "") : "";
   tr.dataset.auto = a.launch_summary ? (a.launch_summary.auto === true ? "on" : "off") : "unknown";
   tr.dataset.launch = a.launch_summary ? "1" : "0";
-  tr.dataset.errors = Number(a.error_count ?? 0) > 0 ? "1" : "0";
+  tr.dataset.errors = errCount > 0 ? "1" : "0";
   tr.dataset.sdk = a.sdk_outdated ? "old" : "new";
   tr.dataset.debug = a.debug_enabled ? "1" : "0";
   tr.dataset.delivery = a.delivery_health?.consecutive_failures > 0 ? "failing"
@@ -2468,11 +2471,13 @@ function agentRow(a) {
     badge.title = a.delivery_health.last_error || "最近外部投送连续失败";
     cells[0].append(" ", badge);
   }
-  if (Number(a.error_count ?? 0) > 0) {
+  if (errCount > 0) {
     const badge = document.createElement("span");
     badge.className = "badge released";
-    badge.textContent = `异常${Number(a.error_count) > 99 ? "99+" : a.error_count}`;
-    badge.title = "客户端上报的异常条数（详情可看诊断包）";
+    badge.textContent = `异常${errCount > 99 ? "99+" : errCount}`;
+    badge.title = `最近 ${errWindowMin} 分钟客户端上报的异常条数`
+      + (errTotal > errCount ? `；另有 ${errTotal} 条历史异常保留在诊断包` : "")
+      + "。";
     cells[0].append(" ", badge);
   }
   if (a.debug_enabled) {
@@ -4958,13 +4963,22 @@ function renderAgentDiag(client, live, available) {
   }
   const debug = client?.debug || null;
   const errors = Array.isArray(client?.client_errors) ? client.client_errors : [];
+  const errorWindowMs = Number(client?.error_window_ms ?? 30 * 60_000);
+  const errorWindowMin = Math.max(1, Math.round(errorWindowMs / 60_000));
+  const recentErrors = Array.isArray(client?.recent_client_errors)
+    ? client.recent_client_errors
+    : errors.filter((e) => {
+        const ts = Number(e?.ts ?? 0);
+        return Number.isFinite(ts) && ts > 0 && ts >= Date.now() - errorWindowMs;
+      });
+  const totalErrors = Number(client?.error_count_total ?? errors.length);
   const health = client?.delivery_health || live?.delivery_health || null;
   const project = live?.project || current;
   const logs = debug?.enabled && Array.isArray(debug.logs) ? debug.logs : [];
   const healthLabel = health?.consecutive_failures > 0
     ? `连续失败 ${health.consecutive_failures} 次` : health?.status === "ok" ? "最近投送成功" : "暂无投送样本";
   const healthCls = health?.consecutive_failures > 0 ? "off" : health?.status === "ok" ? "on" : "unknown";
-  const errRows = errors.slice(0, 30).map((e) => `<div class="diagItem">
+  const errRows = recentErrors.slice(0, 30).map((e) => `<div class="diagItem">
       <span>${hasNum(e.ts) ? new Date(Number(e.ts)).toLocaleString() : "—"}</span>
       <b>${txt(e.kind || "other")}</b> ${txt(e.message || "")}
       ${e.detail ? `<pre>${txt(e.detail)}</pre>` : ""}
@@ -4982,20 +4996,23 @@ function renderAgentDiag(client, live, available) {
     delivery_health: health,
     debug_enabled: !!debug?.enabled,
     debug_logs: logs,
+    error_window_ms: errorWindowMs,
+    error_count_total: totalErrors,
+    recent_client_errors: recentErrors,
     client_errors: errors,
   };
   box.innerHTML = `<div class="launchTop"><div class="cap">客户端诊断</div>
       <span class="launchBadge ${debug?.enabled ? "on" : "unknown"}">debug ${debug?.enabled ? "已开启" : "关闭"}</span>
       <span class="launchBadge ${healthCls}" style="margin-left:6px">${txt(healthLabel)}</span>
-      <span class="launchBadge ${errors.length ? "off" : "unknown"}" style="margin-left:6px">异常 ${errors.length}</span>
+      <span class="launchBadge ${recentErrors.length ? "off" : "unknown"}" style="margin-left:6px">异常 ${recentErrors.length}（近${errorWindowMin}分）</span>
     </div>
     <div class="launchMeta">${health?.last_attempt_ms ? `最近投送 ${fmtLast(Number(health.last_attempt_ms))}` : "尚无投送记录"}${health?.last_error ? ` · ${txt(health.last_error)}` : ""}</div>
     <div class="ctrlBtns"><button class="ghost mini" id="dDiagCopy" type="button">复制诊断包</button></div>
-    <div class="cap" style="margin-top:8px">最近异常</div>
-    <div class="diagList">${errRows || `<div class="muted">暂无异常上报</div>`}</div>
+    <div class="cap" style="margin-top:8px">最近异常（近${errorWindowMin}分钟）</div>
+    <div class="diagList">${errRows || `<div class="muted">近${errorWindowMin}分钟暂无异常上报${totalErrors > 0 ? `（历史 ${totalErrors} 条已保留在诊断包）` : ""}</div>`}</div>
     <div class="cap" style="margin-top:8px">debug 日志${logs.length ? ` · ${logs.length} 条` : ""}</div>
     <div class="diagList">${logRows || `<div class="muted">${debug?.enabled ? "暂无日志" : "debug 关闭；开启后随心跳上传最近日志"}</div>`}</div>
-    <div class="ctrlHint">异常与 debug 日志由客户端内存环形缓冲上报；debug 关闭时不传日志，历史记录保留上一次上传内容。</div>`;
+    <div class="ctrlHint">列表只显示近${errorWindowMin}分钟异常；更早的记录仍保留在复制诊断包中。debug 关闭时不传日志，历史记录保留上一次上传内容。</div>`;
   const copy = $("dDiagCopy");
   if (copy) copy.onclick = async () => {
     const text = JSON.stringify(pkg, null, 2);

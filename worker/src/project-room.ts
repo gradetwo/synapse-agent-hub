@@ -17,6 +17,8 @@ const RETRY_BASE_MS = 15_000;                    // 15s 起指数退避，封顶
 const RETRY_MAX_MS = 5 * 60_000;
 const QUEUE_STALE_MS = 2 * 60 * 60_000;          // 排队超过 2h 进入管理告警
 const QUEUE_OFFLINE_STALE_MS = 60 * 60_000;      // 目标离线超过 1h 也进入告警
+// “最近异常”徽章只认近 30 分钟的客户端上报；更早的记录保留给诊断包，不再冒充当前异常。
+const CLIENT_ERROR_RECENT_MS = 30 * 60_000;
 
 function clampPriority(v: unknown): number {
   if (v === undefined || v === null || String(v).trim() === "") return DEFAULT_TASK_PRIORITY;
@@ -2531,6 +2533,16 @@ export class ProjectRoom implements DurableObject {
     return { ...a, alive, age_s: Math.round(age / 1000) };
   }
 
+  /** 近 30 分钟的客户端异常；列表徽章和详情“最近异常”共用这一口径。 */
+  private recentClientErrors(errors: any, now = Date.now()): any[] {
+    if (!Array.isArray(errors)) return [];
+    const cutoff = now - CLIENT_ERROR_RECENT_MS;
+    return errors.filter((e) => {
+      const ts = Number(e?.ts ?? 0);
+      return Number.isFinite(ts) && ts > 0 && ts >= cutoff;
+    }).sort((a, b) => Number(b.ts ?? 0) - Number(a.ts ?? 0));
+  }
+
   private async agents() {
     const now = Date.now();
     const r = await this.st.list<any>({ prefix: "agent:" });
@@ -2539,6 +2551,7 @@ export class ProjectRoom implements DurableObject {
       const launch = view.launch;
       const health = view.delivery_health;
       const errors = Array.isArray(view.client_errors) ? view.client_errors : [];
+      const recentErrors = this.recentClientErrors(errors, now);
       const remote = view.remote_control;
       // 名册不携带完整 argv/日志（31–200 个节点会放大每次列表流量）；详情用 agent/get 取全量。
       const { launch: _launch, debug: _debug, client_errors: _errors, ...rest } = view;
@@ -2564,8 +2577,12 @@ export class ProjectRoom implements DurableObject {
           consecutive_failures: health.consecutive_failures,
         } : null,
         debug_enabled: view.debug?.enabled === true,
-        error_count: errors.length,
-        last_error_at: errors.length ? errors[0]?.ts ?? null : null,
+        // error_count 是“当前异常”口径（近 30 分钟）；历史条数单独放 total，避免旧徽章常驻。
+        error_count: recentErrors.length,
+        error_count_total: errors.length,
+        last_error_at: recentErrors.length ? recentErrors[0]?.ts ?? null : null,
+        last_error_at_total: errors.length ? errors[0]?.ts ?? null : null,
+        error_window_ms: CLIENT_ERROR_RECENT_MS,
         remote_control: remote ? {
           rev: remote.rev,
           auto_forward: remote.auto_forward,
@@ -2584,7 +2601,17 @@ export class ProjectRoom implements DurableObject {
     if (!id) return json({ error: "agent_id_required" }, 422);
     const rec: any = await this.st.get<any>(`agent:${id}`);
     if (!rec) return json({ error: "agent_not_found", agent_id: id }, 404);
-    return json({ agent: this.agentView(rec) });
+    const view = this.agentView(rec);
+    const errors = Array.isArray(view.client_errors) ? view.client_errors : [];
+    const recentErrors = this.recentClientErrors(errors);
+    // 详情保留全量历史供复制诊断包；另给 recent_client_errors，让页面“最近异常”不必自己猜窗口。
+    return json({ agent: { ...view,
+      client_errors: errors,
+      recent_client_errors: recentErrors,
+      error_count: recentErrors.length,
+      error_count_total: errors.length,
+      error_window_ms: CLIENT_ERROR_RECENT_MS,
+    } });
   }
 
   // ── 空闲提醒：活动记录、配置和 cron 扫描 ──────────────────
