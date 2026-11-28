@@ -828,10 +828,20 @@ if (location.search.includes("reset=1")) {
   .copyField{display:none}
   #dClose .backGlyph{display:none}
   #dClose .closeX{display:inline}
+  .sheetBack{display:none}
   @media(max-width:720px){
     /* 其他全屏面板：标题栏始终留在顶部，避免滚出屏幕后无路可退 */
     .overlay .sheetHead{position:sticky;top:0;z-index:20;box-shadow:0 1px 0 var(--line-soft)}
     .overlay .sheetHead .iconBtn{width:44px;height:44px;min-width:44px!important}
+    /* 标题栏在部分手机 WebView 里会被状态栏/滚动容器吃掉；底部再给一个固定返回入口。 */
+    body.has-sheet .sheetBack{display:flex;position:fixed;right:max(14px,env(safe-area-inset-right));
+      bottom:calc(env(safe-area-inset-bottom) + 14px);z-index:9999;align-items:center;gap:6px;
+      height:46px;padding:0 16px;border-radius:999px;border:1px solid var(--line-strong);
+      background:var(--surface-sheet-head);color:var(--fg-strong);font-size:14px;font-weight:600;
+      box-shadow:0 6px 24px var(--shadow-strong);touch-action:manipulation}
+    body.has-sheet.sheet-detail .sheetBack{display:none}
+    #trendDetail .sheetBody,#issueDetail .sheetBody,#taskTimeline .sheetBody{
+      padding-bottom:calc(74px + env(safe-area-inset-bottom))}
     /* agent 详情：干净的返回箭头 + 名称，不做大号方块按钮压内容 */
     #detail .sheetHead{position:fixed;top:0;left:0;right:0;z-index:31;margin:0;box-sizing:border-box;
       height:calc(env(safe-area-inset-top) + 56px);
@@ -1491,6 +1501,7 @@ if (location.search.includes("reset=1")) {
     </div>
   </div>
 </div>
+<button class="sheetBack" id="sheetBack" type="button" aria-label="关闭当前面板并返回" title="关闭当前面板并返回"><span aria-hidden="true">‹</span> 返回</button>
 <div id="toast" class="toast" hidden></div>
 <script>
 const KEY = "hub.admin.token";
@@ -5167,7 +5178,7 @@ function openAgent(id, project, days = detailDays) {
   if (ov) {
     ov.hidden = false; ov.style.display = "flex";
     raiseOverlay(ov);
-    document.body.classList.add("has-sheet");
+    syncSheetLock();
     if (!sameAgentRefresh) {
       const sheetBody = ov.querySelector(".sheetBody");
       if (sheetBody) sheetBody.scrollTop = 0;
@@ -6121,7 +6132,7 @@ function setProjectPanels(enabled) {
   SUB_COUNTS = null;
   lastPending = null;
   const ov = $("detail");
-  if (ov) { ov.hidden = true; ov.style.display = ""; document.body.classList.remove("has-sheet"); }
+  if (ov) { ov.hidden = true; ov.style.display = ""; syncSheetLock(); }
   detailAgent = null;
   LAST_DETAIL = null;
   detailReady = false;
@@ -6321,8 +6332,18 @@ function topOpenSheet() {
     .sort((a, b) => (Number(getComputedStyle(b).zIndex) || 20) - (Number(getComputedStyle(a).zIndex) || 20))[0] || null;
 }
 function syncSheetLock() {
-  if (!anySheetOpen()) overlayZ = 20;
-  document.body.classList.toggle("has-sheet", anySheetOpen());
+  const open = anySheetOpen();
+  if (!open) overlayZ = 20;
+  document.body.classList.toggle("has-sheet", open);
+  document.body.classList.toggle("sheet-detail", open && topOpenSheet()?.id === "detail");
+}
+function closeTopSheet() {
+  const top = topOpenSheet();
+  if (!top) return;
+  if (top.id === "trendDetail") closeTrendSheet();
+  else if (top.id === "issueDetail") closeIssueDetail();
+  else if (top.id === "taskTimeline") closeTaskTimeline();
+  else closeAgentDetail();
 }
 const sheetHistoryPushed = { trend: false, issue: false, timeline: false };
 let suppressPopstate = false;
@@ -6405,13 +6426,9 @@ window.addEventListener("popstate", () => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  const top = topOpenSheet();
-  if (!top) return;
+  if (!topOpenSheet()) return;
   e.preventDefault();
-  if (top.id === "trendDetail") closeTrendSheet();
-  else if (top.id === "issueDetail") closeIssueDetail();
-  else if (top.id === "taskTimeline") closeTaskTimeline();
-  else closeAgentDetail();
+  closeTopSheet();
 });
 
 const trendTile = $("dashTrendTile");
@@ -6423,6 +6440,8 @@ const trendCloseEl = $("trendClose");
 if (trendCloseEl) trendCloseEl.onclick = () => closeTrendSheet();
 const trendOv = $("trendDetail");
 if (trendOv) trendOv.onclick = (e) => { if (e.target === trendOv) closeTrendSheet(); };
+const sheetBackEl = $("sheetBack");
+if (sheetBackEl) sheetBackEl.onclick = closeTopSheet;
 const trendRangeEl = $("trendRange");
 if (trendRangeEl) trendRangeEl.addEventListener("click", (e) => {
   const b = e.target.closest("[data-trend-days]");
